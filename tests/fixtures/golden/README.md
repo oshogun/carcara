@@ -1,7 +1,7 @@
 # Golden installer fixtures
 
 Byte-exact output of the installer for a set of cases. They started as the
-output of the 0.1.0 bash installer (`bin/carcara`); since 0.3.0 they are the
+output of the 0.1.0 bash installer (since removed); since 0.3.0 they are the
 Python installer's output (routing skill, settings hooks, `{{ROUTING}}` text)
 and are regenerated deliberately whenever templates or profiles change.
 

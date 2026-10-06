@@ -33,9 +33,6 @@ pipx install .          # or: uv tool install .
 # or straight from git: pipx install git+https://github.com/oshogun/carcara.git
 ```
 
-Running `bin/carcara` from a git clone still works but is deprecated and will
-be removed in a future release.
-
 ## Using carcara from Claude Code
 
 After `carcara install` (and `carcara` on your `PATH`), start Claude Code in
