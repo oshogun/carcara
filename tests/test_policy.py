@@ -1,0 +1,470 @@
+import asyncio
+
+import pytest
+
+from carcara.policy import (
+    KNOWN_TOOLS,
+    STRUCTURED_OUTPUT_TOOL,
+    allowed_tools_for,
+    decide,
+    disallowed_tools_for,
+    make_can_use_tool,
+    make_pre_tool_use_hook,
+    permission_mode_for,
+)
+from carcara.roles import Role, load_roles
+
+CWD = "/repo"
+ROLES = load_roles()
+
+
+def allowed(role, tool, tool_input=None):
+    return decide(role, tool, tool_input or {}, CWD).allow
+
+
+# --- acceptance cases from the plan ---------------------------------------
+
+
+def test_deny_edit_on_reviewer():
+    assert not allowed("reviewer", "Edit", {"file_path": "a.py"})
+    assert not allowed("reviewer", "Write", {"file_path": "a.py"})
+    assert not allowed("explorer", "NotebookEdit", {"notebook_path": "a.ipynb"})
+
+
+@pytest.mark.parametrize("role", sorted(ROLES))
+@pytest.mark.parametrize("tool", ["Task", "Agent"])
+def test_task_denied_everywhere(role, tool):
+    assert not allowed(role, tool, {"prompt": "x"})
+
+
+def test_deny_rm_via_bash_on_explorer():
+    assert not allowed("explorer", "Bash", {"command": "rm -rf x"})
+
+
+@pytest.mark.parametrize("role", sorted(ROLES))
+def test_read_env_denied(role):
+    assert not allowed(role, "Read", {"file_path": ".env"})
+
+
+def test_allow_pytest_on_test_runner():
+    assert allowed("test-runner", "Bash", {"command": "pytest -q"})
+
+
+# --- more policy -----------------------------------------------------------
+
+
+def test_tool_not_in_role_denied():
+    assert not allowed("architect", "Bash", {"command": "ls"})
+    assert not allowed("doc-writer", "Bash", {"command": "ls"})
+    assert not allowed("explorer", "WebFetch", {"url": "http://x"})
+    assert not allowed("explorer", "mcp__x__y")
+    assert not allowed("nonexistent-role", "Read", {"file_path": "a"})
+
+
+def test_writers_may_edit():
+    assert allowed("implementer", "Edit", {"file_path": "src/a.py"})
+    assert allowed("doc-writer", "Write", {"file_path": "README.md"})
+    assert not allowed("implementer", "Write", {"file_path": ".env"})
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status",
+        "git diff --stat HEAD~1",
+        "git log -n 5 --oneline",
+        "ls -la src",
+        "rg -n 'foo$' src",
+        'grep -n "def main" src/a.py',
+        "find . -name '*.py'",
+        "cat README.md",
+        "wc -l a.py",
+        "head -n 20 a.py",
+        "grep -n -A3 -i foo a.py",
+        "grep -nA3 --color=never -e foo a.py",
+        "grep --color foo a.py",
+        "rg -n -t py -g '*.py' --glob='src/*' -C 2 foo src",
+        "rg --files src",
+        "find src -maxdepth 2 -type f -name '*.py'",
+        "git log -3 --oneline",
+        "git log -n5 --pretty=format:%h --stat=200",
+        "git diff --cached --name-status -- src/a.py",
+        "git show --stat HEAD",
+        "tail -n 5 a.py",
+        "wc -lw a.py",
+    ],
+)
+@pytest.mark.parametrize("role", ["explorer", "reviewer"])
+def test_read_only_bash_allowed(role, command):
+    assert allowed(role, "Bash", {"command": command}), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status; rm -rf x",
+        "git status && rm -rf x",
+        "git status || rm -rf x",
+        "git log | sh",
+        "cat a > b",
+        "cat < a",
+        "ls `rm x`",
+        "ls $(rm x)",
+        'ls "$(rm x)"',
+        "ls\nrm x",
+        "cat .env",
+        "cat ./.env",
+        "cat sub/.env.local",
+        "head secrets/a/b",
+        "cat .e*",
+        "cat ~/.ssh/id_rsa",
+        "git show HEAD:.env",
+        "git show :.env",
+        "git show HEAD:secrets/key",
+        "git show HEAD:./.env",
+        "rg -nuu KEY",
+        "rg -n. KEY",
+        "rg -nz KEY",
+        "git diff --stat HEAD #x",
+        "grep -f.env x",
+        "rm x",
+        "git push",
+        "git -C /tmp status",
+        "find . -delete",
+        "find . -exec rm {} +",
+        "rg --pre sh foo",
+        "git diff --output=x",
+        "grep -r foo .",
+        "grep -nr foo .",
+        "grep --recur foo .",
+        "grep --recursive=x foo .",
+        "grep --include=x foo a.py",
+        "grep -f pats a.py",
+        "rg --hostname-bin=./s.sh --hyperlink-format=default foo",
+        "rg --hidden foo",
+        "rg --no-ignore foo",
+        "rg -g '.env*' KEY",
+        "rg --glob=secrets/** KEY",
+        "rg --unknown-flag foo",
+        "rg -A -u foo",
+        "find . -fprint out",
+        "find . -execdir ls",
+        "find . -newer",
+        "git log --pretty --output=x",
+        "git diff -U --output=x",
+        "git diff --ext-diff",
+        "git diff --no-index a b",
+        "git log --format --output=x",
+        "git diff --stat=1 --textconv",
+        "ls --color=always",
+        "tail -f a.py",
+        "head -n",
+        "python -c 'print(1)'",
+        "ls 'unterminated",
+        "",
+    ],
+)
+@pytest.mark.parametrize("role", ["explorer", "reviewer"])
+def test_read_only_bash_bypass_attempts_denied(role, command):
+    assert not allowed(role, "Bash", {"command": command}), command
+
+
+def test_unrestricted_bash_roles():
+    assert allowed("implementer", "Bash", {"command": "pytest -q && ruff check ."})
+    assert allowed("test-runner", "Bash", {"command": "npm test 2>&1 | tail -n 50"})
+    assert not allowed("test-runner", "Bash", {"command": 123})
+
+
+@pytest.mark.parametrize(
+    "tool,tool_input",
+    [
+        ("Read", {"file_path": "./.env"}),
+        ("Read", {"file_path": "sub/.env.local"}),
+        ("Read", {"file_path": ".env.production"}),
+        ("Read", {"file_path": "secrets/a/b"}),
+        ("Read", {"file_path": "src/../secrets/key"}),
+        ("Read", {"file_path": "/repo/.env"}),
+        ("Read", {"file_path": "/repo/sub/../.env"}),
+        ("Grep", {"pattern": "KEY", "path": "secrets"}),
+        ("Grep", {"pattern": "KEY", "path": ".env"}),
+        ("Grep", {"pattern": "KEY", "glob": "*.env*"}),
+        ("Glob", {"pattern": "**/.env*"}),
+        ("Glob", {"pattern": "secrets/**"}),
+        ("Glob", {"pattern": "*", "path": "secrets"}),
+        ("Read", {"file_path": 5}),
+        ("Glob", {"pattern": ".env", "path": None}),
+    ],
+)
+def test_secret_paths_denied(tool, tool_input):
+    assert not allowed("explorer", tool, tool_input)
+    assert not allowed("implementer", tool, tool_input)
+
+
+def test_normal_paths_allowed():
+    assert allowed("explorer", "Read", {"file_path": "src/env.py"})
+    assert allowed("explorer", "Read", {"file_path": "/repo/src/a.py"})
+    assert allowed("explorer", "Grep", {"pattern": "os.environ", "path": "src"})
+    assert allowed("explorer", "Bash", {"command": "rg os.environ src"})
+    assert allowed("explorer", "Glob", {"pattern": "**/*.py"})
+    assert allowed("explorer", "Grep", {"pattern": "x", "path": None})
+    assert allowed("explorer", "Bash", {"command": "git show HEAD:src/a.py"})
+
+
+def test_disallowed_tools_and_modes():
+    for role in ROLES.values():
+        dis = disallowed_tools_for(role)
+        assert "Task" in dis and "Agent" in dis
+        assert not set(dis) & set(role.tools)
+        assert set(dis) | set(role.tools) >= set(KNOWN_TOOLS)
+    assert "Edit" in disallowed_tools_for(ROLES["reviewer"])
+    assert "Bash" in disallowed_tools_for(ROLES["architect"])
+    assert permission_mode_for("implementer") == "acceptEdits"
+    assert permission_mode_for(ROLES["doc-writer"]) == "acceptEdits"
+    for name in ("explorer", "reviewer", "architect", "test-runner"):
+        assert permission_mode_for(name) == "dontAsk"
+
+
+def _hook_input(tool, tool_input):
+    return {
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool,
+        "tool_input": tool_input,
+        "session_id": "s",
+        "cwd": CWD,
+    }
+
+
+def test_pre_tool_use_hook_shape():
+    hook = make_pre_tool_use_hook(ROLES["reviewer"], CWD)
+    out = asyncio.run(hook(_hook_input("Edit", {"file_path": "a.py"}), "t1", None))
+    spec = out["hookSpecificOutput"]
+    assert spec["hookEventName"] == "PreToolUse"
+    assert spec["permissionDecision"] == "deny"
+    assert "Edit" in spec["permissionDecisionReason"]
+    assert set(out) == {"hookSpecificOutput"}
+    assert asyncio.run(hook(_hook_input("Read", {"file_path": "a.py"}), "t2", None)) == {}
+    out = asyncio.run(hook({"hook_event_name": "PreToolUse"}, None, None))
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_can_use_tool_callback():
+    from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+    cb = make_can_use_tool("explorer", CWD)
+    assert isinstance(
+        asyncio.run(cb("Bash", {"command": "git status"}, None)), PermissionResultAllow
+    )
+    res = asyncio.run(cb("Bash", {"command": "git status; rm -rf x"}, None))
+    assert isinstance(res, PermissionResultDeny)
+    assert res.message
+
+
+# --- write-path confinement -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "~/.bashrc",
+        "/etc/x",
+        "../x",
+        "sub/../../x",
+        ".git/hooks/pre-commit",
+        "sub/.git/config",
+        "/repo/.git/config",
+        ".carcara/runs/x/state.json",
+        "",
+    ],
+)
+@pytest.mark.parametrize("tool", ["Edit", "Write"])
+def test_write_outside_cwd_or_into_git_denied(tool, path):
+    assert not allowed("implementer", tool, {"file_path": path})
+    assert not allowed("doc-writer", tool, {"file_path": path})
+
+
+def test_notebook_and_multiedit_paths_confined():
+    base = ROLES["implementer"]
+    role = Role(base.name, base.description, (*base.tools, "NotebookEdit", "MultiEdit"), "")
+    nb = "NotebookEdit"
+    assert not decide(role, nb, {"notebook_path": "../n.ipynb"}, CWD).allow
+    assert decide(role, nb, {"notebook_path": "n.ipynb"}, CWD).allow
+    assert not decide(role, "MultiEdit", {"file_path": "/etc/x", "edits": []}, CWD).allow
+    edits = [{"file_path": ".git/config", "old_string": "a", "new_string": "b"}]
+    assert not decide(role, "MultiEdit", {"file_path": "a.py", "edits": edits}, CWD).allow
+
+
+def test_write_through_symlink_dir_outside_cwd_denied(tmp_path):
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    repo.mkdir()
+    outside.mkdir()
+    (repo / "link").symlink_to(outside, target_is_directory=True)
+    (repo / "src").mkdir()
+    cwd = str(repo)
+    assert not decide("implementer", "Write", {"file_path": "link/x"}, cwd).allow
+    assert not decide("implementer", "Write", {"file_path": f"{cwd}/link/x"}, cwd).allow
+    assert decide("implementer", "Write", {"file_path": "src/new.py"}, cwd).allow
+    assert decide("implementer", "Edit", {"file_path": f"{cwd}/src/a.py"}, cwd).allow
+    # Reads are confined too: the symlink resolves outside cwd.
+    assert not decide("explorer", "Read", {"file_path": "link/x"}, cwd).allow
+    assert decide("explorer", "Read", {"file_path": "src/a.py"}, cwd).allow
+
+
+def test_write_with_symlinked_cwd(tmp_path):
+    real = tmp_path / "real"
+    (real / "src").mkdir(parents=True)
+    (tmp_path / "outside").mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    cwd = str(alias)
+    assert decide("implementer", "Write", {"file_path": f"{alias}/src/a.py"}, cwd).allow
+    assert decide("implementer", "Write", {"file_path": f"{real}/src/a.py"}, cwd).allow
+    assert decide("implementer", "Write", {"file_path": "src/a.py"}, cwd).allow
+    assert not decide("implementer", "Write", {"file_path": f"{alias}/.git/config"}, cwd).allow
+    assert not decide("implementer", "Write", {"file_path": f"{alias}/../outside/x"}, cwd).allow
+
+
+# --- case-insensitive / symlinked secrets, .claude, read confinement --------
+
+
+@pytest.mark.parametrize(
+    "tool,tool_input",
+    [
+        ("Read", {"file_path": ".ENV"}),
+        ("Read", {"file_path": "sub/.Env.Local"}),
+        ("Read", {"file_path": "Secrets/key"}),
+        ("Grep", {"pattern": "KEY", "path": "SECRETS"}),
+        ("Glob", {"pattern": "**/.ENV*"}),
+    ],
+)
+def test_secret_paths_case_insensitive(tool, tool_input):
+    assert not allowed("explorer", tool, tool_input)
+
+
+@pytest.mark.parametrize("command", ["cat .ENV", "head SECRETS/a", "rg -g '.ENV*' KEY"])
+def test_read_only_bash_secret_case_insensitive(command):
+    assert not allowed("explorer", "Bash", {"command": command})
+
+
+def test_symlink_to_secret_denied(tmp_path):
+    (tmp_path / ".env").write_text("KEY=1")
+    (tmp_path / "harmless.txt").symlink_to(tmp_path / ".env")
+    (tmp_path / "vault").symlink_to(tmp_path / "secrets", target_is_directory=True)
+    cwd = str(tmp_path)
+    assert not decide("explorer", "Read", {"file_path": "harmless.txt"}, cwd).allow
+    assert not decide("explorer", "Read", {"file_path": "vault/k"}, cwd).allow
+    assert not decide("explorer", "Bash", {"command": "cat harmless.txt"}, cwd).allow
+    assert not decide("implementer", "Edit", {"file_path": "harmless.txt"}, cwd).allow
+
+
+@pytest.mark.parametrize(
+    "path", [".claude/settings.json", ".Claude/agents/x.md", "/repo/.CLAUDE/settings.json"]
+)
+@pytest.mark.parametrize("role", ["implementer", "doc-writer"])
+def test_write_into_claude_dir_denied(role, path):
+    assert not allowed(role, "Write", {"file_path": path})
+    assert not allowed(role, "Edit", {"file_path": path})
+
+
+def test_claude_md_stays_writable():
+    assert allowed("doc-writer", "Edit", {"file_path": "CLAUDE.md"})
+
+
+@pytest.mark.parametrize(
+    "tool,tool_input",
+    [
+        ("Read", {"file_path": "/etc/passwd"}),
+        ("Read", {"file_path": "~/.ssh/id_rsa"}),
+        ("Read", {"file_path": "../other/a.py"}),
+        ("Read", {"file_path": "src/../../x"}),
+        ("Grep", {"pattern": "x", "path": "/etc"}),
+        ("Grep", {"pattern": "x", "path": ".."}),
+        ("Glob", {"pattern": "/etc/*"}),
+        ("Glob", {"pattern": "../**/*.py"}),
+        ("Glob", {"pattern": "src/*/../../../x"}),
+        ("Glob", {"pattern": "~/*"}),
+        ("Glob", {"pattern": "*.py", "path": "/tmp"}),
+    ],
+)
+@pytest.mark.parametrize("role", ["explorer", "implementer"])
+def test_reads_outside_cwd_denied(role, tool, tool_input):
+    assert not allowed(role, tool, tool_input)
+
+
+def test_reads_inside_cwd_allowed():
+    assert allowed("explorer", "Read", {"file_path": "src/../a.py"})
+    assert allowed("explorer", "Glob", {"pattern": "src/**/*.py", "path": "/repo/src"})
+    assert allowed("explorer", "Grep", {"pattern": "/etc", "glob": "*.py"})
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat /etc/passwd",
+        "ls ..",
+        "head -n 5 ../x",
+        "rg foo /etc",
+        "grep -e foo /etc/hosts",
+        "find / -name x",
+        "find . -newer /etc/passwd",
+        "git diff -- ../x",
+    ],
+)
+@pytest.mark.parametrize("role", ["explorer", "reviewer"])
+def test_read_only_bash_outside_cwd_denied(role, command):
+    assert not allowed(role, "Bash", {"command": command})
+
+
+@pytest.mark.parametrize(
+    "command", ["rg -n /api/v1 src", "grep /usr a.py", "rg --files src", "ls /repo/src"]
+)
+def test_read_only_bash_patterns_not_treated_as_paths(command):
+    assert allowed("explorer", "Bash", {"command": command})
+
+
+def test_implementer_bash_unconfined():
+    assert allowed("implementer", "Bash", {"command": "cat /etc/hostname"})
+
+
+# --- StructuredOutput / Glob path / secret-glob regressions ----------------
+
+
+@pytest.mark.parametrize("role", [*ROLES, "main", None, "nope"])
+def test_structured_output_always_allowed(role):
+    assert decide(role, STRUCTURED_OUTPUT_TOOL, {"verdict": "approve"}, CWD).allow
+    hook = make_pre_tool_use_hook(role, CWD)
+    out = asyncio.run(hook(_hook_input(STRUCTURED_OUTPUT_TOOL, {}), None, None))
+    assert out == {}
+
+
+def test_structured_output_in_allowed_never_disallowed():
+    assert STRUCTURED_OUTPUT_TOOL not in KNOWN_TOOLS
+    for role in ROLES.values():
+        assert STRUCTURED_OUTPUT_TOOL in allowed_tools_for(role)
+        assert STRUCTURED_OUTPUT_TOOL not in disallowed_tools_for(role)
+        assert "*" not in disallowed_tools_for(role)
+
+
+def test_glob_pattern_resolved_relative_to_path(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (tmp_path / "outside").mkdir()
+    (repo / "src" / "out").symlink_to("../../outside", target_is_directory=True)
+    cwd = str(repo)
+    assert not decide("explorer", "Glob", {"pattern": "out/*", "path": "src"}, cwd).allow
+    assert not decide("explorer", "Glob", {"pattern": "~/*", "path": "src"}, cwd).allow
+    assert decide("explorer", "Glob", {"pattern": "*.py", "path": "src"}, cwd).allow
+    assert decide("explorer", "Glob", {"pattern": "out/*"}, cwd).allow
+
+
+@pytest.mark.parametrize("glob", [".en[v]", ".en?", "*env", "secret*", "src/.E*", ".*"])
+def test_secret_matching_globs_denied(glob):
+    assert not allowed("explorer", "Glob", {"pattern": glob})
+    assert not allowed("explorer", "Grep", {"pattern": "x", "glob": glob})
+    assert not allowed("explorer", "Bash", {"command": f"rg -g '{glob}' KEY"})
+    assert not allowed("explorer", "Bash", {"command": f"find . -name '{glob}'"})
+
+
+@pytest.mark.parametrize("glob", ["*", "**/*", "*.py", "**/environment*.py", ".github/*"])
+def test_ordinary_globs_allowed(glob):
+    assert allowed("explorer", "Glob", {"pattern": glob})

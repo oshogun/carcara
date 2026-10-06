@@ -25,18 +25,28 @@ carcara balances this by:
 
 ## Install
 
-Requirements: `bash`, `sed`, `awk`, `find` (macOS and Linux).
+Requirements: Python 3.10 or newer.
 
 ```sh
-git clone https://github.com/oshogun/carcara.git
-ln -s "$PWD/carcara/bin/carcara" /usr/local/bin/carcara   # optional
+git clone https://github.com/oshogun/carcara.git && cd carcara
+pipx install .          # or: uv tool install .
+# or straight from git: pipx install git+https://github.com/oshogun/carcara.git
 ```
+
+Running `bin/carcara` from a git clone still works but is deprecated and will
+be removed in 0.3.0.
 
 ## Usage
 
 ```sh
-carcara [options] [target-dir]     # target-dir defaults to the current directory
+carcara [install] [options] [target-dir]   # target-dir defaults to the current directory
+carcara profiles                           # list profiles
+carcara run "<task>"                       # run the pipeline headlessly (see below)
 ```
+
+`install`, `profiles` and `run` as the first argument are subcommands; to
+target a directory with one of those names use `carcara -- <dir>` or
+`carcara install <dir>`.
 
 | Option | Description |
 |---|---|
@@ -92,6 +102,92 @@ only appends or updates the section between `<!-- carcara:begin -->` and
 | M | explorer → implementer → test-runner → reviewer |
 | L | explorer → architect → **your approval** → implementer → test-runner → reviewer → doc-writer |
 
+## carcara run
+
+`carcara run "<task>"` runs the same pipeline headlessly from the terminal,
+one Claude Agent SDK session per stage.
+
+Requirements: the [Claude Code CLI](https://code.claude.com/docs/en/setup) on
+`PATH` and authenticated.
+
+**Billing.** Each stage runs through the `claude` CLI using your Claude Code
+login, so by default runs draw on your Claude subscription (Pro/Max) usage
+limits. `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are hidden from the CLI
+(with a notice) unless you pass `--use-api-key`, which bills the pay-per-token
+API instead; on `--resume` the run keeps the choice it was started with.
+With `--project-settings`, the project's `.claude/settings.json` is loaded too, and
+an `env.ANTHROPIC_API_KEY` or `apiKeyHelper` there can still switch the CLI to
+API billing.
+Explicit provider settings (`CLAUDE_CODE_USE_BEDROCK`, `..._VERTEX`,
+`..._FOUNDRY`) are left alone. Reported costs are the SDK's estimate at API
+prices: on a subscription they are not charged, but they approximate how much
+plan usage the run consumed.
+
+```sh
+carcara run "add rate limiting to the public API"
+carcara run --dry-run                 # print the stage table, no backend calls
+```
+
+Stages per size (triage picks the size unless `--size S|M|L` is given):
+
+| Size | Stages |
+|---|---|
+| S | implement → test (→ review with `--review`) |
+| M | explore → plan → implement → test → review |
+| L | explore → plan (architect) → **approval** → implement per plan step → test → review → docs |
+
+**Approval gate.** L plans (and M plans with `--approve-plan`) wait for you. On
+a TTY you are prompted; `--yes` auto-approves; without a TTY the run stops with
+exit code 3 and is continued later with `--resume <id> --yes`. If tests still
+fail, the fix loop runs at most 2 iterations, then exits with code 4.
+
+| Option | Description |
+|---|---|
+| `-p, --profile NAME` | profile name or `.env` path (default `balanced`) |
+| `--max-budget-usd USD` | cap the total estimated cost (exit 5 when exceeded); on a subscription this is a proxy for plan usage |
+| `--use-api-key` | let the CLI use `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` (pay-per-token API billing) instead of your subscription login |
+| `--dry-run` | show stages, models and tools without calling Claude |
+| `--plan-only` | stop after the plan |
+| `--resume RUN_ID` / `--list` | continue a stored run / list stored runs |
+| `--allow-dirty` | allow uncommitted changes (clean tree required by default) |
+| `--project-settings` | load the project's Claude Code settings and CLAUDE.md (note: their `env` / `apiKeyHelper` can re-enable API billing) |
+| `--cwd DIR` | project directory (default `.`) |
+
+The budget is checked from the estimated stage costs the SDK reports; a stage
+that errors out reports none, so its usage may go uncounted.
+
+**Run directory.** Each run is stored in `.carcara/runs/<id>/`: `state.json`,
+`events.jsonl` (append-only log) and `report.md`. The base commit is recorded
+in the state.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | done (or plan-only) |
+| 1 | error |
+| 3 | awaiting plan approval |
+| 4 | needs human (e.g. tests still failing after the fix loop) |
+| 5 | budget exceeded |
+| 130 | interrupted (state saved; resume with `--resume`) |
+
+### Tool policy
+
+Each role gets only its own tools. Read-only roles (explorer, reviewer) may run
+Bash only from a flag allowlist (git status/diff/log/show, ls, rg, grep, find,
+cat, wc, head, tail; no shell metacharacters, no unknown options). Reads are
+confined to the repo, and `.env`, `.env.*` and `secrets/` are refused (case-
+insensitively, symlinks resolved). Write tools are confined to the repo and
+refuse `.git`, `.claude` and `.carcara`. The policy is
+enforced by a PreToolUse hook, which applies in every permission mode;
+`bypassPermissions` is never used.
+
+Known risks:
+
+- implementer and test-runner have unrestricted Bash. This is mitigated by the
+  clean-tree requirement and the base commit recorded for each run.
+- Grep and recursive searches may still surface secrets in a searched directory.
+- `setting_sources` is empty by default, so project settings and CLAUDE.md are
+  not loaded into stages; pass `--project-settings` to opt in.
+
 ## Profiles
 
 | Role | economy | balanced | quality |
@@ -104,16 +200,21 @@ only appends or updates the section between `<!-- carcara:begin -->` and
 | test-runner | haiku | haiku | haiku |
 | doc-writer | haiku | haiku | sonnet |
 
-Profiles live in `profiles/*.env`. To customise, copy one and pass its path:
+Profiles live in `src/carcara/data/profiles/*.env`. To customise, copy one and
+pass its path (also accepted by `carcara run -p`):
 
 ```sh
-cp profiles/balanced.env my.env    # edit MODEL_* values (opus, sonnet, haiku, inherit or a model id)
+cp src/carcara/data/profiles/balanced.env my.env    # edit MODEL_* values (opus, sonnet, haiku, inherit or a model id)
 carcara --profile ./my.env --force .
 ```
 
 ## Development
 
 ```sh
-tests/run.sh                       # test suite
-shellcheck bin/carcara tests/run.sh
+pip install -e '.[dev]'
+ruff check .
+pytest -q
+tests/fixtures/regen_golden.sh     # regenerate golden installer output after template/profile changes
 ```
+
+See `tests/fixtures/golden/README.md` for the golden and bash-parity fixtures.

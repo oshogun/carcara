@@ -1,0 +1,131 @@
+"""Strict JSON schemas for each ``carcara run`` stage's structured output.
+
+``validate`` is a deliberately small checker (types, enums, required keys,
+``additionalProperties: false``, array items) so no jsonschema dependency is
+needed; it covers exactly the subset used by these schemas.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+def _obj(properties: dict[str, Any], optional: tuple[str, ...] = ()) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": [k for k in properties if k not in optional],
+        "additionalProperties": False,
+    }
+
+
+def _arr(items: dict[str, Any]) -> dict[str, Any]:
+    return {"type": "array", "items": items}
+
+
+_STR: dict[str, Any] = {"type": "string"}
+_INT: dict[str, Any] = {"type": "integer"}
+_BOOL: dict[str, Any] = {"type": "boolean"}
+
+SCHEMAS: dict[str, dict[str, Any]] = {
+    "triage": _obj({"size": {"type": "string", "enum": ["S", "M", "L"]}, "rationale": _STR}),
+    "explore": _obj(
+        {
+            "summary": _STR,
+            "findings": _arr(_obj({"path": _STR, "line": _INT, "fact": _STR}, optional=("line",))),
+        }
+    ),
+    "plan": _obj(
+        {
+            "goal": _STR,
+            "steps": _arr(_obj({"id": _STR, "files": _arr(_STR), "change": _STR})),
+            "tests": _arr(_STR),
+            "acceptance": _arr(_STR),
+            "risks": _arr(_STR),
+        }
+    ),
+    "implement": _obj(
+        {
+            "changed": _arr(_obj({"path": _STR, "summary": _STR})),
+            "verified": _STR,
+            "notes": _STR,
+            "blocked": _BOOL,
+            "user_facing_change": _BOOL,
+        }
+    ),
+    "test": _obj(
+        {
+            "passed": _BOOL,
+            "commands": _arr(_STR),
+            "failures": _arr(_obj({"name": _STR, "detail": _STR})),
+        }
+    ),
+    "review": _obj(
+        {
+            "verdict": {"type": "string", "enum": ["approve", "request_changes"]},
+            "findings": _arr(
+                _obj(
+                    {
+                        "severity": {
+                            "type": "string",
+                            "enum": ["blocker", "major", "minor", "nit"],
+                        },
+                        "path": _STR,
+                        "line": _INT,
+                        "issue": _STR,
+                        "fix": _STR,
+                    },
+                    optional=("line",),
+                )
+            ),
+        }
+    ),
+    "docs": _obj({"changed": _arr(_STR)}),
+}
+
+
+def schema_for(stage: str) -> dict[str, Any]:
+    return SCHEMAS[stage]
+
+
+_TYPES: dict[str, tuple[type, ...]] = {
+    "object": (dict,),
+    "array": (list,),
+    "string": (str,),
+    "boolean": (bool,),
+    "integer": (int,),
+}
+
+
+def _check(schema: dict[str, Any], value: Any, path: str, errors: list[str]) -> None:
+    kind = schema.get("type")
+    if kind is not None:
+        ok = isinstance(value, _TYPES[kind])
+        if kind == "integer" and isinstance(value, bool):
+            ok = False
+        if not ok:
+            errors.append(f"{path}: expected {kind}")
+            return
+    if "enum" in schema and value not in schema["enum"]:
+        errors.append(f"{path}: {value!r} not in {schema['enum']}")
+    if kind == "object":
+        props: dict[str, Any] = schema.get("properties", {})
+        for key in schema.get("required", []):
+            if key not in value:
+                errors.append(f"{path}: missing required key {key!r}")
+        for key, item in value.items():
+            if key in props:
+                _check(props[key], item, f"{path}.{key}", errors)
+            elif schema.get("additionalProperties") is False:
+                errors.append(f"{path}: unexpected key {key!r}")
+    elif kind == "array" and "items" in schema:
+        for i, item in enumerate(value):
+            _check(schema["items"], item, f"{path}[{i}]", errors)
+
+
+def validate(stage_or_schema: str | dict[str, Any], data: Any) -> list[str]:
+    """Return a list of validation errors (empty when ``data`` conforms)."""
+    schema = SCHEMAS[stage_or_schema] if isinstance(stage_or_schema, str) else stage_or_schema
+    errors: list[str] = []
+    _check(schema, data, "$", errors)
+    return errors
