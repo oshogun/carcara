@@ -50,7 +50,7 @@ def test_matches_golden(tmp_path, case, capsys):
     assert main(["-p", CASES[case], str(target)]) == 0
     assert tree(target / ".claude") == tree(gold / "dot-claude")
     assert (target / "CLAUDE.md").read_bytes() == (gold / "CLAUDE.md.golden").read_bytes()
-    assert sorted(os.listdir(target)) == [".claude", "CLAUDE.md"]
+    assert sorted(os.listdir(target)) == [".carcara", ".claude", "CLAUDE.md"]
 
 
 def test_install_subcommand_equals_flag_only(tmp_path):
@@ -79,7 +79,11 @@ def test_output_format(tmp_path, capsys):
     out = capsys.readouterr().out.splitlines()
     assert out[0] == f"carcara {__version__}: installing profile 'economy' into d"
     assert out[1] == "  create     d/.claude/agents/architect.md"
-    assert out[-3] == "  create     d/CLAUDE.md"
+    assert out[-5:-2] == [
+        "  create     d/CLAUDE.md",
+        "  create     d/.carcara/.gitignore",
+        "  create     d/.carcara/profile",
+    ]
     assert out[-2] == "done: 13 file(s) written, 0 skipped."
 
 

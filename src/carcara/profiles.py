@@ -21,6 +21,9 @@ MODEL_KEYS: tuple[str, ...] = (
     "MODEL_DOC_WRITER",
 )
 
+# Profile recorded by ``carcara install`` in the target project; read by ``carcara run``.
+INSTALLED_PROFILE_REL = ".carcara/profile"
+
 _SAFE = re.compile(r"[A-Za-z0-9._-]+", re.ASCII)
 _LIST_LINE = re.compile(rb"MODEL_[A-Z_]+=")
 
@@ -94,6 +97,16 @@ def load_profile(spec: str) -> Profile:
     if not _SAFE.fullmatch(name):
         raise ProfileError(f"invalid profile name: {name}")
     return Profile(name=name, models=models, source=source)
+
+
+def read_installed_profile(root: str) -> str | None:
+    """The profile spec recorded by ``carcara install`` in ``root``; None if absent."""
+    try:
+        with open(os.path.join(root, INSTALLED_PROFILE_REL), encoding="utf-8") as fh:
+            spec = fh.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return spec or None
 
 
 def list_profiles() -> str:

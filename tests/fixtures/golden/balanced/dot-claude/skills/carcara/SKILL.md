@@ -36,8 +36,9 @@ heredoc (never in shell arguments):
     CARCARA_TASK
 
 Never add `--yes`, `--accept-failures` or `--use-api-key` yourself. The first
-stderr line is `carcara: run <id> started`; remember the id. Tell the user the
-run started; keep chatting if they want. You are notified when it finishes.
+stderr line is `carcara: run <id> started (profile <name>)`; remember the id.
+Tell the user the run started; keep chatting if they want. You are notified
+when it finishes.
 
 ## 4. On completion
 Take the exit code of the background `carcara run`, read

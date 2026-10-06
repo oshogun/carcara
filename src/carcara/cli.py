@@ -82,7 +82,8 @@ def _add_run_parser(sub: Any) -> None:
         "-p",
         "--profile",
         default=None,
-        help=f"profile name or .env path (default {DEFAULT_PROFILE})",
+        help="profile name or .env path (default: profile recorded by `carcara install`, "
+        f"else {DEFAULT_PROFILE})",
     )
     run.add_argument("--size", choices=SIZES, help="skip triage and use this size")
     run.add_argument("--yes", action="store_true", help="auto-approve the plan gate")
@@ -180,11 +181,44 @@ def _dry_run_stages(size: str, review_small: bool) -> list[tuple[str, str | None
     return rows
 
 
-def _dry_run(profile: Any, ns: argparse.Namespace, cwd: str) -> str:
+def _project_root(cwd: str) -> str:
+    """The git toplevel containing ``cwd``, else ``cwd`` itself."""
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True, text=True
+        )
+    except OSError:
+        return cwd
+    top = proc.stdout.strip()
+    return top if proc.returncode == 0 and top else cwd
+
+
+def _select_profile(ns: argparse.Namespace, cwd: str) -> tuple[Any, str]:
+    """(profile, origin): --profile, else the one `carcara install` recorded, else balanced."""
+    from carcara.profiles import ProfileError, load_profile, read_installed_profile
+
+    if ns.profile:
+        return load_profile(ns.profile), "explicit"
+    spec = read_installed_profile(_project_root(cwd))
+    if spec is None:
+        return load_profile(DEFAULT_PROFILE), "default"
+    try:
+        return load_profile(spec), "installed"
+    except (ProfileError, OSError) as exc:
+        _err(
+            f"warning: installed profile {spec!r} could not be loaded ({exc}); "
+            f"falling back to {DEFAULT_PROFILE}"
+        )
+        return load_profile(DEFAULT_PROFILE), "default"
+
+
+def _dry_run(profile: Any, ns: argparse.Namespace, cwd: str, origin: str) -> str:
     from carcara.backend import build_request
     from carcara.roles import get_role
 
-    out = [f"carcara run --dry-run (profile {profile.name}; no backend calls)"]
+    out = [f"carcara run --dry-run (profile {profile.name}, {origin}; no backend calls)"]
     for size in (ns.size,) if ns.size else SIZES:
         out.append(f"\nsize {size}:")
         rows: list[tuple[str, str | None]] = [] if ns.size else [("triage", None)]
@@ -463,8 +497,8 @@ def _sigterm_as_interrupt() -> Iterator[None]:
         signal.signal(signal.SIGTERM, previous)
 
 
-def _announce(run_id: str, resumed: bool) -> None:
-    _err(f"run {run_id} {'resumed' if resumed else 'started'}")
+def _announce(run_id: str, resumed: bool, profile_name: str) -> None:
+    _err(f"run {run_id} {'resumed' if resumed else 'started'} (profile {profile_name})")
     sys.stderr.flush()
 
 
@@ -504,7 +538,7 @@ def _run_main(ns: argparse.Namespace) -> int:
         RunOptions,
         require_toplevel,
     )
-    from carcara.profiles import ProfileError, load_profile
+    from carcara.profiles import ProfileError
     from carcara.roles import RoleError
     from carcara.runstore import RunBusy, RunStore, RunStoreError
 
@@ -526,7 +560,8 @@ def _run_main(ns: argparse.Namespace) -> int:
     orch: Orchestrator | None = None
     try:
         if ns.dry_run:
-            sys.stdout.write(_dry_run(load_profile(ns.profile or DEFAULT_PROFILE), ns, cwd))
+            profile, origin = _select_profile(ns, cwd)
+            sys.stdout.write(_dry_run(profile, ns, cwd, origin))
             return 0
         store = RunStore(cwd)
         if ns.resume:
@@ -550,7 +585,7 @@ def _run_main(ns: argparse.Namespace) -> int:
             if not ns.task:
                 _err("missing TASK (or use --resume RUN_ID / --list / --dry-run)")
                 return 1
-            profile = load_profile(ns.profile or DEFAULT_PROFILE)
+            profile, _ = _select_profile(ns, cwd)
             use_api_key = ns.use_api_key
         backend = _ProgressBackend(_make_backend(use_api_key))
         options = RunOptions(
@@ -563,8 +598,15 @@ def _run_main(ns: argparse.Namespace) -> int:
             project_settings=ns.project_settings,
             use_api_key=use_api_key,
         )
+        name = profile.name
         orch = Orchestrator(
-            backend, profile, cwd, store, _make_gate(ns.yes), options, on_start=_announce
+            backend,
+            profile,
+            cwd,
+            store,
+            _make_gate(ns.yes),
+            options,
+            on_start=lambda run_id, resumed: _announce(run_id, resumed, name),
         )
         coro = (
             orch.resume(

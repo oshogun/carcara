@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+- `carcara run` now defaults to the profile chosen at `carcara install`
+  (recorded in `.carcara/profile`) instead of always using balanced; an
+  unloadable recorded profile warns and falls back to balanced. The run start
+  line shows the profile: `carcara: run <id> started (profile <name>)` (#16).
+
 ### Removed
 - The deprecated bash `bin/carcara` (deprecated in 0.2.0). Install the Python
   package with `pipx install .` or `uv tool install .` instead.

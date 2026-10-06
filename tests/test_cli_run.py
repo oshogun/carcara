@@ -386,10 +386,16 @@ def test_started_and_resumed_lines(repo, fake, capsys):
     fake({"explore": [EXPLORE], "plan": [PLAN]})
     assert run(repo, "big change", "--size", "L") == 3
     (run_id,) = RunStore(repo).list_runs()
-    assert capsys.readouterr().err.splitlines()[0] == f"carcara: run {run_id} started"
+    assert (
+        capsys.readouterr().err.splitlines()[0]
+        == f"carcara: run {run_id} started (profile balanced)"
+    )
     fake({"implement": [IMPL], "test": [TEST_OK], "review": [REVIEW_OK]})
     assert run(repo, "--resume", run_id, "--yes") == 0
-    assert capsys.readouterr().err.splitlines()[0] == f"carcara: run {run_id} resumed"
+    assert (
+        capsys.readouterr().err.splitlines()[0]
+        == f"carcara: run {run_id} resumed (profile balanced)"
+    )
 
 
 def test_concurrent_run_is_busy_exit_6(repo, fake, capsys):
@@ -528,7 +534,7 @@ def test_sigterm_saves_state_and_exits_130(repo, fake, tmp_path, sleep):
             proc.kill()
     assert proc.returncode == 130, lines + [rest]
     (run_id,) = RunStore(repo).list_runs()
-    assert lines[0] == f"carcara: run {run_id} started\n"
+    assert lines[0] == f"carcara: run {run_id} started (profile balanced)\n"
     assert "interrupted; state saved" in rest
     assert _state(repo, run_id)["status"] == "running"
     assert not _lock(repo).exists()

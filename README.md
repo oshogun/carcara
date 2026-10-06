@@ -190,7 +190,7 @@ fail, the fix loop runs at most 2 iterations, then exits with code 4.
 
 | Option | Description |
 |---|---|
-| `-p, --profile NAME` | profile name or `.env` path (default `balanced`) |
+| `-p, --profile NAME` | profile name or `.env` path (default: the profile recorded by `carcara install`, else `balanced`) |
 | `--size S\|M\|L` | skip triage and use this size |
 | `--yes` / `--approve-plan` | auto-approve the plan gate / gate M plans too |
 | `--max-budget-usd USD` | cap the total estimated cost (exit 5 when exceeded); stored with the run and kept on `--resume` unless given again; on a subscription this is a proxy for plan usage |
@@ -274,6 +274,15 @@ pass its path (also accepted by `carcara run -p`):
 cp src/carcara/data/profiles/balanced.env my.env    # edit MODEL_* values (opus, sonnet, haiku, inherit or a model id)
 carcara --profile ./my.env --force .
 ```
+
+`carcara install` records the chosen profile in `.carcara/profile` (a name, or
+the absolute path of a custom `.env` file; `.carcara/` is gitignored, so a fresh
+clone has no record). `carcara run` and `carcara run --dry-run` use it unless
+`--profile` is given, and fall back to `balanced` when nothing is recorded. If
+the recorded profile can't be loaded (e.g. the `.env` file moved), the run
+warns on stderr and uses `balanced`. `--resume` always keeps the profile the
+run started with. The run's first stderr line shows the profile:
+`carcara: run <id> started (profile quality)`.
 
 ## Development
 

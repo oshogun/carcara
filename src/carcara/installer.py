@@ -16,6 +16,8 @@ Messages, ordering, dry-run, skip/--force and the CLAUDE.md markers follow the
 - ``--strict-policy`` adds Read/Grep/Glob hook groups and the
   ``.carcara/strict-policy`` flag file that applies the carcara policy to
   carcara-role subagents in interactive sessions; without it both are removed.
+- ``.carcara/profile`` records the chosen profile (name, or absolute path of a
+  custom file) so ``carcara run`` defaults to it.
 
 All validation (CLAUDE.md markers, settings.json JSON/shape) happens before
 any write.
@@ -33,7 +35,13 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from carcara import __version__
-from carcara.profiles import Profile, ProfileError, list_profiles, load_profile
+from carcara.profiles import (
+    INSTALLED_PROFILE_REL,
+    Profile,
+    ProfileError,
+    list_profiles,
+    load_profile,
+)
 from carcara.resources import claude_md_template, iter_claude_templates, render, templates_root
 
 BEGIN_MARKER = b"<!-- carcara:begin -->"
@@ -351,20 +359,48 @@ def _remove_skill(dest: str) -> None:
             break
 
 
+def _install_carcara_gitignore(target: str, dry_run: bool, out: TextIO) -> None:
+    ignore = f"{target}/{CARCARA_GITIGNORE_REL}"
+    if not os.path.exists(ignore):
+        out.write(_action("create", ignore))
+        if not dry_run:
+            _write(ignore, b"*\n")
+
+
 def _install_strict_flag(target: str, strict: bool, dry_run: bool, out: TextIO) -> None:
     flag = f"{target}/{STRICT_POLICY_REL}"
     if strict:
-        ignore = f"{target}/{CARCARA_GITIGNORE_REL}"
-        for path, data in ((ignore, b"*\n"), (flag, b"")):
-            if os.path.exists(path):
-                continue
-            out.write(_action("create", path))
+        if not os.path.exists(flag):
+            out.write(_action("create", flag))
             if not dry_run:
-                _write(path, data)
+                _write(flag, b"")
     elif os.path.exists(flag):
         out.write(_action("remove", flag))
         if not dry_run:
             os.unlink(flag)
+
+
+def _install_profile_record(
+    target: str, profile_spec: str, profile: Profile, dry_run: bool, out: TextIO
+) -> None:
+    """Record the profile for ``carcara run``. Gitignored on purpose: a custom
+    profile is recorded as an absolute, machine-local path."""
+    # Same test as load_profile: a file spec (even one named like a built-in)
+    # is recorded by path, a packaged profile by name.
+    is_file = os.path.isfile(profile_spec)
+    spec = os.path.abspath(profile.source) if is_file else profile.name
+    data = f"{spec}\n".encode()
+    path = f"{target}/{INSTALLED_PROFILE_REL}"
+    if os.path.exists(path):
+        with open(path, "rb") as fh:
+            if fh.read() == data:
+                return
+        action = "overwrite"
+    else:
+        action = "create"
+    out.write(_action(action, path))
+    if not dry_run:
+        _write(path, data)
 
 
 def _is_user_config_dir(target: str) -> bool:
@@ -448,7 +484,9 @@ def install(
         _write(dest, _render_resource(res, profile))
 
     _install_claude_md(claude_md, profile, routing, dry_run, out)
+    _install_carcara_gitignore(target, dry_run, out)
     _install_strict_flag(target, strict_policy, dry_run, out)
+    _install_profile_record(target, profile_spec, profile, dry_run, out)
 
     out.write(f"done: {result.written} file(s) written, {result.skipped} skipped.\n")
     if result.skipped > 0:
