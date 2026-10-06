@@ -74,6 +74,11 @@ Then start Claude Code in the target directory and run:
         └── sdlc-review.md        # /sdlc-review [focus]
 ```
 
+`settings.json` denies the `Read` tool on `.env*` and `secrets/**`. This is a
+guard rail, not a sandbox: agents with `Bash` could still read such files via
+shell commands, so keep real secrets out of the working tree or add your own
+`Bash(...)` deny rules.
+
 Re-running is safe: existing files in `.claude/` are skipped unless
 `--force` is given, and an existing `CLAUDE.md` keeps its content — carcara
 only appends or updates the section between `<!-- carcara:begin -->` and
@@ -83,7 +88,7 @@ only appends or updates the section between `<!-- carcara:begin -->` and
 
 | Size | Flow |
 |---|---|
-| S | main session edits directly → test-runner |
+| S | main session edits directly → test-runner (→ reviewer if security, data handling or public APIs are touched) |
 | M | explorer → implementer → test-runner → reviewer |
 | L | explorer → architect → **your approval** → implementer → test-runner → reviewer → doc-writer |
 

@@ -30,7 +30,11 @@ test_fresh_install() {
   check "settings.json installed" [ -f "$d/.claude/settings.json" ]
   check "CLAUDE.md created" [ -f "$d/CLAUDE.md" ]
   check "no unrendered placeholders" bash -c "! grep -rq '{{' '$d/.claude' '$d/CLAUDE.md'"
-  check "settings.json is valid JSON" python3 -m json.tool "$d/.claude/settings.json"
+  if command -v python3 > /dev/null; then
+    check "settings.json is valid JSON" python3 -m json.tool "$d/.claude/settings.json"
+  else
+    echo "skip - settings.json is valid JSON (python3 not found)"
+  fi
 }
 
 test_agent_frontmatter() {

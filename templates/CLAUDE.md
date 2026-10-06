@@ -4,14 +4,14 @@ This project uses the carcara SDLC framework. Work is split across
 specialised subagents in `.claude/agents/`, each pinned to the cheapest model
 that does its job well:
 
-| Agent         | Model                   | Role                                  |
-|---------------|-------------------------|---------------------------------------|
-| explorer      | {{MODEL_EXPLORER}}      | read-only code search, file:line facts |
-| architect     | {{MODEL_ARCHITECT}}     | plans for non-trivial changes          |
-| implementer   | {{MODEL_IMPLEMENTER}}   | writes code and tests                  |
-| test-runner   | {{MODEL_TEST_RUNNER}}   | runs build/lint/tests, summarises      |
-| reviewer      | {{MODEL_REVIEWER}}      | high-signal diff review                |
-| doc-writer    | {{MODEL_DOC_WRITER}}    | updates affected docs                  |
+| Agent | Model | Role |
+|---|---|---|
+| explorer | {{MODEL_EXPLORER}} | read-only code search, file:line facts |
+| architect | {{MODEL_ARCHITECT}} | plans for non-trivial changes |
+| implementer | {{MODEL_IMPLEMENTER}} | writes code and tests |
+| test-runner | {{MODEL_TEST_RUNNER}} | runs build/lint/tests, summarises |
+| reviewer | {{MODEL_REVIEWER}} | high-signal diff review |
+| doc-writer | {{MODEL_DOC_WRITER}} | updates affected docs |
 
 Commands: `/sdlc <task>` (full triaged pipeline), `/sdlc-plan`, `/sdlc-build`,
 `/sdlc-test`, `/sdlc-review`.
