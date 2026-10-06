@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+- Automatic routing of code-change requests in Claude Code: `carcara install`
+  adds a `carcara` skill, a routing rule in the `CLAUDE.md` section and
+  `PreToolUse` / `UserPromptSubmit` hooks in `.claude/settings.json`. Just ask
+  for a change; Claude Code hands it to `carcara run` and reports back.
+- The `carcara hook` PreToolUse handler is the sole approver of carcara
+  commands: it allows only the exact `carcara run|status|diff` forms the skill
+  uses and asks you for everything else. `--yes`, `--accept-failures`,
+  `--use-api-key`, `--max-budget-usd` and resuming a run that hit its budget
+  always need your confirmation.
+- Main-session edit guard: while routing is on, the main session cannot edit
+  project files directly, and no session (subagents included) can write
+  `.claude/settings*.json` or `.claude/skills/carcara/`. Opt-outs:
+  `carcara routing off|on|status`, `CARCARA_OFF=1`, `carcara install --no-routing`.
+- `carcara install --strict-policy`: also apply the carcara tool policy to
+  carcara-role subagents in interactive sessions.
+- Dirty-tree runs: `carcara run --allow-dirty` diffs against a snapshot of
+  your uncommitted work, so it is not attributed to carcara.
+- `carcara diff [RUN_ID] [--stat]` and `carcara status [RUN_ID] [--json|--plan]`.
+- Single active run lock; `carcara run` exits 6 when another run is active.
+- `carcara run --resume <id> --reject` / `--feedback TEXT|-` (re-plan or guide
+  a needs_human retry), `--accept-failures`, and `carcara run -` (task on stdin).
+- The run budget (`--max-budget-usd`) is stored with the run and kept on
+  `--resume` unless a new value is given.
+- Under Claude Code (`CLAUDECODE` set) the approval gate never waits on stdin.
+- Nested-run guard: `carcara run` refuses to start inside a carcara stage.
+- Abbreviated long options (e.g. `--ye`) are rejected.
+- `carcara install` refuses to install into your home directory, the Claude
+  config dir (`CLAUDE_CONFIG_DIR` or `~/.claude`) or anything inside
+  `~/.claude`, which Claude Code would load as user-level config.
+
+### Changed
+- `.claude/settings.json` is now merged into an existing file (your
+  permissions, hooks and model are kept) instead of skipped or overwritten.
+- `carcara install` output differs from 0.2.0: the skill, the hooks and the
+  routing text in `CLAUDE.md`. `carcara install --no-routing` reproduces the
+  0.2.0 `settings.json` and `CLAUDE.md`.
+- The interactive `/sdlc` S path now delegates the change to the `implementer`
+  subagent instead of editing in the main session.
+- The version is 0.3.0.
+
 ## 0.2.0
 
 ### Added

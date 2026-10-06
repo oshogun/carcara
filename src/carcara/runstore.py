@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,61 @@ STATUSES = (
 
 class RunStoreError(Exception):
     """Unknown run id or unreadable run state."""
+
+
+class RunBusy(RunStoreError):
+    """Another live ``carcara run`` holds ``.carcara/active.json``."""
+
+    def __init__(self, run_id: str) -> None:
+        super().__init__(f"another run is active: {run_id}")
+        self.run_id = run_id
+
+
+def _pid_alive(pid: Any) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OverflowError, OSError):
+        return False
+    return True
+
+
+def _proc_start(pid: int) -> str | None:
+    """Start identity of process ``pid`` (guards against pid reuse); None if unknown."""
+    try:
+        if sys.platform.startswith("linux"):
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+            # Field 22 (starttime); fields after the last ")" start at field 3.
+            return raw.rsplit(")", 1)[1].split()[19]
+        if sys.platform == "darwin":
+            proc = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            return proc.stdout.strip() or None
+    except (OSError, IndexError, ValueError, subprocess.SubprocessError):
+        return None
+    return None
+
+
+def _holder_alive(data: dict[str, Any]) -> bool:
+    """The lock holder is still the process that wrote the lock."""
+    pid = data.get("pid")
+    if not _pid_alive(pid):
+        return False
+    start = data.get("start")
+    if not isinstance(start, str):
+        return True  # no identity recorded: pid-only check
+    current = _proc_start(pid)
+    return current is None or current == start
 
 
 def _now() -> str:
@@ -160,6 +217,8 @@ class RunStore:
             "message": None,
             "verify_round": 0,
             "plan_approved": False,
+            "plan_revision": 0,
+            "plan_feedback": [],
             "accepted_failures": None,
             "stages": [],
             "totals": _empty_totals(),
@@ -183,6 +242,130 @@ class RunStore:
         except (OSError, ValueError) as exc:
             raise RunStoreError(f"cannot read {path}: {exc}") from exc
         return Run(run_dir, state)
+
+    # -- single active run lock ---------------------------------------------
+
+    @property
+    def lock_path(self) -> Path:
+        return self.base / "active.json"
+
+    def _read_lock_text(self) -> str | None:
+        """The lock file's raw content, or None when missing/unreadable."""
+        try:
+            return self.lock_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+
+    @staticmethod
+    def _parse_lock(text: str | None) -> dict[str, Any] | None:
+        try:
+            data = json.loads(text) if text is not None else None
+        except ValueError:
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("run_id"), str):
+            return None
+        return data
+
+    def _read_lock(self) -> dict[str, Any] | None:
+        """The lock's content, or None when missing or corrupt."""
+        return self._parse_lock(self._read_lock_text())
+
+    def active(self) -> dict[str, Any] | None:
+        """The live lock holder ``{pid, run_id, started}``; None if absent or stale."""
+        data = self._read_lock()
+        if data is None or not _holder_alive(data):
+            return None
+        return data
+
+    def acquire_lock(self, run_id: str) -> None:
+        """Create ``active.json`` exclusively; take over stale/corrupt locks.
+
+        Raises ``RunBusy`` when a live process holds the lock (even this one,
+        under another run id).
+        """
+        self._ensure_root()
+        lock: dict[str, Any] = {"pid": os.getpid(), "run_id": run_id, "started": _now()}
+        start = _proc_start(os.getpid())
+        if start is not None:
+            lock["start"] = start
+        payload = json.dumps(lock)
+        token = f"{os.getpid()}.{secrets.token_hex(4)}"
+        tmp = self.base / f".active.json.{token}.tmp"
+        aside = self.base / f".active.json.{token}.stale"
+        tmp.write_text(payload + "\n", encoding="utf-8")
+        try:
+            for _ in range(10):
+                try:
+                    self._create_lock(tmp, payload)
+                    return
+                except FileExistsError:
+                    pass
+                text = self._read_lock_text()
+                if text is None and not self.lock_path.exists():
+                    continue
+                holder = self._parse_lock(text)
+                if holder is not None and _holder_alive(holder):
+                    raise RunBusy(holder["run_id"])
+                self._take_over(text, aside)
+            raise RunStoreError(f"could not acquire {self.lock_path}")
+        finally:
+            tmp.unlink(missing_ok=True)
+            aside.unlink(missing_ok=True)
+
+    def _take_over(self, stale_text: str | None, aside: Path) -> None:
+        """Discard the lock judged stale from ``stale_text``.
+
+        The lock is first moved aside atomically; if it no longer holds the
+        content judged stale (another process replaced it in between), it is
+        put back and ``RunBusy`` is raised.
+        """
+        try:
+            os.rename(self.lock_path, aside)
+        except FileNotFoundError:
+            return
+        try:
+            moved = aside.read_text(encoding="utf-8")
+        except OSError:
+            moved = None
+        if moved == stale_text:
+            aside.unlink(missing_ok=True)
+            return
+        # Not the lock we judged stale: restore it unless the path was retaken.
+        try:
+            os.link(aside, self.lock_path)
+        except FileExistsError:
+            pass
+        except OSError:
+            if not self.lock_path.exists():
+                os.rename(aside, self.lock_path)
+        aside.unlink(missing_ok=True)
+        holder = self._parse_lock(moved)
+        raise RunBusy(holder["run_id"] if holder is not None else "unknown")
+
+    def _create_lock(self, tmp: Path, payload: str) -> None:
+        """Exclusive create; raises FileExistsError if the lock exists."""
+        try:
+            # Hard-linking a fully written file is atomic: readers never see
+            # a partially written lock.
+            os.link(tmp, self.lock_path)
+        except FileExistsError:
+            raise
+        except OSError:
+            # Filesystems without hard links: plain O_EXCL create.
+            fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload + "\n")
+
+    def release_lock(self, run_id: str) -> None:
+        """Remove the lock only if this process holds it for ``run_id``."""
+        data = self._read_lock()
+        if data is not None and data.get("run_id") == run_id and data.get("pid") == os.getpid():
+            try:
+                self.lock_path.unlink()
+            except FileNotFoundError:
+                pass
 
     def list_runs(self) -> list[str]:
         if not self.root.is_dir():

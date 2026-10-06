@@ -68,7 +68,10 @@ def test_default_target_is_cwd(tmp_path, capsys):
     assert (tmp_path / ".claude" / "agents" / "explorer.md").is_file()
     out = capsys.readouterr().out
     assert "  create     ./.claude/agents/architect.md\n" in out
-    assert out.endswith("Next: start Claude Code in . and run: /sdlc <task>\n")
+    assert out.endswith(
+        "Next: start Claude Code in . and just ask for a change \u2014 carcara routes it. "
+        "(`carcara routing off` to disable.)\n"
+    )
 
 
 def test_output_format(tmp_path, capsys):
@@ -78,7 +81,7 @@ def test_output_format(tmp_path, capsys):
     assert out[0] == f"carcara {__version__}: installing profile 'economy' into d"
     assert out[1] == "  create     d/.claude/agents/architect.md"
     assert out[-3] == "  create     d/CLAUDE.md"
-    assert out[-2] == "done: 12 file(s) written, 0 skipped."
+    assert out[-2] == "done: 13 file(s) written, 0 skipped."
 
 
 def test_skip_and_force(tmp_path, capsys):
@@ -88,7 +91,7 @@ def test_skip_and_force(tmp_path, capsys):
     assert main(["d"]) == 0
     out = capsys.readouterr().out
     assert "  skip       d/.claude/agents/reviewer.md (exists; use --force to overwrite)\n" in out
-    assert "done: 11 file(s) written, 1 skipped.\n" in out
+    assert "done: 12 file(s) written, 1 skipped.\n" in out
     assert "re-run with --force to apply profile 'balanced' to them.\n" in out
     assert (d / ".claude" / "agents" / "reviewer.md").read_text() == "custom\n"
     assert main(["--force", "d"]) == 0
@@ -206,12 +209,11 @@ def test_install_help_and_version(capsys):
     assert capsys.readouterr().out == f"carcara {__version__}\n"
 
 
-# --- parity with the 0.1.0 bash installer -----------------------------------
-# tests/fixtures/bash_parity.json holds the exit code, stdout, stderr and
-# resulting tree (sha256 per file) that the retired bash installer produced
-# for each scenario; the Python CLI must reproduce them exactly.
+# --- install snapshot (originally parity with the 0.1.0 bash installer) -----
+# tests/fixtures/install_snapshot.json holds the exit code, stdout, stderr and
+# resulting tree (sha256 per file) for each scenario (see golden/README.md).
 
-PARITY = json.loads((FIXTURES / "bash_parity.json").read_text())
+PARITY = json.loads((FIXTURES / "install_snapshot.json").read_text())
 
 
 def _existing(proj):
@@ -232,7 +234,7 @@ def tree_sha256(base: Path) -> dict[str, str]:
 
 
 @pytest.mark.parametrize("case", PARITY, ids=[c["id"] for c in PARITY])
-def test_parity_with_bash(tmp_path, case):
+def test_install_snapshot(tmp_path, case):
     proj = tmp_path / "proj"
     proj.mkdir()
     setup = SETUPS[case["setup"]]
@@ -367,13 +369,16 @@ def test_bad_profile_file_rejected(tmp_path, transform, err):
     assert list((tmp_path / "d").iterdir()) == []
 
 
-def test_skip_keeps_existing_settings(tmp_path):
+def test_existing_settings_are_merged_keeping_model(tmp_path):
     d = tmp_path / "d"
     (d / ".claude").mkdir(parents=True)
     (d / ".claude" / "settings.json").write_text('{"model":"opus"}\n')
     proc = run_cli(["d"], cwd=tmp_path, check=True)
-    assert "  skip       d/.claude/settings.json" in proc.stdout
-    assert (d / ".claude" / "settings.json").read_text() == '{"model":"opus"}\n'
+    assert "  merge      d/.claude/settings.json\n" in proc.stdout
+    data = json.loads((d / ".claude" / "settings.json").read_text())
+    assert data["model"] == "opus"
+    assert "Bash(carcara run *)" not in data["permissions"]["allow"]
+    assert "Read" in data["permissions"]["allow"]
 
 
 def test_default_target_is_cwd_subprocess(tmp_path):
@@ -457,3 +462,46 @@ def test_oserror_is_reported_without_traceback(tmp_path):
     assert proc.returncode == 1
     assert proc.stderr.startswith("carcara: ")
     assert "Traceback" not in proc.stderr
+
+
+_HOME_ERR = (
+    "carcara: refusing to install into your home directory (Claude Code would load it as "
+    "user-level config for every project); pass a project directory\n"
+)
+
+
+@pytest.mark.parametrize("sub", ["", ".claude", ".claude/agents", "cfg"])
+def test_refuses_home_and_claude_config_dir(tmp_path, monkeypatch, capsys, sub):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude" / "agents").mkdir(parents=True)
+    (home / "cfg").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / "cfg"))
+    target = home / sub if sub else home
+    before = sorted(str(p) for p in home.rglob("*"))
+    assert main([str(target)]) == 1
+    assert capsys.readouterr().err == _HOME_ERR
+    assert sorted(str(p) for p in home.rglob("*")) == before
+    assert not (home / "CLAUDE.md").exists()
+    # Also via cwd default and a symlink resolving to home.
+    monkeypatch.chdir(target)
+    assert main([]) == 1
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    assert main([str(link)]) == 1
+    assert sorted(str(p) for p in home.rglob("*")) == before
+
+
+def test_project_under_home_still_installs(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    proj = home / "proj"
+    proj.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    assert main([str(proj)]) == 0
+    assert (proj / "CLAUDE.md").is_file()
+    assert (proj / ".claude" / "settings.json").is_file()
+    assert not (home / "CLAUDE.md").exists()

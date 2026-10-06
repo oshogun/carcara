@@ -18,16 +18,17 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from carcara.backend import Backend, BackendError, build_request
-from carcara.policy import is_secret_path
 from carcara.profiles import Profile
 from carcara.roles import Role, get_role
-from carcara.runstore import Run, RunStore
+from carcara.runstore import Run, RunBusy, RunStore
 
 EXIT_CODES = {
     "done": 0,
@@ -36,6 +37,7 @@ EXIT_CODES = {
     "awaiting_approval": 3,
     "needs_human": 4,
     "budget_exceeded": 5,
+    "busy": 6,  # another run holds .carcara/active.json (not a run status)
 }
 
 # Per-stage max_turns defaults, keyed by pipeline step name.
@@ -116,11 +118,44 @@ class _Stop(Exception):
         self.message = message
 
 
-def _git(cwd: str, *args: str) -> subprocess.CompletedProcess[str]:
+# Repo config must not run code during carcara's own git calls.
+_GIT_SAFE = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+_DIFF_SAFE = ("--no-ext-diff", "--no-textconv", "--no-color")
+# Paths never captured in snapshots nor shown in diffs.
+_SECRET_PATHSPECS = (
+    ":(icase,glob)**/.env",
+    ":(icase,glob)**/.env.*",
+    ":(icase,glob)**/secrets/**",
+)
+_SNAPSHOT_PATHSPECS = (
+    ".",
+    ":(exclude).carcara",
+    *(":(exclude," + spec[2:] for spec in _SECRET_PATHSPECS),
+)
+
+
+def _git(
+    cwd: str, *args: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    full_env = {**os.environ, **env} if env else None
     try:
-        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
+        return subprocess.run(
+            ["git", *_GIT_SAFE, *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=full_env,
+        )
     except FileNotFoundError as exc:
         raise OrchestratorError("git is not installed") from exc
+
+
+def _git_ok(cwd: str, *args: str, env: dict[str, str] | None = None) -> str:
+    proc = _git(cwd, *args, env=env)
+    if proc.returncode != 0:
+        raise OrchestratorError(f"git {args[0]} failed: {proc.stderr.strip()}")
+    return proc.stdout.strip()
 
 
 def _dirty_entries(cwd: str) -> list[str]:
@@ -134,43 +169,60 @@ def _dirty_entries(cwd: str) -> list[str]:
     return entries
 
 
-def _untracked_context(cwd: str, budget: int) -> str:
-    """Contents of untracked (non-ignored) files, roughly capped at ``budget``.
+def _snapshot_tree(cwd: str) -> str:
+    """Tree sha of the working tree (minus .carcara/ and secrets), via a temp index.
 
-    Skips ``.carcara/``, secret paths, symlinks, binary and oversized files.
+    The temp index is seeded from the real one (stat cache, tracked files), so
+    the user's index is never touched.
     """
-    proc = _git(cwd, "ls-files", "--others", "--exclude-standard", "-z")
-    parts: list[str] = []
-    used = 0
-    for path in proc.stdout.split("\0"):
-        if not path or path == ".carcara" or path.startswith(".carcara/"):
-            continue
-        if used >= budget:
-            parts.append(f"\n### untracked: {path}\n(omitted: diff cap reached)\n")
-            continue
-        full = os.path.join(cwd, path)
-        body: str
-        if is_secret_path(path):
-            body = "(skipped: secret file)"
-        elif os.path.islink(full) or not os.path.isfile(full):
-            body = "(skipped: not a regular file)"
-        else:
-            try:
-                if os.path.getsize(full) > budget - used:
-                    body = "(skipped: too large)"
-                else:
-                    with open(full, "rb") as fh:
-                        data = fh.read()
-                    if b"\0" in data:
-                        body = "(skipped: binary)"
-                    else:
-                        body = data.decode("utf-8", errors="replace")
-            except OSError:
-                body = "(skipped: unreadable)"
-        part = f"\n### untracked: {path}\n{body}\n"
-        parts.append(part)
-        used += len(part)
-    return "".join(parts)
+    real_index = _git_ok(cwd, "rev-parse", "--git-path", "index")
+    real_index = os.path.join(cwd, real_index)
+    tmp_dir = tempfile.mkdtemp(prefix="carcara-index-")
+    try:
+        tmp_index = os.path.join(tmp_dir, "index")
+        if os.path.isfile(real_index):
+            shutil.copyfile(real_index, tmp_index)
+        env = {"GIT_INDEX_FILE": tmp_index}
+        if _git(cwd, "add", "-A", "--", *_SNAPSHOT_PATHSPECS, env=env).returncode != 0:
+            # Unusable seed (e.g. split index): start over from an empty index.
+            if not os.path.exists(tmp_index):
+                raise OrchestratorError("git add failed while snapshotting the working tree")
+            os.remove(tmp_index)
+            # Seed from HEAD so tracked secrets keep their committed content.
+            if _git(cwd, "rev-parse", "--verify", "-q", "HEAD", env=env).returncode == 0:
+                _git_ok(cwd, "read-tree", "HEAD", env=env)
+            _git_ok(cwd, "add", "-A", "--", *_SNAPSHOT_PATHSPECS, env=env)
+        # Tracked secrets keep their indexed content (never the working copy):
+        # dropping them would make a plain ``git diff <base>`` show them as new
+        # files. Diffs exclude them via the secret pathspecs instead.
+        return _git_ok(cwd, "write-tree", env=env)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def require_toplevel(cwd: str) -> None:
+    """Refuse a ``cwd`` that is not the repository root (pathspecs and the
+    run store are relative to it)."""
+    proc = _git(cwd, "rev-parse", "--show-toplevel")
+    if proc.returncode != 0:
+        raise OrchestratorError(f"{cwd} is not a git repository")
+    top = proc.stdout.strip()
+    if os.path.realpath(top) != os.path.realpath(cwd):
+        raise OrchestratorError(f"run from the repository root ({top})")
+
+
+def _safe_diff(cwd: str, base: str, tree: str, *opts: str, check: bool = True) -> str:
+    """``git diff`` of ``base`` vs ``tree`` without secrets, .carcara/ or repo diff drivers."""
+    proc = _git(cwd, "diff", *_DIFF_SAFE, *opts, base, tree, "--", *_SNAPSHOT_PATHSPECS)
+    if check and proc.returncode != 0:
+        raise OrchestratorError(f"git diff failed: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def run_diff(cwd: str, base: str, *, stat: bool = False) -> str:
+    """Changes in the working tree since ``base`` (what ``carcara diff`` prints)."""
+    tree = _snapshot_tree(cwd)
+    return _safe_diff(cwd, base, tree, *(("--stat",) if stat else ()))
 
 
 def _dumps(value: Any) -> str:
@@ -187,6 +239,32 @@ def _failing_items(test: dict[str, Any], review: dict[str, Any] | None) -> dict[
     return {}
 
 
+def _last_failing(run: Run) -> dict[str, Any]:
+    """Failing items of the latest test stage (and the review that followed it)."""
+    stages = run.state["stages"]
+    last = max((i for i, e in enumerate(stages) if e["stage"] == "test"), default=None)
+    if last is None:
+        return {}
+    review = next((e["output"] for e in stages[last + 1 :] if e["stage"] == "review"), None)
+    return _failing_items(stages[last]["output"], review)
+
+
+def _check_resume_flags(
+    status: str, reject: bool, feedback: str | None, accept_failures: bool
+) -> None:
+    """Validate --reject/--feedback/--accept-failures against the run status."""
+    if reject and status != "awaiting_approval":
+        raise OrchestratorError(f"--reject needs a run awaiting approval (run is {status})")
+    if feedback and status not in ("awaiting_approval", "needs_human"):
+        raise OrchestratorError(
+            f"--feedback needs a run awaiting approval or needing a human (run is {status})"
+        )
+    if accept_failures and status != "needs_human":
+        raise OrchestratorError(f"--accept-failures needs a needs_human run (run is {status})")
+    if accept_failures and (reject or feedback):
+        raise OrchestratorError("--accept-failures cannot be combined with --reject/--feedback")
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -196,6 +274,7 @@ class Orchestrator:
         store: RunStore,
         gate: Gate,
         options: RunOptions | None = None,
+        on_start: Callable[[str, bool], None] | None = None,
     ) -> None:
         self.backend = backend
         self.profile = profile
@@ -204,6 +283,8 @@ class Orchestrator:
         self.gate = gate
         self.options = options or RunOptions()
         self.run_state: Run | None = None
+        # Called as on_start(run_id, resumed) once the run holds the lock.
+        self.on_start = on_start
         self._roles: dict[str, Role] = {}
 
     # -- public entry points -------------------------------------------------
@@ -216,6 +297,7 @@ class Orchestrator:
                 "carcara run needs a base commit to diff against"
             )
         base_sha = proc.stdout.strip()
+        require_toplevel(self.cwd)
         if not self.options.allow_dirty:
             dirty = _dirty_entries(self.cwd)
             if dirty:
@@ -223,33 +305,160 @@ class Orchestrator:
                     "working tree has uncommitted changes; commit or stash them, "
                     "or pass --allow-dirty:\n" + "\n".join(dirty[:10])
                 )
+        holder = self.store.active()
+        if holder is not None:
+            raise RunBusy(holder["run_id"])
         run = self.store.create(task, self.profile.name, base_sha, size=self.options.size)
-        # Absolute path so ``carcara run --resume`` can reload custom profiles.
-        run.state["profile_source"] = os.path.abspath(self.profile.source)
-        run.state["use_api_key"] = self.options.use_api_key
-        run.save()
-        return await self._drive(run)
-
-    async def resume(self, run_id: str) -> RunOutcome:
         try:
-            run = self.store.load(run_id)
-        except Exception as exc:
-            raise OrchestratorError(str(exc)) from exc
+            self.store.acquire_lock(run.id)
+        except RunBusy as exc:
+            # Lost a race with another starter after the pre-check.
+            run.set_status("failed", str(exc))
+            raise
+        try:
+            self._started(run, resumed=False)
+            # Absolute path so ``carcara run --resume`` can reload custom profiles.
+            run.state["profile_source"] = os.path.abspath(self.profile.source)
+            run.state["use_api_key"] = self.options.use_api_key
+            # Persisted so a resume keeps the cap unless --max-budget-usd is given again.
+            run.state["max_budget_usd"] = self.options.max_budget_usd
+            try:
+                self._pin_base(run, snapshot=self.options.allow_dirty)
+            except OrchestratorError as exc:
+                run.set_status("failed", str(exc))
+                raise
+            return await self._drive(run)
+        finally:
+            self.store.release_lock(run.id)
+
+    async def resume(
+        self,
+        run_id: str,
+        *,
+        reject: bool = False,
+        feedback: str | None = None,
+        accept_failures: bool = False,
+    ) -> RunOutcome:
+        require_toplevel(self.cwd)
+        run = self._load(run_id)
         status = run.state["status"]
+        _check_resume_flags(status, reject, feedback, accept_failures)
         if status == "done":
             report = run.read_report() or self._report(run)
             return RunOutcome("done", 0, report, run.id)
-        run.event("resumed", previous_status=status)
-        if self.options.use_api_key and not run.state.get("use_api_key"):
-            run.state["use_api_key"] = True
-            run.save()
-        if status == "needs_human":
-            # The human fixed things: verify again under fresh stage keys.
-            run.state["verify_round"] = int(run.state.get("verify_round", 0)) + 1
-            run.save()
-        return await self._drive(run)
+        self.store.acquire_lock(run.id)
+        try:
+            # Another process may have driven the run before we got the lock.
+            run = self._load(run_id)
+            status = run.state["status"]
+            _check_resume_flags(status, reject, feedback, accept_failures)
+            if status == "done":
+                report = run.read_report() or self._report(run)
+                return RunOutcome("done", 0, report, run.id)
+            self._started(run, resumed=True)
+            run.event("resumed", previous_status=status)
+            if self.options.use_api_key and not run.state.get("use_api_key"):
+                run.state["use_api_key"] = True
+                run.save()
+            if self.options.max_budget_usd is None:
+                stored = run.state.get("max_budget_usd")
+                self.options = replace(
+                    self.options, max_budget_usd=None if stored is None else float(stored)
+                )
+            else:
+                run.state["max_budget_usd"] = self.options.max_budget_usd
+                run.save()
+            if reject and not feedback:
+                run.event("plan_rejected")
+                return self._finish(run, "failed", "plan rejected by user")
+            if accept_failures:
+                run.state["accepted_failures"] = True
+                run.save()
+                run.event("failures_accepted")
+                return self._finish(run, "done", "unresolved failures accepted by user")
+            if status == "awaiting_approval" and not any(
+                e["stage"] == "implement" for e in run.state["stages"]
+            ):
+                # Edits made while reviewing the plan are the user's, not carcara's.
+                self._pin_base(run, snapshot=True)
+            if status == "awaiting_approval" and feedback:
+                # Re-plan: a new revision under fresh plan stage keys.
+                run.state["plan_revision"] = int(run.state.get("plan_revision", 0)) + 1
+                run.state.setdefault("plan_feedback", []).append(feedback)
+                run.state["plan_approved"] = False
+                run.save()
+                run.event("plan_revision", revision=run.state["plan_revision"])
+            if status == "needs_human":
+                # The human fixed things: verify again under fresh stage keys.
+                rnd = int(run.state.get("verify_round", 0)) + 1
+                run.state["verify_round"] = rnd
+                if feedback:
+                    run.state.setdefault("retry_feedback", {})[str(rnd)] = feedback
+                blocked = run.state.pop("blocked", None)
+                run.state.pop("blocked_feedback", None)
+                if blocked and feedback:
+                    # Applied to the re-run of the blocked implement stage.
+                    run.state["blocked_feedback"] = {
+                        **blocked,
+                        "feedback": feedback,
+                        "round": rnd,
+                        "applied": False,
+                    }
+                run.save()
+            return await self._drive(run)
+        finally:
+            self.store.release_lock(run.id)
+
+    def _load(self, run_id: str) -> Run:
+        try:
+            return self.store.load(run_id)
+        except Exception as exc:
+            raise OrchestratorError(str(exc)) from exc
+
+    def _pin_base(self, run: Run, *, snapshot: bool) -> None:
+        """Set the run's diff base and pin it at refs/carcara/<run_id>.
+
+        With ``snapshot`` and a dirty tree, the base is a commit of the current
+        working tree (secrets and .carcara/ excluded) on top of HEAD, so the
+        user's uncommitted work is not attributed to carcara.
+        """
+        head = _git_ok(self.cwd, "rev-parse", "--verify", "HEAD^{commit}")
+        base, kind = head, "head"
+        if snapshot and _dirty_entries(self.cwd):
+            tree = _snapshot_tree(self.cwd)
+            base = _git_ok(
+                self.cwd,
+                "-c",
+                "user.name=carcara",
+                "-c",
+                "user.email=carcara@localhost",
+                "commit-tree",
+                "--no-gpg-sign",
+                tree,
+                "-p",
+                head,
+                "-m",
+                f"carcara base {run.id}",
+            )
+            kind = "snapshot"
+        _git_ok(self.cwd, "update-ref", f"refs/carcara/{run.id}", base)
+        run.state["base_sha"] = base
+        run.state["base_kind"] = kind
+        run.save()
+        run.event("base_pinned", base_sha=base, base_kind=kind)
+
+    def _started(self, run: Run, *, resumed: bool) -> None:
+        self.run_state = run
+        if self.on_start is not None:
+            self.on_start(run.id, resumed)
 
     # -- driver --------------------------------------------------------------
+
+    def _finish(self, run: Run, status: str, message: str | None) -> RunOutcome:
+        run.set_status(status, message)
+        report = self._report(run)
+        run.write_report(report)
+        return RunOutcome(status, EXIT_CODES[status], report, run.id)
 
     async def _drive(self, run: Run) -> RunOutcome:
         self.run_state = run
@@ -258,10 +467,7 @@ class Orchestrator:
             status, message = await self._pipeline(run)
         except _Stop as stop:
             status, message = stop.status, stop.message
-        run.set_status(status, message)
-        report = self._report(run)
-        run.write_report(report)
-        return RunOutcome(status, EXIT_CODES[status], report, run.id)
+        return self._finish(run, status, message)
 
     def _role(self, name: str) -> Role:
         if name not in self._roles:
@@ -290,11 +496,24 @@ class Orchestrator:
                 raise _Stop("budget_exceeded", f"budget exhausted before stage {key}")
 
         role = self._role(role_name) if role_name else None
+        text = prompt()
+        blocked = run.state.get("blocked_feedback")
+        apply_guidance = (
+            stage == "implement"
+            and blocked is not None
+            and blocked.get("key") == key
+            and not blocked.get("applied")
+        )
+        if apply_guidance:
+            text += (
+                f"\n\nA previous attempt at this stage was blocked: {blocked.get('notes', '')}"
+                f"\n\nUser guidance:\n{blocked['feedback']}"
+            )
         request = build_request(
             stage,
             role,
             self.profile,
-            prompt(),
+            text,
             self.cwd,
             max_turns=self.options.max_turns.get(turns_key),
             max_budget_usd=remaining,
@@ -331,9 +550,12 @@ class Orchestrator:
         output = result.structured
         if stage == "implement" and output.get("blocked"):
             # Not memoised: a resume re-runs the stage after the human intervenes.
+            run.state["blocked"] = {"key": key, "notes": output.get("notes", "")}
             run.save()
             run.event("stage_blocked", key=key, output=output)
             raise _Stop("needs_human", f"implementer blocked at {key}: {output.get('notes', '')}")
+        if apply_guidance:
+            blocked["applied"] = True
         run.record_stage(
             key,
             stage,
@@ -353,17 +575,16 @@ class Orchestrator:
     def _diff_context(self) -> str:
         assert self.run_state is not None
         base = self.run_state.state["base_sha"]
-        stat = _git(self.cwd, "diff", "--stat", base).stdout.strip()
-        diff = _git(self.cwd, "diff", base).stdout
-        if len(diff) < DIFF_CAP:
-            diff += _untracked_context(self.cwd, DIFF_CAP - len(diff))
+        tree = _snapshot_tree(self.cwd)
+        names = _safe_diff(self.cwd, base, tree, "--name-status", check=False)
+        stat = _safe_diff(self.cwd, base, tree, "--stat", check=False)
+        diff = _safe_diff(self.cwd, base, tree, check=False)
         if len(diff) > DIFF_CAP:
             diff = diff[:DIFF_CAP] + f"\n[... diff truncated at {DIFF_CAP} chars ...]"
-        status = "\n".join(_dirty_entries(self.cwd))
         return (
             f"## Changes since base {base}\n"
-            f"### git status --porcelain\n{status or '(clean)'}\n"
-            f"### git diff --stat\n{stat or '(no diff)'}\n"
+            f"### git diff --name-status\n{names.strip() or '(none)'}\n"
+            f"### git diff --stat\n{stat.strip() or '(no diff)'}\n"
             f"### git diff\n{diff or '(no diff)'}\n"
         )
 
@@ -419,7 +640,8 @@ class Orchestrator:
             plan = await self._plan_stage(task, explore, architect=size == "L")
             if self.options.plan_only:
                 return "plan_only", None
-            if size == "L" or self.options.approve_plan:
+            # Revised plans always go back to the gate (approve_plan is not persisted).
+            if size == "L" or self.options.approve_plan or run.state.get("plan_revision"):
                 self._gate(run, plan)
             steps = plan["steps"] if size == "L" else []
             if steps:
@@ -474,14 +696,35 @@ class Orchestrator:
     async def _plan_stage(
         self, task: str, explore: dict[str, Any] | None, *, architect: bool
     ) -> dict[str, Any]:
-        context = f"\n\nExplorer findings (JSON):\n{_dumps(explore)}" if explore else ""
-        prompt = (
-            f"Task: {task}{context}\n\nWrite an implementation plan: ordered steps with "
-            "stable ids and files, tests, acceptance criteria and risks."
-        )
+        run = self.run_state
+        assert run is not None
+        base = "architect" if architect else "plan"
+        rev = int(run.state.get("plan_revision", 0))
+
+        def key(n: int) -> str:
+            return f"{base}:r{n}" if n else base
+
+        def prompt() -> str:
+            context = f"\n\nExplorer findings (JSON):\n{_dumps(explore)}" if explore else ""
+            ask = (
+                "Write an implementation plan: ordered steps with stable ids and files, "
+                "tests, acceptance criteria and risks."
+            )
+            if rev:
+                previous = run.stage(key(rev - 1))
+                prev_plan = previous["output"] if previous else None
+                feedback = run.state.get("plan_feedback", [])[rev - 1]
+                ask = (
+                    f"Previous plan (JSON):\n{_dumps(prev_plan)}\n\n"
+                    f"The user rejected it with this feedback:\n{feedback}\n\n"
+                    "Write a revised implementation plan addressing the feedback: ordered "
+                    "steps with stable ids and files, tests, acceptance criteria and risks."
+                )
+            return f"Task: {task}{context}\n\n{ask}"
+
         if architect:
-            return await self._stage("architect", "plan", "architect", "architect", lambda: prompt)
-        return await self._stage("plan", "plan", None, "plan", lambda: prompt)
+            return await self._stage(key(rev), "plan", "architect", "architect", prompt)
+        return await self._stage(key(rev), "plan", None, "plan", prompt)
 
     def _step_prompt(
         self, task: str, plan: dict[str, Any], step: dict[str, Any]
@@ -541,6 +784,30 @@ class Orchestrator:
                     f"{stage_prefix}review", "review", "reviewer", "review", review_prompt
                 )
             return test, review
+
+        guidance = run.state.get("retry_feedback", {}).get(str(rnd)) if rnd else None
+        blocked = run.state.get("blocked_feedback") or {}
+        if blocked.get("round") == rnd and blocked.get("applied"):
+            guidance = None  # already given to the re-run blocked implement stage
+        if guidance:
+
+            def guided_prompt() -> str:
+                items = _last_failing(run)
+                return (
+                    f"Task: {task}\n\nThe run stopped with these failing items (JSON):\n"
+                    f"{_dumps(items)}\n\nUser guidance:\n{guidance}\n\n"
+                    f"Fix the failing items following the guidance.\n\n{self._diff_context()}"
+                )
+
+            fixes.append(
+                await self._stage(
+                    f"{prefix}guided-implement",
+                    "implement",
+                    "implementer",
+                    "implement",
+                    guided_prompt,
+                )
+            )
 
         test, review = await check(prefix)
         failing = _failing_items(test, review)
@@ -614,6 +881,10 @@ class Orchestrator:
             f"({'API key' if state.get('use_api_key') else 'subscription login'})",
             f"run dir: {rel_dir}",
         ]
+        if state.get("base_kind"):
+            lines.append(f"carcara changes: carcara diff {run.id}")
+        if state.get("accepted_failures"):
+            lines.append("accepted failures: yes (unresolved failures accepted by user)")
         if state.get("message"):
             note = state["message"]
             lines.append(f"note: {note if len(note) <= 300 else note[:297] + '...'}")
@@ -629,4 +900,6 @@ __all__ = [
     "OrchestratorError",
     "RunOptions",
     "RunOutcome",
+    "require_toplevel",
+    "run_diff",
 ]

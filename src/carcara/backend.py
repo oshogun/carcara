@@ -22,7 +22,9 @@ SDK notes (claude-agent-sdk 0.2.x):
   ``ANTHROPIC_API_KEY`` / ``ANTHROPIC_AUTH_TOKEN`` from ``os.environ`` while a
   stage runs and restores them afterwards, so the CLI uses the user's Claude
   subscription login. This is process-global, which is fine for the
-  single-run, sequential ``carcara run`` CLI.
+  single-run, sequential ``carcara run`` CLI. ``StageRequest.env`` (which
+  sets ``CARCARA_STAGE``) is passed as ``options.env`` and never contains
+  those keys.
 """
 
 from __future__ import annotations
@@ -56,6 +58,9 @@ MAIN_PROMPT = (
 
 
 API_KEY_ENV_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+# Set to the stage's role name (or "main") in every stage's CLI process, so
+# carcara's Claude Code hooks no-op there and `carcara run` refuses to nest.
+STAGE_ENV_VAR = "CARCARA_STAGE"
 
 
 @contextmanager
@@ -99,6 +104,8 @@ class StageRequest:
     max_turns: int | None = None
     max_budget_usd: float | None = None
     setting_sources: list[str] = field(default_factory=list)
+    # Extra environment for the stage's CLI process (merged over os.environ).
+    env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -156,6 +163,7 @@ def build_request(
         max_turns=max_turns,
         max_budget_usd=max_budget_usd,
         setting_sources=list(setting_sources or []),
+        env={STAGE_ENV_VAR: role_name or "main"},
     )
 
 
@@ -226,6 +234,7 @@ class SdkBackend:
             setting_sources=list(request.setting_sources),
             hooks={"PreToolUse": [sdk.HookMatcher(matcher=None, hooks=[hook])]},
             can_use_tool=can_use_tool,
+            env=dict(request.env),
         )
 
     async def run_stage(self, request: StageRequest) -> StageResult:

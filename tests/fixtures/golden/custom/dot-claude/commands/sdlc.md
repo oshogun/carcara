@@ -18,9 +18,10 @@ Classify the task and state the size in one line before doing anything else:
 - **L** — many files, new feature, refactor, or real design trade-offs.
 
 ## 2. Pipeline
-- **S:** make the change directly yourself (no explorer/architect), then use
-  the `test-runner` subagent. Skip review unless the change touches security,
-  data handling or public APIs.
+- **S:** delegate the change to the `implementer` subagent (no
+  explorer/architect; main-session edits are blocked while carcara routing is
+  on), then use the `test-runner` subagent. Skip review unless the change
+  touches security, data handling or public APIs.
 - **M:** `explorer` → `implementer` (give it the findings + a 3–6 bullet
   plan you write yourself) → `test-runner` → `reviewer`.
 - **L:** `explorer` → `architect` → show the plan to the user and **wait for
