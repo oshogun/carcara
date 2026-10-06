@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck bin/carcara tests/fixtures/regen_golden.sh
+        run: shellcheck tests/fixtures/regen_golden.sh
 
   python:
     strategy:

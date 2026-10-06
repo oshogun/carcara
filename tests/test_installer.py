@@ -15,7 +15,6 @@ from carcara.installer import install
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures"
 GOLDEN = FIXTURES / "golden"
-BASH = ROOT / "bin" / "carcara"
 
 CASES = {
     "economy": "economy",
@@ -404,47 +403,6 @@ def test_default_target_is_cwd_subprocess(tmp_path):
 def test_misc_flags_subprocess(tmp_path, argv, check):
     proc = run_cli(argv, cwd=tmp_path, check=True)
     assert check(proc.stdout)
-
-
-# --- bin/carcara deprecation shim -------------------------------------------
-
-needs_bash = pytest.mark.skipif(not shutil.which("bash"), reason="needs bash")
-
-
-def run_shim(cmd, cwd):
-    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "CARCARA_HOME")}
-    # The shim runs `python3` from PATH: make it the interpreter under test.
-    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
-    return subprocess.run([str(cmd), *SHIM_ARGS], cwd=cwd, env=env, capture_output=True, text=True)
-
-
-SHIM_ARGS = ["-n", "proj"]
-DEPRECATION = (
-    "carcara: bin/carcara is deprecated; install with `pipx install .` or `uv tool install .`\n"
-)
-
-
-@needs_bash
-def test_shim_runs_python_cli(tmp_path):
-    (tmp_path / "proj").mkdir()
-    proc = run_shim(BASH, tmp_path)
-    assert proc.returncode == 0, proc.stderr
-    assert proc.stderr == DEPRECATION
-    assert proc.stdout == run_cli(SHIM_ARGS, cwd=tmp_path, check=True).stdout
-    assert list((tmp_path / "proj").iterdir()) == []
-
-
-@needs_bash
-def test_shim_via_symlink(tmp_path):
-    (tmp_path / "bin").mkdir()
-    (tmp_path / "proj").mkdir()
-    link = tmp_path / "bin" / "carcara"
-    # Relative link from another directory exercises the resolve loop.
-    link.symlink_to(os.path.relpath(BASH, link.parent))
-    proc = run_shim(link, tmp_path)
-    assert proc.returncode == 0, proc.stderr
-    assert proc.stderr == DEPRECATION
-    assert "(dry run)" in proc.stdout.splitlines()[0]
 
 
 def test_oserror_is_reported_without_traceback(tmp_path):

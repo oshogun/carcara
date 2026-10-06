@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Removed
+- The deprecated bash `bin/carcara` (deprecated in 0.2.0). Install the Python
+  package with `pipx install .` or `uv tool install .` instead.
+
 ## 0.3.0
 
 ### Added
