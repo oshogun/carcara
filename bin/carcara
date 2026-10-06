@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# carcara - set up a token-balanced agentic SDLC for Claude Code in a directory.
+set -euo pipefail
+
+VERSION="0.1.0"
+BEGIN_MARKER="<!-- carcara:begin -->"
+END_MARKER="<!-- carcara:end -->"
+MODEL_KEYS="MODEL_MAIN MODEL_ARCHITECT MODEL_IMPLEMENTER MODEL_REVIEWER MODEL_EXPLORER MODEL_TEST_RUNNER MODEL_DOC_WRITER"
+
+resolve_home() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")/.." && pwd
+}
+
+CARCARA_HOME="${CARCARA_HOME:-$(resolve_home)}"
+TEMPLATES="$CARCARA_HOME/templates"
+PROFILES="$CARCARA_HOME/profiles"
+
+usage() {
+  cat <<EOF
+carcara $VERSION - agentic SDLC framework for Claude Code
+
+Usage: carcara [options] [target-dir]
+
+Installs subagents, slash commands, settings and a CLAUDE.md section into
+<target-dir> (default: current directory).
+
+Options:
+  -p, --profile NAME   model profile: economy | balanced | quality, or a path
+                       to a custom profile file (default: balanced)
+  -f, --force          overwrite existing carcara files in .claude/
+  -n, --dry-run        show what would be done without writing anything
+  -l, --list-profiles  list available profiles and their model routing
+  -V, --version        print version
+  -h, --help           show this help
+EOF
+}
+
+die() { echo "carcara: $*" >&2; exit 1; }
+
+list_profiles() {
+  local f name
+  for f in "$PROFILES"/*.env; do
+    name="$(basename "$f" .env)"
+    printf '%s\n' "$name"
+    grep -E '^MODEL_[A-Z_]+=' "$f" | sed 's/^/  /'
+  done
+}
+
+load_profile() {
+  local spec="$1" file key value line
+  if [ -f "$spec" ]; then
+    file="$spec"
+  else
+    case "$spec" in
+      ''|*/*|*.*) die "unknown profile: $spec" ;;
+    esac
+    file="$PROFILES/$spec.env"
+    [ -f "$file" ] || die "unknown profile: $spec (try --list-profiles)"
+  fi
+  for key in $MODEL_KEYS; do printf -v "$key" '%s' ""; done
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    key="${line%%=*}"
+    value="${line#*=}"
+    case " $MODEL_KEYS " in
+      *" $key "*) ;;
+      *) die "invalid key in profile $file: $key" ;;
+    esac
+    [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid model for $key in $file: '$value'"
+    printf -v "$key" '%s' "$value"
+  done < "$file"
+  for key in $MODEL_KEYS; do
+    [ -n "${!key}" ] || die "profile $file is missing $key"
+  done
+  PROFILE="$(basename "$file" .env)"
+  [[ "$PROFILE" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid profile name: $PROFILE"
+}
+
+render() {
+  local args=() key
+  for key in $MODEL_KEYS PROFILE; do
+    args+=(-e "s/{{$key}}/${!key}/g")
+  done
+  sed "${args[@]}" "$1"
+}
+
+install_file() {
+  local src="$1" dest="$2" action
+  if [ -e "$dest" ]; then
+    if [ "$FORCE" -eq 0 ]; then
+      echo "  skip       $dest (exists; use --force to overwrite)"
+      SKIPPED=$((SKIPPED + 1))
+      return
+    fi
+    action="overwrite"
+  else
+    action="create"
+  fi
+  printf '  %-10s %s\n' "$action" "$dest"
+  WRITTEN=$((WRITTEN + 1))
+  [ "$DRY_RUN" -eq 1 ] && return
+  mkdir -p "$(dirname "$dest")"
+  render "$src" > "$dest"
+}
+
+count_markers() {
+  BEGINS="$(grep -cxF "$BEGIN_MARKER" "$1" || true)"
+  ENDS="$(grep -cxF "$END_MARKER" "$1" || true)"
+  if [ "$BEGINS" -ne "$ENDS" ] || [ "$BEGINS" -gt 1 ] ||
+     { [ "$BEGINS" -eq 1 ] && [ "$(grep -nxF "$BEGIN_MARKER" "$1" | cut -d: -f1)" -gt "$(grep -nxF "$END_MARKER" "$1" | cut -d: -f1)" ]; }; then
+    die "$1 has unbalanced carcara markers; fix them manually"
+  fi
+}
+
+install_claude_md() {
+  local dest="$1" block="$WORKDIR/block" tmp="$WORKDIR/claude.md"
+  { echo "$BEGIN_MARKER"; render "$TEMPLATES/CLAUDE.md"; echo "$END_MARKER"; } > "$block"
+
+  if [ ! -e "$dest" ]; then
+    printf '  %-10s %s\n' "create" "$dest"
+    [ "$DRY_RUN" -eq 1 ] || cp "$block" "$dest"
+    return
+  fi
+
+  count_markers "$dest"
+  if [ "$BEGINS" -eq 0 ]; then
+    printf '  %-10s %s\n' "append" "$dest"
+    [ "$DRY_RUN" -eq 1 ] && return
+    { cat "$dest"; echo; cat "$block"; } > "$tmp"
+  else
+    printf '  %-10s %s\n' "update" "$dest"
+    [ "$DRY_RUN" -eq 1 ] && return
+    awk -v blockfile="$block" -v begin="$BEGIN_MARKER" -v end="$END_MARKER" '
+      $0 == begin { while ((getline l < blockfile) > 0) print l; skip = 1; next }
+      $0 == end   { skip = 0; next }
+      !skip       { print }
+    ' "$dest" > "$tmp"
+  fi
+  cat "$tmp" > "$dest"
+}
+
+main() {
+  local profile="balanced" target="" src rel
+  FORCE=0
+  DRY_RUN=0
+  WRITTEN=0
+  SKIPPED=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -p|--profile) [ $# -ge 2 ] || die "$1 requires an argument"; profile="$2"; shift 2 ;;
+      --profile=*) profile="${1#*=}"; shift ;;
+      -f|--force) FORCE=1; shift ;;
+      -n|--dry-run) DRY_RUN=1; shift ;;
+      -l|--list-profiles) list_profiles; exit 0 ;;
+      -V|--version) echo "carcara $VERSION"; exit 0 ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; break ;;
+      -*) die "unknown option: $1 (see --help)" ;;
+      *) [ -z "$target" ] || die "only one target directory may be given"; target="$1"; shift ;;
+    esac
+  done
+  if [ $# -gt 0 ]; then
+    if [ -n "$target" ] || [ $# -ne 1 ]; then die "only one target directory may be given"; fi
+    target="$1"
+  fi
+  target="${target:-.}"
+
+  [ -d "$TEMPLATES/claude" ] || die "templates not found in $CARCARA_HOME"
+  [ -d "$target" ] || die "target directory does not exist: $target"
+  load_profile "$profile"
+  [ ! -e "$target/CLAUDE.md" ] || count_markers "$target/CLAUDE.md"
+  WORKDIR="$(mktemp -d)"
+  trap 'rm -rf "$WORKDIR"' EXIT
+
+  echo "carcara $VERSION: installing profile '$PROFILE' into $target$([ "$DRY_RUN" -eq 1 ] && echo ' (dry run)')"
+
+  while IFS= read -r src; do
+    rel="${src#"$TEMPLATES/claude/"}"
+    install_file "$src" "$target/.claude/$rel"
+  done < <(find "$TEMPLATES/claude" -type f | LC_ALL=C sort)
+
+  install_claude_md "$target/CLAUDE.md"
+
+  echo "done: $WRITTEN file(s) written, $SKIPPED skipped."
+  if [ "$SKIPPED" -gt 0 ]; then
+    echo "note: skipped files keep their previous content; re-run with --force to apply profile '$PROFILE' to them."
+  fi
+  echo "Next: start Claude Code in $target and run: /sdlc <task>"
+}
+
+main "$@"
