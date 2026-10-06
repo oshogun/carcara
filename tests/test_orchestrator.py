@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import subprocess
+import tempfile
 
 import pytest
 
@@ -100,6 +101,7 @@ def check_requests(backend, **expect):
             assert not WRITE_TOOLS & set(req.allowed_tools), req
         assert req.setting_sources == expect.get("setting_sources", [])
         assert req.cwd == expect["cwd"]
+        assert req.env == {"CARCARA_STAGE": req.role or "main"}
 
 
 def test_small_sequence(repo):
@@ -316,7 +318,10 @@ def test_fix_loop_only_serious_findings(repo):
     )
     assert go(orch).status == "done"
     fix_prompt = backend.requests[3].prompt
-    assert '"issue":"bug"' in fix_prompt and "style" not in fix_prompt.split("git status")[0]
+    assert (
+        '"issue":"bug"' in fix_prompt
+        and "style" not in fix_prompt.split("## Changes since base")[0]
+    )
 
 
 def test_fix_loop_cap_needs_human_then_resume_with_dirty_tree(repo):
@@ -412,6 +417,37 @@ def test_budget_exceeded_result_subtype(repo):
     assert orch.run_state.state["totals"]["cost_usd"] == pytest.approx(0.7)
 
 
+def test_budget_persists_across_resume_unless_overridden(repo):
+    orch, _, _ = make(
+        repo,
+        {"implement": [impl()], "test": [TEST_OK]},
+        costs={"implement": 1.0},
+        size="S",
+        max_budget_usd=1.0,
+    )
+    out = go(orch)
+    assert out.status == "budget_exceeded"
+    run_id = out.run_id
+    assert RunStore(repo).load(run_id).state["max_budget_usd"] == 1.0
+    # Resume without the flag keeps the stored cap: no stage runs.
+    orch2, backend2, _ = make(repo, {"test": [TEST_OK]})
+    out2 = asyncio.run(orch2.resume(run_id))
+    assert (out2.status, out2.exit_code) == ("budget_exceeded", 5)
+    assert backend2.requests == []
+    assert RunStore(repo).load(run_id).state["max_budget_usd"] == 1.0
+    # An explicit higher cap is used and stored.
+    orch3, backend3, _ = make(repo, {"test": [TEST_OK]}, max_budget_usd=5.0)
+    assert asyncio.run(orch3.resume(run_id)).status == "done"
+    assert [r.max_budget_usd for r in backend3.requests] == [4.0]
+    assert RunStore(repo).load(run_id).state["max_budget_usd"] == 5.0
+
+
+def test_budget_none_stored_for_uncapped_run(repo):
+    orch, _, _ = make(repo, {"implement": [impl()], "test": [TEST_OK]}, size="S")
+    assert go(orch).status == "done"
+    assert orch.run_state.state["max_budget_usd"] is None
+
+
 def test_stage_error_fails_and_is_resumable(repo):
     err = StageResult(subtype="error_max_turns", is_error=True, errors=["too many turns"])
     orch, _, _ = make(repo, {"implement": [impl()], "test": [err]}, size="S")
@@ -468,35 +504,6 @@ def test_second_run_ignores_carcara_dir(repo):
     assert len(RunStore(repo).list_runs()) == 2
 
 
-def test_diff_context_includes_untracked_files(repo):
-    (repo / "new.py").write_text("print('hello')\n")
-    (repo / "blob.bin").write_bytes(b"\x00\x01binary")
-    (repo / ".env").write_text("TOKEN=secret\n")
-    (repo / ".carcara").mkdir()
-    (repo / ".carcara" / "x.txt").write_text("internal\n")
-    orch, _, _ = make(repo, {}, allow_dirty=True)
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
-    ).stdout.strip()
-    orch.run_state = orch.store.create("t", PROFILE.name, head)
-    ctx = orch._diff_context()
-    assert "### untracked: new.py\nprint('hello')" in ctx
-    assert "### untracked: blob.bin\n(skipped: binary)" in ctx
-    assert "TOKEN=secret" not in ctx
-    assert ".carcara" not in ctx.split("### git diff", 1)[1]
-
-
-def test_untracked_context_respects_cap(repo, monkeypatch):
-    import carcara.orchestrator as mod
-
-    monkeypatch.setattr(mod, "DIFF_CAP", 200)
-    (repo / "big.txt").write_text("y" * 1000)
-    (repo / "small.txt").write_text("ok\n")
-    text = mod._untracked_context(str(repo), 200)
-    assert "### untracked: big.txt\n(skipped: too large)" in text
-    assert "### untracked: small.txt\nok" in text
-
-
 def test_backend_error_mid_stage_fails_without_cost(repo):
     orch, _, _ = make(repo, {"implement": [impl()], "test": []}, size="S", costs={"implement": 0.2})
     out = go(orch)
@@ -550,3 +557,374 @@ def test_is_error_stage_cost_counted_in_totals(repo):
     out = go(orch)
     assert out.status == "failed"
     assert orch.run_state.state["totals"]["cost_usd"] == pytest.approx(0.008)
+
+
+def test_lock_acquire_release_and_ownership(repo):
+    from carcara.runstore import RunBusy
+
+    store = RunStore(repo)
+    assert store.active() is None
+    store.acquire_lock("r1")
+    assert store.active()["run_id"] == "r1"
+    with pytest.raises(RunBusy) as info:
+        store.acquire_lock("r2")
+    assert info.value.run_id == "r1"
+    store.release_lock("r2")  # not the owner: no-op
+    assert store.active()["run_id"] == "r1"
+    store.release_lock("r1")
+    assert store.active() is None and not store.lock_path.exists()
+    assert list(store.base.glob(".active.json.*")) == []
+
+
+def test_resume_releases_lock(repo):
+    orch, _, _ = make(
+        repo, {"explore": [EXPLORE], "plan": [PLAN]}, gate=AutoGate(decision="defer"), size="L"
+    )
+    assert go(orch).status == "awaiting_approval"
+    assert not orch.store.lock_path.exists()
+    orch2, _, _ = make(repo, {}, gate=AutoGate(decision="reject"), size="L")
+    assert asyncio.run(orch2.resume(orch.run_state.id)).status == "failed"
+    assert not orch2.store.lock_path.exists()
+
+
+PLAN_R1 = {**PLAN, "steps": [{"id": "step-r1", "files": ["c.py"], "change": "revised"}]}
+
+
+@pytest.mark.parametrize("size", ["L", "M"])
+def test_reject_with_feedback_replans_then_approve(repo, size):
+    orch, _, _ = make(
+        repo,
+        {"explore": [EXPLORE], "plan": [PLAN]},
+        gate=AutoGate(decision="defer"),
+        size=size,
+        approve_plan=True,
+    )
+    run_id = go(orch).run_id
+
+    # No explore entry: a re-call would fail loudly.
+    orch2, backend2, gate2 = make(repo, {"plan": [PLAN_R1]}, gate=AutoGate(decision="defer"))
+    out2 = asyncio.run(orch2.resume(run_id, reject=True, feedback="use c.py instead"))
+    assert (out2.status, out2.exit_code) == ("awaiting_approval", 3)
+    base = "architect" if size == "L" else "plan"
+    assert seq(backend2) == [("plan", "architect" if size == "L" else None)]
+    prompt = backend2.requests[0].prompt
+    assert "use c.py instead" in prompt and '"change":"one"' in prompt
+    assert keys(orch2) == ["explore", base, f"{base}:r1"]
+    assert gate2.plans == [PLAN_R1]
+    state = orch2.run_state.state
+    assert (state["plan_revision"], state["plan_feedback"]) == (1, ["use c.py instead"])
+
+    # Approving replays explore/plan revisions and implements the revised steps.
+    orch3, backend3, gate3 = make(
+        repo, {"implement": [impl("c.py")], "test": [TEST_OK], "review": [REVIEW_OK]}
+    )
+    assert asyncio.run(orch3.resume(run_id)).status == "done"
+    assert gate3.plans == [PLAN_R1]
+    assert [s for s, _ in seq(backend3)] == ["implement", "test", "review"]
+    if size == "L":
+        assert "implement:step-r1" in keys(orch3)
+    assert '"step-r1"' in backend3.requests[0].prompt
+
+
+def test_reject_without_feedback_fails(repo):
+    orch, _, _ = make(
+        repo, {"explore": [EXPLORE], "plan": [PLAN]}, gate=AutoGate(decision="defer"), size="L"
+    )
+    run_id = go(orch).run_id
+    orch2, backend2, _ = make(repo, {})
+    out = asyncio.run(orch2.resume(run_id, reject=True))
+    assert (out.status, out.exit_code) == ("failed", 1)
+    assert "plan rejected by user" in out.report_text
+    assert backend2.requests == []
+
+
+def test_guided_retry_after_needs_human(repo):
+    orch, _, _ = make(
+        repo, {"implement": [impl(), impl(), impl()], "test": [TEST_FAIL] * 3}, size="S"
+    )
+    run_id = go(orch).run_id
+    orch2, backend2, _ = make(repo, {"implement": [impl("b.py")], "test": [TEST_OK]})
+    out = asyncio.run(orch2.resume(run_id, feedback="mock the clock"))
+    assert (out.status, out.exit_code) == ("done", 0)
+    assert seq(backend2) == [("implement", "implementer"), ("test", "test-runner")]
+    assert keys(orch2)[-2:] == ["retry-1:guided-implement", "retry-1:test"]
+    prompt = backend2.requests[0].prompt
+    assert "mock the clock" in prompt and '"name":"t1"' in prompt
+
+
+def test_accept_failures_without_backend_calls(repo):
+    orch, _, _ = make(
+        repo, {"implement": [impl(), impl(), impl()], "test": [TEST_FAIL] * 3}, size="S"
+    )
+    run_id = go(orch).run_id
+    orch2, backend2, _ = make(repo, {})
+    out = asyncio.run(orch2.resume(run_id, accept_failures=True))
+    assert (out.status, out.exit_code) == ("done", 0)
+    assert backend2.requests == []
+    assert orch2.run_state.state["accepted_failures"] is True
+    assert "accepted failures" in out.report_text
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        {"reject": True},
+        {"accept_failures": True},
+        {"feedback": "x", "accept_failures": True},
+    ],
+)
+def test_resume_flags_invalid_for_status(repo, flags):
+    orch, _, _ = make(
+        repo, {"explore": [EXPLORE], "plan": [PLAN]}, gate=AutoGate(decision="defer"), size="L"
+    )
+    run_id = go(orch).run_id
+    if flags.get("reject"):
+        # A done run cannot be rejected.
+        orch_s, _, _ = make(repo, {"implement": [impl()], "test": [TEST_OK]}, size="S")
+        run_id = go(orch_s).run_id
+    orch2, backend2, _ = make(repo, {})
+    with pytest.raises(OrchestratorError):
+        asyncio.run(orch2.resume(run_id, **flags))
+    assert backend2.requests == []
+
+
+def git(repo, *args):
+    return subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+class EditingBackend(FakeBackend):
+    """FakeBackend whose implement stages write files like a real implementer."""
+
+    def __init__(self, script, repo, edits):
+        super().__init__(script)
+        self.repo = repo
+        self.edits = list(edits)
+
+    async def run_stage(self, request):
+        if request.stage == "implement" and self.edits:
+            for name, text in self.edits.pop(0).items():
+                (self.repo / name).write_text(text)
+        return await super().run_stage(request)
+
+
+def make_editing(repo, script, edits, gate=None, **opts):
+    backend = EditingBackend(script, repo, edits)
+    gate = gate or AutoGate()
+    orch = Orchestrator(backend, PROFILE, str(repo), RunStore(repo), gate, RunOptions(**opts))
+    return orch, backend
+
+
+def review_prompt(backend):
+    return next(r.prompt for r in backend.requests if r.stage == "review")
+
+
+def test_dirty_repo_snapshot_base_shows_only_carcara_edits(repo):
+    (repo / ".env").write_text("TRACKED_SECRET=1\n")
+    git(repo, "add", ".env")
+    git(repo, "commit", "-q", "-m", "env")
+    index_before = git(repo, "ls-files", "-s")
+    (repo / "a.py").write_text("x = 'user edit'\n")
+    (repo / "notes.txt").write_text("pre-existing untracked\n")
+    (repo / ".env").write_text("TRACKED_SECRET=2\n")
+    (repo / "sub").mkdir()
+    (repo / "sub" / ".env").write_text("UNTRACKED_SECRET=3\n")
+    tmp_before = set(os.listdir(tempfile.gettempdir()))
+
+    orch, backend = make_editing(
+        repo,
+        {"implement": [impl("b.py")], "test": [TEST_OK], "review": [REVIEW_OK]},
+        [{"b.py": "carcara_was_here = 1\n", ".env": "TRACKED_SECRET=carcara\n"}],
+        size="S",
+        review_small=True,
+        allow_dirty=True,
+    )
+    out = go(orch)
+    assert out.status == "done"
+    state = orch.run_state.state
+    assert state["base_kind"] == "snapshot"
+    assert git(repo, "rev-parse", f"refs/carcara/{out.run_id}") == state["base_sha"]
+    assert git(repo, "rev-parse", f"{state['base_sha']}^") == git(repo, "rev-parse", "HEAD")
+    assert f"carcara changes: carcara diff {out.run_id}" in out.report_text
+    # The tracked secret keeps its committed blob in the snapshot (not dropped,
+    # not the working copy), so a plain `git diff <base>` never shows it as new.
+    assert git(repo, "rev-parse", f"{state['base_sha']}:.env") == git(
+        repo, "rev-parse", "HEAD:.env"
+    )
+    assert ".env" not in git(repo, "diff", "--name-only", "HEAD", state["base_sha"])
+
+    prompt = review_prompt(backend)
+    diff = prompt.split("## Changes since base", 1)[1]
+    assert "carcara_was_here" in diff and "b.py" in diff
+    assert "user edit" not in diff and "a.py" not in diff
+    assert "notes.txt" not in diff
+    assert "SECRET" not in prompt and ".env" not in diff
+    # The user's index is untouched and the temp index is cleaned up.
+    assert git(repo, "ls-files", "-s") == index_before
+    leftovers = set(os.listdir(tempfile.gettempdir())) - tmp_before
+    assert not [n for n in leftovers if n.startswith("carcara-index-")]
+
+
+def test_clean_repo_head_base_hides_tracked_secret(repo):
+    (repo / ".env").write_text("TRACKED_SECRET=1\n")
+    git(repo, "add", ".env")
+    git(repo, "commit", "-q", "-m", "env")
+    orch, backend = make_editing(
+        repo,
+        {"implement": [impl("b.py")], "test": [TEST_OK], "review": [REVIEW_OK]},
+        [{"b.py": "carcara_was_here = 1\n"}],
+        size="S",
+        review_small=True,
+    )
+    out = go(orch)
+    assert out.status == "done"
+    state = orch.run_state.state
+    head = git(repo, "rev-parse", "HEAD")
+    assert (state["base_sha"], state["base_kind"]) == (head, "head")
+    assert git(repo, "rev-parse", f"refs/carcara/{out.run_id}") == head
+    prompt = review_prompt(backend)
+    assert "carcara_was_here" in prompt
+    assert "SECRET" not in prompt and ".env" not in prompt.split("## Changes since base", 1)[1]
+
+
+def test_allow_dirty_with_clean_tree_uses_head(repo):
+    orch, _, _ = make(repo, {"implement": [impl()], "test": [TEST_OK]}, size="S", allow_dirty=True)
+    assert go(orch).status == "done"
+    assert orch.run_state.state["base_kind"] == "head"
+
+
+def test_gate_resume_resnapshots_base(repo):
+    orch, _ = make_editing(
+        repo,
+        {"explore": [EXPLORE], "plan": [PLAN]},
+        [],
+        gate=AutoGate(decision="defer"),
+        size="M",
+        approve_plan=True,
+    )
+    out = go(orch)
+    assert out.status == "awaiting_approval"
+    first_base = orch.run_state.state["base_sha"]
+    (repo / "a.py").write_text("x = 'edited while reviewing'\n")
+
+    orch2, backend2 = make_editing(
+        repo,
+        {"implement": [impl("b.py")], "test": [TEST_OK], "review": [REVIEW_OK]},
+        [{"b.py": "carcara_was_here = 1\n"}],
+    )
+    out2 = asyncio.run(orch2.resume(out.run_id))
+    assert out2.status == "done"
+    state = orch2.run_state.state
+    assert state["base_kind"] == "snapshot" and state["base_sha"] != first_base
+    assert git(repo, "rev-parse", f"refs/carcara/{out.run_id}") == state["base_sha"]
+    diff = review_prompt(backend2).split("## Changes since base", 1)[1]
+    assert "carcara_was_here" in diff
+    assert "edited while reviewing" not in diff
+
+
+def test_needs_human_resume_keeps_base(repo):
+    orch, _ = make_editing(
+        repo,
+        {"implement": [impl(), impl(), impl()], "test": [TEST_FAIL] * 3},
+        [{"b.py": "carcara_was_here = 1\n"}],
+        size="S",
+    )
+    out = go(orch)
+    assert out.status == "needs_human"
+    base = orch.run_state.state["base_sha"]
+    (repo / "a.py").write_text("x = 'human fix'\n")
+    orch2, backend2 = make_editing(
+        repo, {"test": [TEST_OK], "review": [REVIEW_OK]}, [], review_small=True
+    )
+    out2 = asyncio.run(orch2.resume(out.run_id))
+    assert out2.status == "done"
+    assert orch2.run_state.state["base_sha"] == base
+    assert git(repo, "rev-parse", f"refs/carcara/{out.run_id}") == base
+    diff = review_prompt(backend2).split("## Changes since base", 1)[1]
+    assert "carcara_was_here" in diff and "human fix" in diff
+
+
+def test_blocked_implement_resume_with_feedback_reruns_with_guidance(repo):
+    orch, _, _ = make(repo, {"implement": [impl(blocked=True)]}, size="S")
+    out = go(orch)
+    assert out.status == "needs_human"
+    assert orch.run_state.state["blocked"]["key"] == "implement"
+    orch2, backend2, _ = make(repo, {"implement": [impl()], "test": [TEST_OK]})
+    out2 = asyncio.run(orch2.resume(out.run_id, feedback="use the v2 api"))
+    assert out2.status == "done"
+    # No extra guided-implement: the feedback goes to the re-run implement.
+    assert seq(backend2) == [("implement", "implementer"), ("test", "test-runner")]
+    prompt = backend2.requests[0].prompt
+    assert "use the v2 api" in prompt and "blocked on x" in prompt
+    assert "implement" in keys(orch2)
+    assert "retry-1:guided-implement" not in keys(orch2)
+
+
+def test_blocked_fix_implement_feedback_goes_to_guided_implement(repo):
+    orch, _, _ = make(
+        repo, {"implement": [impl(), impl(blocked=True)], "test": [TEST_FAIL]}, size="S"
+    )
+    out = go(orch)
+    assert out.status == "needs_human"
+    assert orch.run_state.state["blocked"]["key"] == "fix-1:implement"
+    orch2, backend2, _ = make(repo, {"implement": [impl()], "test": [TEST_OK]})
+    out2 = asyncio.run(orch2.resume(out.run_id, feedback="use the v2 api"))
+    assert out2.status == "done"
+    assert keys(orch2)[-2:] == ["retry-1:guided-implement", "retry-1:test"]
+    assert "use the v2 api" in backend2.requests[0].prompt
+
+
+def test_run_diff_matches_review_diff_and_hides_secrets(repo):
+    from carcara.orchestrator import run_diff
+
+    (repo / ".env").write_text("TRACKED_SECRET=1\n")
+    git(repo, "add", ".env")
+    git(repo, "commit", "-q", "-m", "env")
+    (repo / ".env").write_text("TRACKED_SECRET=2\n")
+    head = git(repo, "rev-parse", "HEAD")
+    (repo / "b.py").write_text("y = " + "1" * 30000 + "\n")
+    diff = run_diff(str(repo), head)
+    assert "b.py" in diff and "1" * 30000 in diff  # not truncated
+    assert "SECRET" not in diff and ".env" not in diff
+    stat = run_diff(str(repo), head, stat=True)
+    assert "b.py" in stat and ".env" not in stat
+
+
+def test_run_refuses_non_toplevel_cwd(repo):
+    (repo / "sub").mkdir()
+    orch = Orchestrator(
+        FakeBackend({}), PROFILE, str(repo / "sub"), RunStore(repo / "sub"), AutoGate()
+    )
+    with pytest.raises(OrchestratorError, match=r"^run from the repository root \("):
+        go(orch)
+    with pytest.raises(OrchestratorError, match="repository root"):
+        asyncio.run(orch.resume("anything"))
+    assert not (repo / "sub" / ".carcara").exists()
+
+
+def test_resume_revalidates_state_after_taking_lock(repo, monkeypatch):
+    orch, _, _ = make(
+        repo, {"explore": [EXPLORE], "plan": [PLAN]}, gate=AutoGate(decision="defer"), size="L"
+    )
+    assert go(orch).status == "awaiting_approval"
+    run_id = orch.run_state.id
+    store = RunStore(repo)
+    real_acquire = store.acquire_lock
+
+    def racing_acquire(rid):
+        # Another process finished the run between our check and the lock.
+        run = store.load(rid)
+        run.state["status"] = "done"
+        run.save()
+        real_acquire(rid)
+
+    monkeypatch.setattr(store, "acquire_lock", racing_acquire)
+    backend = FakeBackend({})
+    orch2 = Orchestrator(backend, PROFILE, str(repo), store, AutoGate(), RunOptions(size="L"))
+    with pytest.raises(OrchestratorError, match="--reject needs a run awaiting approval"):
+        asyncio.run(orch2.resume(run_id, reject=True))
+    assert not store.lock_path.exists()
+    out = asyncio.run(orch2.resume(run_id))
+    assert out.status == "done" and backend.requests == []
+    assert not store.lock_path.exists()

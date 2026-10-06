@@ -18,8 +18,7 @@ Commands: `/sdlc <task>` (full triaged pipeline), `/sdlc-plan`, `/sdlc-build`,
 headlessly from the terminal.
 
 ### Token discipline
-- Triage first: do S-sized changes directly; only escalate to subagents when
-  the task warrants it. Use the architect only for L-sized work.
+{{ROUTING}}
 - Delegate searching to `explorer` and command output to `test-runner`
   instead of reading files or logs in the main conversation.
 - Give subagents only the context they need (task, plan, file paths); they

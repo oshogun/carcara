@@ -6,7 +6,7 @@
     ],
     "setup": null,
     "returncode": 0,
-    "stdout": "carcara VERSION: installing profile 'balanced' into proj\n  create     proj/.claude/agents/architect.md\n  create     proj/.claude/agents/doc-writer.md\n  create     proj/.claude/agents/explorer.md\n  create     proj/.claude/agents/implementer.md\n  create     proj/.claude/agents/reviewer.md\n  create     proj/.claude/agents/test-runner.md\n  create     proj/.claude/commands/sdlc-build.md\n  create     proj/.claude/commands/sdlc-plan.md\n  create     proj/.claude/commands/sdlc-review.md\n  create     proj/.claude/commands/sdlc-test.md\n  create     proj/.claude/commands/sdlc.md\n  create     proj/.claude/settings.json\n  create     proj/CLAUDE.md\ndone: 12 file(s) written, 0 skipped.\nNext: start Claude Code in proj and run: /sdlc <task>\n",
+    "stdout": "carcara VERSION: installing profile 'balanced' into proj\n  create     proj/.claude/agents/architect.md\n  create     proj/.claude/agents/doc-writer.md\n  create     proj/.claude/agents/explorer.md\n  create     proj/.claude/agents/implementer.md\n  create     proj/.claude/agents/reviewer.md\n  create     proj/.claude/agents/test-runner.md\n  create     proj/.claude/commands/sdlc-build.md\n  create     proj/.claude/commands/sdlc-plan.md\n  create     proj/.claude/commands/sdlc-review.md\n  create     proj/.claude/commands/sdlc-test.md\n  create     proj/.claude/commands/sdlc.md\n  create     proj/.claude/settings.json\n  create     proj/.claude/skills/carcara/SKILL.md\n  create     proj/CLAUDE.md\ndone: 13 file(s) written, 0 skipped.\nNext: start Claude Code in proj and just ask for a change \u2014 carcara routes it. (`carcara routing off` to disable.)\n",
     "stderr": "",
     "tree_sha256": {
       ".claude/agents/architect.md": "c25fc7bb515813a7b7cd4656480c68daecf228b8f78325b92f676d4a7f4a4745",
@@ -19,9 +19,10 @@
       ".claude/commands/sdlc-plan.md": "452e242ebc22327bd5bdd9db48535f1e22a11d925adc1ae465b4152e385713a4",
       ".claude/commands/sdlc-review.md": "e3083c8e1eaddfa2d56cae4cb75722d694720978fa2f10638fbdbb6d527e87cb",
       ".claude/commands/sdlc-test.md": "cc679efcbcb1b27633e1c87f4e0b44b14969db35389d959cf8ac6a7742b3dc50",
-      ".claude/commands/sdlc.md": "81a2599c6ca3b98226dd225ea139304c6af169648a3d633c643e7f6bb088b4e9",
-      ".claude/settings.json": "96562bd79c5a57c4e96f921ae11cec07850cdf0f16360cb912a14d9251d14e4a",
-      "CLAUDE.md": "e69543840f43969639110ea57429d5389be840667fbaff14d2357a282bed5e99"
+      ".claude/commands/sdlc.md": "1c7b6bb01b3b015308ce789ea4022d59fc9439eeaa54286fcdb735a48598f8a4",
+      ".claude/settings.json": "49780075437b102d22c57d44b1ad7d1b4ddad345c377f6d64aea7b540e5da0c5",
+      ".claude/skills/carcara/SKILL.md": "7d4136b8553eabf51cfe7801a164930ba2b27066d305d303710e1aeae6746b88",
+      "CLAUDE.md": "7fc0e65068d76a959dbe98fab22da5192a4b2a73d78c8750dfc40e39185dda61"
     }
   },
   {
@@ -33,7 +34,7 @@
     ],
     "setup": null,
     "returncode": 0,
-    "stdout": "carcara VERSION: installing profile 'quality' into proj/\n  create     proj//.claude/agents/architect.md\n  create     proj//.claude/agents/doc-writer.md\n  create     proj//.claude/agents/explorer.md\n  create     proj//.claude/agents/implementer.md\n  create     proj//.claude/agents/reviewer.md\n  create     proj//.claude/agents/test-runner.md\n  create     proj//.claude/commands/sdlc-build.md\n  create     proj//.claude/commands/sdlc-plan.md\n  create     proj//.claude/commands/sdlc-review.md\n  create     proj//.claude/commands/sdlc-test.md\n  create     proj//.claude/commands/sdlc.md\n  create     proj//.claude/settings.json\n  create     proj//CLAUDE.md\ndone: 12 file(s) written, 0 skipped.\nNext: start Claude Code in proj/ and run: /sdlc <task>\n",
+    "stdout": "carcara VERSION: installing profile 'quality' into proj/\n  create     proj//.claude/agents/architect.md\n  create     proj//.claude/agents/doc-writer.md\n  create     proj//.claude/agents/explorer.md\n  create     proj//.claude/agents/implementer.md\n  create     proj//.claude/agents/reviewer.md\n  create     proj//.claude/agents/test-runner.md\n  create     proj//.claude/commands/sdlc-build.md\n  create     proj//.claude/commands/sdlc-plan.md\n  create     proj//.claude/commands/sdlc-review.md\n  create     proj//.claude/commands/sdlc-test.md\n  create     proj//.claude/commands/sdlc.md\n  create     proj//.claude/settings.json\n  create     proj//.claude/skills/carcara/SKILL.md\n  create     proj//CLAUDE.md\ndone: 13 file(s) written, 0 skipped.\nNext: start Claude Code in proj/ and just ask for a change \u2014 carcara routes it. (`carcara routing off` to disable.)\n",
     "stderr": "",
     "tree_sha256": {
       ".claude/agents/architect.md": "c25fc7bb515813a7b7cd4656480c68daecf228b8f78325b92f676d4a7f4a4745",
@@ -46,9 +47,10 @@
       ".claude/commands/sdlc-plan.md": "452e242ebc22327bd5bdd9db48535f1e22a11d925adc1ae465b4152e385713a4",
       ".claude/commands/sdlc-review.md": "e3083c8e1eaddfa2d56cae4cb75722d694720978fa2f10638fbdbb6d527e87cb",
       ".claude/commands/sdlc-test.md": "cc679efcbcb1b27633e1c87f4e0b44b14969db35389d959cf8ac6a7742b3dc50",
-      ".claude/commands/sdlc.md": "81a2599c6ca3b98226dd225ea139304c6af169648a3d633c643e7f6bb088b4e9",
-      ".claude/settings.json": "39458f40163b3df5ceceb25104facd527efc8e604ebaf6b51f261c9a983daacd",
-      "CLAUDE.md": "314d93a985f03b00d9e7c03957e04a732c297c46ca4ad62047a9d82d57b3c790"
+      ".claude/commands/sdlc.md": "1c7b6bb01b3b015308ce789ea4022d59fc9439eeaa54286fcdb735a48598f8a4",
+      ".claude/settings.json": "64da077bc0e6aff00e0c65f267d79e78bde0cdd5e973479d6d3987447c74d29d",
+      ".claude/skills/carcara/SKILL.md": "7d4136b8553eabf51cfe7801a164930ba2b27066d305d303710e1aeae6746b88",
+      "CLAUDE.md": "dce2cdc06e9e6ff9cc1bc5ffcb99f71511ca1a24110f89691a972382d859f797"
     }
   },
   {
@@ -58,7 +60,7 @@
     ],
     "setup": "existing",
     "returncode": 0,
-    "stdout": "carcara VERSION: installing profile 'balanced' into proj\n  create     proj/.claude/agents/architect.md\n  create     proj/.claude/agents/doc-writer.md\n  create     proj/.claude/agents/explorer.md\n  create     proj/.claude/agents/implementer.md\n  skip       proj/.claude/agents/reviewer.md (exists; use --force to overwrite)\n  create     proj/.claude/agents/test-runner.md\n  create     proj/.claude/commands/sdlc-build.md\n  create     proj/.claude/commands/sdlc-plan.md\n  create     proj/.claude/commands/sdlc-review.md\n  create     proj/.claude/commands/sdlc-test.md\n  create     proj/.claude/commands/sdlc.md\n  create     proj/.claude/settings.json\n  update     proj/CLAUDE.md\ndone: 11 file(s) written, 1 skipped.\nnote: skipped files keep their previous content; re-run with --force to apply profile 'balanced' to them.\nNext: start Claude Code in proj and run: /sdlc <task>\n",
+    "stdout": "carcara VERSION: installing profile 'balanced' into proj\n  create     proj/.claude/agents/architect.md\n  create     proj/.claude/agents/doc-writer.md\n  create     proj/.claude/agents/explorer.md\n  create     proj/.claude/agents/implementer.md\n  skip       proj/.claude/agents/reviewer.md (exists; use --force to overwrite)\n  create     proj/.claude/agents/test-runner.md\n  create     proj/.claude/commands/sdlc-build.md\n  create     proj/.claude/commands/sdlc-plan.md\n  create     proj/.claude/commands/sdlc-review.md\n  create     proj/.claude/commands/sdlc-test.md\n  create     proj/.claude/commands/sdlc.md\n  create     proj/.claude/settings.json\n  create     proj/.claude/skills/carcara/SKILL.md\n  update     proj/CLAUDE.md\ndone: 12 file(s) written, 1 skipped.\nnote: skipped files keep their previous content; re-run with --force to apply profile 'balanced' to them.\nNext: start Claude Code in proj and just ask for a change \u2014 carcara routes it. (`carcara routing off` to disable.)\n",
     "stderr": "",
     "tree_sha256": {
       ".claude/agents/architect.md": "c25fc7bb515813a7b7cd4656480c68daecf228b8f78325b92f676d4a7f4a4745",
@@ -71,9 +73,10 @@
       ".claude/commands/sdlc-plan.md": "452e242ebc22327bd5bdd9db48535f1e22a11d925adc1ae465b4152e385713a4",
       ".claude/commands/sdlc-review.md": "e3083c8e1eaddfa2d56cae4cb75722d694720978fa2f10638fbdbb6d527e87cb",
       ".claude/commands/sdlc-test.md": "cc679efcbcb1b27633e1c87f4e0b44b14969db35389d959cf8ac6a7742b3dc50",
-      ".claude/commands/sdlc.md": "81a2599c6ca3b98226dd225ea139304c6af169648a3d633c643e7f6bb088b4e9",
-      ".claude/settings.json": "96562bd79c5a57c4e96f921ae11cec07850cdf0f16360cb912a14d9251d14e4a",
-      "CLAUDE.md": "63e6f0768c6fcf76302877dd969501b43cb8161e2b3fdf66bca39267a54971e5"
+      ".claude/commands/sdlc.md": "1c7b6bb01b3b015308ce789ea4022d59fc9439eeaa54286fcdb735a48598f8a4",
+      ".claude/settings.json": "49780075437b102d22c57d44b1ad7d1b4ddad345c377f6d64aea7b540e5da0c5",
+      ".claude/skills/carcara/SKILL.md": "7d4136b8553eabf51cfe7801a164930ba2b27066d305d303710e1aeae6746b88",
+      "CLAUDE.md": "277bb27964e7fda2f19344d4d96d1228576bf62e32e054709dcc554be163ce36"
     }
   },
   {
@@ -85,7 +88,7 @@
     ],
     "setup": "existing",
     "returncode": 0,
-    "stdout": "carcara VERSION: installing profile 'balanced' into proj (dry run)\n  create     proj/.claude/agents/architect.md\n  create     proj/.claude/agents/doc-writer.md\n  create     proj/.claude/agents/explorer.md\n  create     proj/.claude/agents/implementer.md\n  overwrite  proj/.claude/agents/reviewer.md\n  create     proj/.claude/agents/test-runner.md\n  create     proj/.claude/commands/sdlc-build.md\n  create     proj/.claude/commands/sdlc-plan.md\n  create     proj/.claude/commands/sdlc-review.md\n  create     proj/.claude/commands/sdlc-test.md\n  create     proj/.claude/commands/sdlc.md\n  create     proj/.claude/settings.json\n  update     proj/CLAUDE.md\ndone: 12 file(s) written, 0 skipped.\nNext: start Claude Code in proj and run: /sdlc <task>\n",
+    "stdout": "carcara VERSION: installing profile 'balanced' into proj (dry run)\n  create     proj/.claude/agents/architect.md\n  create     proj/.claude/agents/doc-writer.md\n  create     proj/.claude/agents/explorer.md\n  create     proj/.claude/agents/implementer.md\n  overwrite  proj/.claude/agents/reviewer.md\n  create     proj/.claude/agents/test-runner.md\n  create     proj/.claude/commands/sdlc-build.md\n  create     proj/.claude/commands/sdlc-plan.md\n  create     proj/.claude/commands/sdlc-review.md\n  create     proj/.claude/commands/sdlc-test.md\n  create     proj/.claude/commands/sdlc.md\n  create     proj/.claude/settings.json\n  create     proj/.claude/skills/carcara/SKILL.md\n  update     proj/CLAUDE.md\ndone: 13 file(s) written, 0 skipped.\nNext: start Claude Code in proj and just ask for a change \u2014 carcara routes it. (`carcara routing off` to disable.)\n",
     "stderr": "",
     "tree_sha256": {
       ".claude/agents/reviewer.md": "c95b74032c438c7a91af14ef1af75c773ccd775ad81bf98a2a1fbdd1d75ea38d",
@@ -100,7 +103,7 @@
     ],
     "setup": "existing",
     "returncode": 0,
-    "stdout": "carcara VERSION: installing profile 'balanced' into proj\n  create     proj/.claude/agents/architect.md\n  create     proj/.claude/agents/doc-writer.md\n  create     proj/.claude/agents/explorer.md\n  create     proj/.claude/agents/implementer.md\n  overwrite  proj/.claude/agents/reviewer.md\n  create     proj/.claude/agents/test-runner.md\n  create     proj/.claude/commands/sdlc-build.md\n  create     proj/.claude/commands/sdlc-plan.md\n  create     proj/.claude/commands/sdlc-review.md\n  create     proj/.claude/commands/sdlc-test.md\n  create     proj/.claude/commands/sdlc.md\n  create     proj/.claude/settings.json\n  update     proj/CLAUDE.md\ndone: 12 file(s) written, 0 skipped.\nNext: start Claude Code in proj and run: /sdlc <task>\n",
+    "stdout": "carcara VERSION: installing profile 'balanced' into proj\n  create     proj/.claude/agents/architect.md\n  create     proj/.claude/agents/doc-writer.md\n  create     proj/.claude/agents/explorer.md\n  create     proj/.claude/agents/implementer.md\n  overwrite  proj/.claude/agents/reviewer.md\n  create     proj/.claude/agents/test-runner.md\n  create     proj/.claude/commands/sdlc-build.md\n  create     proj/.claude/commands/sdlc-plan.md\n  create     proj/.claude/commands/sdlc-review.md\n  create     proj/.claude/commands/sdlc-test.md\n  create     proj/.claude/commands/sdlc.md\n  create     proj/.claude/settings.json\n  create     proj/.claude/skills/carcara/SKILL.md\n  update     proj/CLAUDE.md\ndone: 13 file(s) written, 0 skipped.\nNext: start Claude Code in proj and just ask for a change \u2014 carcara routes it. (`carcara routing off` to disable.)\n",
     "stderr": "",
     "tree_sha256": {
       ".claude/agents/architect.md": "c25fc7bb515813a7b7cd4656480c68daecf228b8f78325b92f676d4a7f4a4745",
@@ -113,9 +116,10 @@
       ".claude/commands/sdlc-plan.md": "452e242ebc22327bd5bdd9db48535f1e22a11d925adc1ae465b4152e385713a4",
       ".claude/commands/sdlc-review.md": "e3083c8e1eaddfa2d56cae4cb75722d694720978fa2f10638fbdbb6d527e87cb",
       ".claude/commands/sdlc-test.md": "cc679efcbcb1b27633e1c87f4e0b44b14969db35389d959cf8ac6a7742b3dc50",
-      ".claude/commands/sdlc.md": "81a2599c6ca3b98226dd225ea139304c6af169648a3d633c643e7f6bb088b4e9",
-      ".claude/settings.json": "96562bd79c5a57c4e96f921ae11cec07850cdf0f16360cb912a14d9251d14e4a",
-      "CLAUDE.md": "63e6f0768c6fcf76302877dd969501b43cb8161e2b3fdf66bca39267a54971e5"
+      ".claude/commands/sdlc.md": "1c7b6bb01b3b015308ce789ea4022d59fc9439eeaa54286fcdb735a48598f8a4",
+      ".claude/settings.json": "49780075437b102d22c57d44b1ad7d1b4ddad345c377f6d64aea7b540e5da0c5",
+      ".claude/skills/carcara/SKILL.md": "7d4136b8553eabf51cfe7801a164930ba2b27066d305d303710e1aeae6746b88",
+      "CLAUDE.md": "277bb27964e7fda2f19344d4d96d1228576bf62e32e054709dcc554be163ce36"
     }
   },
   {

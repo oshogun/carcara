@@ -2,6 +2,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 
 import pytest
 
@@ -312,3 +313,513 @@ def test_use_api_key_enabled_on_resume(repo, fake, monkeypatch):
     assert run(repo, "--resume", run_id, "--yes", "--use-api-key") == 0
     assert _state(repo, run_id)["use_api_key"] is True
     assert seen == [False, True]
+
+
+def test_nested_run_inside_stage_refused(repo, fake, monkeypatch, capsys):
+    monkeypatch.setenv("CARCARA_STAGE", "implementer")
+    fake({})
+    assert run(repo, "anything") == 1
+    assert (
+        capsys.readouterr().err
+        == "carcara: nested carcara run inside a carcara stage is not allowed\n"
+    )
+    assert not (repo / ".carcara").exists()
+
+
+class _FakeTty(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def test_make_gate_tty_vs_claudecode(monkeypatch):
+    monkeypatch.setattr("sys.stdin", _FakeTty())
+    assert isinstance(cli._make_gate(False), TtyGate)
+    monkeypatch.setenv("CLAUDECODE", "1")
+    assert isinstance(cli._make_gate(False), NonInteractiveGate)
+    assert not isinstance(cli._make_gate(True), (TtyGate, NonInteractiveGate))
+
+
+def test_claudecode_l_run_defers_even_with_tty(repo, fake, monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", _FakeTty("y\n"))
+    monkeypatch.setenv("CLAUDECODE", "1")
+    fake({"explore": [EXPLORE], "plan": [PLAN]})
+    assert run(repo, "big change", "--size", "L") == 3
+    assert "awaiting_approval" in capsys.readouterr().out
+    assert sys.stdin.read() == "y\n"  # the gate never read stdin
+
+
+def test_task_from_stdin(repo, fake, monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", io.StringIO("  add a feature\nwith details\n\n"))
+    fake({"implement": [IMPL], "test": [TEST_OK]})
+    assert run(repo, "-", "--size", "S") == 0
+    (run_id,) = RunStore(repo).list_runs()
+    assert RunStore(repo).load(run_id).state["task"] == "add a feature\nwith details"
+
+
+def test_empty_task_from_stdin(repo, fake, monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", io.StringIO("  \n"))
+    fake({})
+    assert run(repo, "-", "--size", "S") == 1
+    assert "carcara: empty task on stdin" in capsys.readouterr().err
+    assert RunStore(repo).list_runs() == []
+
+
+# -- lock, started line, SIGTERM, status ----------------------------------------
+
+
+def _lock(repo):
+    return repo / ".carcara" / "active.json"
+
+
+def _write_lock(repo, pid, run_id="other-run"):
+    _lock(repo).parent.mkdir(parents=True, exist_ok=True)
+    _lock(repo).write_text(json.dumps({"pid": pid, "run_id": run_id, "started": "x"}))
+
+
+def _dead_pid():
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def test_started_and_resumed_lines(repo, fake, capsys):
+    fake({"explore": [EXPLORE], "plan": [PLAN]})
+    assert run(repo, "big change", "--size", "L") == 3
+    (run_id,) = RunStore(repo).list_runs()
+    assert capsys.readouterr().err.splitlines()[0] == f"carcara: run {run_id} started"
+    fake({"implement": [IMPL], "test": [TEST_OK], "review": [REVIEW_OK]})
+    assert run(repo, "--resume", run_id, "--yes") == 0
+    assert capsys.readouterr().err.splitlines()[0] == f"carcara: run {run_id} resumed"
+
+
+def test_concurrent_run_is_busy_exit_6(repo, fake, capsys):
+    _write_lock(repo, os.getpid())  # a live process (this one) under another run id
+    fake({"implement": [IMPL], "test": [TEST_OK]})
+    assert run(repo, "x", "--size", "S") == 6
+    err = capsys.readouterr().err
+    assert err == "carcara: another run is active: other-run (carcara status other-run)\n"
+    assert RunStore(repo).list_runs() == []
+    assert json.loads(_lock(repo).read_text())["run_id"] == "other-run"
+
+
+def test_resume_while_busy_exit_6(repo, fake, capsys):
+    fake({"explore": [EXPLORE], "plan": [PLAN]})
+    assert run(repo, "big change", "--size", "L") == 3
+    (run_id,) = RunStore(repo).list_runs()
+    _write_lock(repo, os.getpid())
+    capsys.readouterr()
+    assert run(repo, "--resume", run_id, "--yes") == 6
+    assert "another run is active: other-run" in capsys.readouterr().err
+    state = _state(repo, run_id)
+    assert state["status"] == "awaiting_approval"
+    assert _lock(repo).exists()
+
+
+@pytest.mark.parametrize("content", ["dead", "{not json", ""])
+def test_stale_or_corrupt_lock_is_taken_over(repo, fake, content):
+    if content == "dead":
+        _write_lock(repo, _dead_pid())
+    else:
+        _lock(repo).parent.mkdir(parents=True, exist_ok=True)
+        _lock(repo).write_text(content)
+    assert RunStore(repo).active() is None
+    fake({"implement": [IMPL], "test": [TEST_OK]})
+    assert run(repo, "x", "--size", "S") == 0
+    assert not _lock(repo).exists()
+
+
+@pytest.mark.parametrize(
+    "script,args,code",
+    [
+        ({"implement": [IMPL], "test": [TEST_OK]}, ["--size", "S"], 0),
+        ({"explore": [EXPLORE], "plan": [PLAN]}, ["--size", "L"], 3),
+        (
+            {"implement": [IMPL, IMPL, IMPL], "test": [TEST_FAIL, TEST_FAIL, TEST_FAIL]},
+            ["--size", "S", "--yes"],
+            4,
+        ),
+        ({"explore": [EXPLORE], "plan": [PLAN]}, ["--size", "M", "--max-budget-usd", "0.5"], 5),
+        ({"implement": []}, ["--size", "S"], 1),
+    ],
+)
+def test_lock_released_on_exit(repo, fake, monkeypatch, script, args, code):
+    fake(script, {"explore": 1.0})
+    seen = []
+    real_create = RunStore.create
+
+    def spy(self, *a, **kw):
+        created = real_create(self, *a, **kw)
+        seen.append(self.lock_path.exists())
+        return created
+
+    monkeypatch.setattr(RunStore, "create", spy)
+    assert run(repo, "x", *args) == code
+    assert seen == [False]
+    assert not _lock(repo).exists()
+
+
+def test_lock_held_during_run_and_released_on_interrupt(repo, fake, monkeypatch, capsys):
+    held = []
+
+    def boom(self, plan):
+        held.append(RunStore(repo).active())
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(NonInteractiveGate, "approve_plan", boom)
+    fake({"explore": [EXPLORE], "plan": [PLAN]})
+    assert run(repo, "big change", "--size", "L") == 130
+    (run_id,) = RunStore(repo).list_runs()
+    assert held[0]["run_id"] == run_id and held[0]["pid"] == os.getpid()
+    assert not _lock(repo).exists()
+
+
+def test_sigterm_handler_raises_keyboard_interrupt():
+    import signal
+
+    before = signal.getsignal(signal.SIGTERM)
+    with cli._sigterm_as_interrupt():
+        handler = signal.getsignal(signal.SIGTERM)
+        with pytest.raises(KeyboardInterrupt):
+            handler(signal.SIGTERM, None)
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+SLOW_RUNNER = """
+import asyncio, sys, time
+from carcara import backend, cli
+orig = backend.FakeBackend.run_stage
+async def slow(self, request):
+    if request.stage == "implement":
+        SLEEP
+    return await orig(self, request)
+backend.FakeBackend.run_stage = slow
+sys.exit(cli.main(sys.argv[1:]))
+"""
+
+
+# Blocking sleep: the signal lands in the coroutine frame; asyncio.sleep: it
+# lands in the event loop's selector (like the real SDK backend awaiting I/O).
+@pytest.mark.parametrize("sleep", ["time.sleep(60)", "await asyncio.sleep(60)"])
+def test_sigterm_saves_state_and_exits_130(repo, fake, tmp_path, sleep):
+    import signal
+
+    script = tmp_path / "slow_runner.py"
+    script.write_text(SLOW_RUNNER.replace("SLEEP", sleep))
+    fake({"implement": [IMPL], "test": [TEST_OK]})
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    proc = subprocess.Popen(
+        [sys.executable, str(script), "run", "x", "--size", "S", "--cwd", str(repo)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    lines = []
+    try:
+        for line in proc.stderr:
+            lines.append(line)
+            if line.startswith("carcara: implement ("):
+                break
+        assert _lock(repo).exists()
+        proc.send_signal(signal.SIGTERM)
+        _, rest = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 130, lines + [rest]
+    (run_id,) = RunStore(repo).list_runs()
+    assert lines[0] == f"carcara: run {run_id} started\n"
+    assert "interrupted; state saved" in rest
+    assert _state(repo, run_id)["status"] == "running"
+    assert not _lock(repo).exists()
+
+
+def status(repo, *args):
+    return main(["status", *args, "--cwd", str(repo)])
+
+
+def _status_json(repo, capsys, *args):
+    capsys.readouterr()
+    assert status(repo, "--json", *args) == 0
+    return json.loads(capsys.readouterr().out)
+
+
+STATUS_KEYS = {
+    "run_id",
+    "status",
+    "size",
+    "exit_code",
+    "message",
+    "report",
+    "plan",
+    "failing",
+    "resume_cmd",
+    "active",
+}
+
+
+def test_status_no_runs(repo, capsys):
+    assert status(repo) == 1
+    assert capsys.readouterr().err == "carcara: no runs\n"
+    assert status(repo, "nope") == 1
+    assert "unknown run: nope" in capsys.readouterr().err
+
+
+def test_status_awaiting_approval_json_and_plan(repo, fake, capsys):
+    fake({"explore": [EXPLORE], "plan": [PLAN]})
+    assert run(repo, "big change", "--size", "L") == 3
+    (run_id,) = RunStore(repo).list_runs()
+    data = _status_json(repo, capsys)
+    assert set(data) == STATUS_KEYS
+    assert data["run_id"] == run_id and data["status"] == "awaiting_approval"
+    assert data["size"] == "L" and data["exit_code"] == 3 and data["active"] is False
+    assert data["plan"] == PLAN and data["failing"] == []
+    assert data["report"].startswith(f"carcara run {run_id}: awaiting_approval")
+    assert data["resume_cmd"] == f"carcara run --resume {run_id} --cwd {repo} --yes"
+
+    assert status(repo, "--plan") == 0
+    assert capsys.readouterr().out.startswith("Plan: do the thing\n")
+
+    assert status(repo, run_id) == 0
+    out = capsys.readouterr().out
+    assert f"carcara run {run_id}: awaiting_approval" in out
+    assert f"resume: carcara run --resume {run_id} --cwd {repo} --yes" in out
+
+
+def test_status_needs_human_failing(repo, fake, capsys):
+    fake({"implement": [IMPL, IMPL, IMPL], "test": [TEST_FAIL, TEST_FAIL, TEST_FAIL]})
+    assert run(repo, "small fix", "--size", "S", "--yes") == 4
+    (run_id,) = RunStore(repo).list_runs()
+    data = _status_json(repo, capsys, run_id)
+    assert data["exit_code"] == 4 and data["plan"] is None
+    assert data["failing"] == [{"kind": "test", "name": "t1", "detail": "x"}]
+    assert data["resume_cmd"] == f'carcara run --resume {run_id} --cwd {repo} --feedback "..."'
+    assert status(repo, "--plan") == 1
+    assert f"run {run_id} has no plan" in capsys.readouterr().err
+
+
+def test_status_review_findings_and_done(repo):
+    store = RunStore(repo)
+    run_ = store.create("t", "balanced", "sha", size="S")
+    finding = {"severity": "major", "path": "a.py", "issue": "bug", "fix": "f"}
+    nit = {**finding, "severity": "nit"}
+    stages = [
+        ("test", TEST_OK),
+        ("review", {"verdict": "request_changes", "findings": [finding, nit]}),
+    ]
+    for key, out in stages:
+        run_.record_stage(key, key, None, "m", out, 0.0, None, 1, None)
+    assert cli._failing(run_.state) == [{"kind": "review", **finding}]
+    assert cli._status_resume_cmd(run_.id, "done", False, ".") is None
+    assert cli._status_resume_cmd(run_.id, "running", True, ".") is None
+    assert cli._status_resume_cmd(run_.id, "running", False, ".") == (
+        f"carcara run --resume {run_.id}"
+    )
+
+
+def test_status_default_prefers_active_then_latest(repo, capsys):
+    store = RunStore(repo)
+    first = store.create("one", "balanced", "sha")
+    second = store.create("two", "balanced", "sha")
+    older, latest = sorted([first.id, second.id])
+    assert _status_json(repo, capsys)["run_id"] == latest
+
+    _write_lock(repo, os.getpid(), older)
+    data = _status_json(repo, capsys)
+    assert data["run_id"] == older and data["active"] is True
+    assert data["status"] == "running" and data["exit_code"] is None
+    assert data["resume_cmd"] is None
+
+    assert status(repo) == 0
+    out = capsys.readouterr().out
+    assert f"carcara run {older}: running" in out and f"pid {os.getpid()}" in out
+
+    _write_lock(repo, _dead_pid(), older)  # stale lock: back to the latest run
+    assert _status_json(repo, capsys)["run_id"] == latest
+    data = _status_json(repo, capsys, older)
+    assert data["active"] is False
+    assert data["resume_cmd"] == f"carcara run --resume {older} --cwd {repo}"
+
+
+PLAN_R1 = {**PLAN, "steps": [{"id": "step-r1", "files": ["c.py"], "change": "revised"}]}
+
+
+def _deferred_l_run(repo, fake, capsys):
+    fake({"explore": [EXPLORE], "plan": [PLAN]})
+    assert run(repo, "big change", "--size", "L") == 3
+    capsys.readouterr()
+    return RunStore(repo).list_runs()[-1]
+
+
+def test_cli_reject_feedback_replans_then_yes(repo, fake, capsys):
+    run_id = _deferred_l_run(repo, fake, capsys)
+    fake({"plan": [PLAN_R1]})
+    assert run(repo, "--resume", run_id, "--reject", "--feedback", "split it") == 3
+    capsys.readouterr()
+    assert main(["status", run_id, "--json", "--cwd", str(repo)]) == 0
+    assert json.loads(capsys.readouterr().out)["plan"] == PLAN_R1
+    fake({"implement": [IMPL], "test": [TEST_OK], "review": [REVIEW_OK]})
+    assert run(repo, "--resume", run_id, "--yes") == 0
+    keys = [s["key"] for s in RunStore(repo).load(run_id).state["stages"]]
+    assert keys == ["explore", "architect", "architect:r1", "implement:step-r1", "test", "review"]
+
+
+def test_cli_feedback_from_stdin(repo, fake, monkeypatch, capsys):
+    run_id = _deferred_l_run(repo, fake, capsys)
+    fake({"plan": [PLAN_R1]})
+    monkeypatch.setattr("sys.stdin", io.StringIO("from\nstdin\n"))
+    assert run(repo, "--resume", run_id, "--feedback", "-") == 3
+    assert RunStore(repo).load(run_id).state["plan_feedback"] == ["from\nstdin"]
+
+
+def test_cli_reject_alone_fails(repo, fake, capsys):
+    run_id = _deferred_l_run(repo, fake, capsys)
+    fake({})
+    assert run(repo, "--resume", run_id, "--reject") == 1
+    assert "plan rejected by user" in capsys.readouterr().out
+
+
+def test_cli_guided_retry_and_accept_failures(repo, fake, capsys):
+    fake({"implement": [IMPL] * 3, "test": [TEST_FAIL] * 3})
+    assert run(repo, "fix", "--size", "S") == 4
+    run_id = RunStore(repo).list_runs()[-1]
+    # Guided retry still failing (fix loop exhausted again) -> needs_human.
+    fake({"implement": [IMPL] * 3, "test": [TEST_FAIL] * 3})
+    assert run(repo, "--resume", run_id, "--feedback", "try harder") == 4
+    keys = [s["key"] for s in RunStore(repo).load(run_id).state["stages"]]
+    assert "retry-1:guided-implement" in keys and "retry-1:fix-2:test" in keys
+    fake({})
+    assert run(repo, "--resume", run_id, "--accept-failures") == 0
+    state = RunStore(repo).load(run_id).state
+    assert (state["status"], state["accepted_failures"]) == ("done", True)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["task", "--reject"],
+        ["task", "--feedback", "x"],
+        ["task", "--accept-failures"],
+        ["--resume", "R", "--reject", "--yes"],
+        ["--resume", "R", "--accept-failures", "--feedback", "x"],
+        ["--resume", "R", "--accept-failures", "--reject"],
+        ["--resume", "R", "--feedback", "  "],
+    ],
+)
+def test_cli_invalid_resume_flag_combos(repo, fake, capsys, args):
+    fake({})
+    assert run(repo, *args) == 1
+    assert "carcara: " in capsys.readouterr().err
+    assert not (repo / ".carcara").exists()
+
+
+def test_cli_status_dependent_flag_errors(repo, fake, capsys):
+    run_id = _deferred_l_run(repo, fake, capsys)
+    fake({})
+    assert run(repo, "--resume", run_id, "--accept-failures") == 1
+    assert run(repo, "--resume", run_id, "--feedback", "x", "--yes") == 1
+    assert RunStore(repo).load(run_id).state["status"] == "awaiting_approval"
+
+
+def test_status_json_report_null_while_running(repo, capsys):
+    run_ = RunStore(repo).create("t", "balanced", "sha")
+    run_.write_report("stale report from a previous drive")
+    data = _status_json(repo, capsys, run_.id)
+    assert data["status"] == "running" and data["report"] is None
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["run", "x", "--ye"], ["status", "--js"], ["diff", "--sta"], ["routing", "on", "--proj", "."]],
+)
+def test_subcommand_flags_not_abbreviated(repo, args):
+    with pytest.raises(SystemExit) as info:
+        main([*args, "--cwd", str(repo)] if args[0] != "routing" else args)
+    assert info.value.code == 2
+
+
+def test_cli_rejects_non_toplevel_cwd(repo, fake, capsys):
+    (repo / "sub").mkdir()
+    fake({"implement": [IMPL], "test": [TEST_OK]})
+    assert main(["run", "x", "--size", "S", "--cwd", str(repo / "sub")]) == 1
+    assert capsys.readouterr().err == f"carcara: run from the repository root ({repo})\n"
+    assert main(["diff", "--cwd", str(repo / "sub")]) == 1
+    assert capsys.readouterr().err == f"carcara: run from the repository root ({repo})\n"
+    assert main(["run", "--resume", "20990101-000000-abcd", "--cwd", str(repo / "sub")]) == 1
+    assert capsys.readouterr().err == f"carcara: run from the repository root ({repo})\n"
+    assert not (repo / "sub" / ".carcara").exists()
+
+
+def test_diff_command(repo, fake, capsys):
+    assert main(["diff", "--cwd", str(repo)]) == 1
+    assert capsys.readouterr().err == "carcara: no runs\n"
+    (repo / ".env").write_text("TRACKED_SECRET=1\n")
+    subprocess.run(["git", "add", ".env"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "env"], cwd=repo, check=True)
+    fake({"implement": [IMPL], "test": [TEST_OK]})
+    assert run(repo, "x", "--size", "S") == 0
+    (run_id,) = RunStore(repo).list_runs()
+    out = capsys.readouterr().out
+    assert f"carcara changes: carcara diff {run_id}" in out
+    (repo / "a.py").write_text("x = 2\n")
+    (repo / ".env").write_text("TRACKED_SECRET=2\n")
+    assert main(["diff", "--cwd", str(repo)]) == 0
+    diff = capsys.readouterr().out
+    assert "+x = 2" in diff and "SECRET" not in diff and ".env" not in diff
+    assert main(["diff", run_id, "--stat", "--cwd", str(repo)]) == 0
+    stat = capsys.readouterr().out
+    assert "a.py" in stat and "+x" not in stat and ".env" not in stat
+    assert main(["diff", "nope", "--cwd", str(repo)]) == 1
+    assert "unknown run: nope" in capsys.readouterr().err
+
+
+def test_stale_lock_takeover_does_not_discard_fresh_lock(repo):
+    from carcara.runstore import RunBusy
+
+    store = RunStore(repo)
+    _write_lock(repo, _dead_pid(), "stale-run")
+    real_read = store._read_lock_text
+    calls = []
+
+    def interleaved():
+        text = real_read()
+        if not calls:
+            # Another process takes over the stale lock right after our read.
+            _write_lock(repo, os.getpid(), "fresh-run")
+        calls.append(text)
+        return text
+
+    store._read_lock_text = interleaved
+    with pytest.raises(RunBusy) as info:
+        store.acquire_lock("mine")
+    assert info.value.run_id == "fresh-run"
+    assert json.loads(_lock(repo).read_text())["run_id"] == "fresh-run"
+    assert list(store.base.glob(".active.json.*")) == []
+
+
+def test_lock_with_mismatched_start_identity_is_stale(repo, monkeypatch):
+    from carcara import runstore
+
+    store = RunStore(repo)
+    monkeypatch.setattr(runstore, "_proc_start", lambda pid: "this-process")
+    store.acquire_lock("r1")
+    assert json.loads(_lock(repo).read_text())["start"] == "this-process"
+    assert store.active()["run_id"] == "r1"
+    monkeypatch.setattr(runstore, "_proc_start", lambda pid: "other-process")
+    assert store.active() is None  # same pid, different process: reused pid
+    store.acquire_lock("r2")  # takes over the stale lock
+    assert store.active()["run_id"] == "r2"
+    monkeypatch.setattr(runstore, "_proc_start", lambda pid: None)  # unknown: pid-only
+    assert store.active()["run_id"] == "r2"
+    store.release_lock("r2")
+    store.acquire_lock("r3")
+    assert "start" not in json.loads(_lock(repo).read_text())
+    store.release_lock("r3")
+
+
+def test_proc_start_identity():
+    from carcara.runstore import _proc_start
+
+    if sys.platform.startswith("linux"):
+        assert _proc_start(os.getpid()) == _proc_start(os.getpid()) is not None
+        assert _proc_start(_dead_pid()) is None

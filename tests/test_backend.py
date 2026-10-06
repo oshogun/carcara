@@ -108,6 +108,8 @@ def test_implementer_option_mapping(monkeypatch):
     assert ROLES["implementer"].prompt in opts.system_prompt["append"]
     assert opts.can_use_tool is not None
     assert "PreToolUse" in opts.hooks and opts.hooks["PreToolUse"][0].hooks
+    assert req.env == {"CARCARA_STAGE": "implementer"}
+    assert opts.env == {"CARCARA_STAGE": "implementer"}
 
 
 def test_reviewer_option_mapping_and_hook_denies_edit(monkeypatch):
@@ -141,6 +143,7 @@ def test_main_model_request_has_no_tools(monkeypatch):
     assert result.structured["size"] == "S"
     opts = calls[0]["options"]
     assert opts.permission_mode == "dontAsk" and opts.can_use_tool is None
+    assert opts.env == {"CARCARA_STAGE": "main"}
     hook = opts.hooks["PreToolUse"][0].hooks[0]
     out = asyncio.run(hook({"tool_name": "Read", "tool_input": {}}, None, None))
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
@@ -288,6 +291,7 @@ def test_sdk_backend_hides_api_keys_by_default_and_restores(monkeypatch):
     seen = install_env_capturing_query(monkeypatch)
     run(SdkBackend(), impl_request())
     assert seen == [{"ANTHROPIC_API_KEY": None, "ANTHROPIC_AUTH_TOKEN": None}]
+    assert not set(KEY_VARS) & set(impl_request().env)
     assert os.environ["ANTHROPIC_API_KEY"] == "sk-test"
     assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "tok-test"
 

@@ -16,5 +16,80 @@
       "Read(./.env.*)",
       "Read(./secrets/**)"
     ]
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v carcara >/dev/null 2>&1 || exit 0; carcara hook prompt-context --project \"${CLAUDE_PROJECT_DIR}\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v carcara >/dev/null 2>&1 || exit 0; carcara hook pre-tool-use --project \"${CLAUDE_PROJECT_DIR}\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v carcara >/dev/null 2>&1 || exit 0; carcara hook pre-tool-use --project \"${CLAUDE_PROJECT_DIR}\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v carcara >/dev/null 2>&1 || exit 0; carcara hook pre-tool-use --project \"${CLAUDE_PROJECT_DIR}\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v carcara >/dev/null 2>&1 || exit 0; carcara hook pre-tool-use --project \"${CLAUDE_PROJECT_DIR}\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v carcara >/dev/null 2>&1 || exit 0; carcara hook pre-tool-use --project \"${CLAUDE_PROJECT_DIR}\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v carcara >/dev/null 2>&1 || exit 0; carcara hook pre-tool-use --project \"${CLAUDE_PROJECT_DIR}\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
   }
 }
