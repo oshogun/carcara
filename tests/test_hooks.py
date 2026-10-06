@@ -101,9 +101,9 @@ def test_main_edit_routing_config_denied(project, path):
 
 
 def test_case_insensitive_fs_spelling_denied(project, monkeypatch):
-    """A differently-spelled path to the same project dir (as on a case-insensitive
-    FS) is matched via samefile, not string prefixes."""
-    alias = project.parent / "PROJ"
+    """A differently-spelled path to the same project dir (a symlink alias) is
+    matched via samefile, not string prefixes."""
+    alias = project.parent / "proj-alias"
     alias.symlink_to(project)
     (project / ".claude").mkdir()
     (project / ".claude" / "settings.json").write_text("{}")
