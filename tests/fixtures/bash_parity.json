@@ -1,0 +1,206 @@
+[
+  {
+    "id": "fresh",
+    "argv": [
+      "proj"
+    ],
+    "setup": null,
+    "returncode": 0,
+    "stdout": "carcara VERSION: installing profile 'balanced' into proj\n  create     proj/.claude/agents/architect.md\n  create     proj/.claude/agents/doc-writer.md\n  create     proj/.claude/agents/explorer.md\n  create     proj/.claude/agents/implementer.md\n  create     proj/.claude/agents/reviewer.md\n  create     proj/.claude/agents/test-runner.md\n  create     proj/.claude/commands/sdlc-build.md\n  create     proj/.claude/commands/sdlc-plan.md\n  create     proj/.claude/commands/sdlc-review.md\n  create     proj/.claude/commands/sdlc-test.md\n  create     proj/.claude/commands/sdlc.md\n  create     proj/.claude/settings.json\n  create     proj/CLAUDE.md\ndone: 12 file(s) written, 0 skipped.\nNext: start Claude Code in proj and run: /sdlc <task>\n",
+    "stderr": "",
+    "tree_sha256": {
+      ".claude/agents/architect.md": "c25fc7bb515813a7b7cd4656480c68daecf228b8f78325b92f676d4a7f4a4745",
+      ".claude/agents/doc-writer.md": "bf7cda99dd7fe506530b9280941f03bad3d2c54d5f82b11130272592d699c26d",
+      ".claude/agents/explorer.md": "10124cc7f603e56d4e5e3e461039de78c983e2bfb1b151ea877d9c10ee82e7f4",
+      ".claude/agents/implementer.md": "b92e1edd11df9c2b72234852db3de1a99e7c79a6edb7bb84f7a5588965139ae8",
+      ".claude/agents/reviewer.md": "aeface5d0996e925e50abd1b268c88ce8bcfda6604a1af62a9fb9b3b5a60cb2f",
+      ".claude/agents/test-runner.md": "6a0a96c62fd5a3a8cfe108f7a070f7334fe2a3d21733c393807db19f38b64329",
+      ".claude/commands/sdlc-build.md": "be35ac6aeca99d0d94293769820dd7e781aae81efb95fcfc00b31aafbebe6803",
+      ".claude/commands/sdlc-plan.md": "452e242ebc22327bd5bdd9db48535f1e22a11d925adc1ae465b4152e385713a4",
+      ".claude/commands/sdlc-review.md": "e3083c8e1eaddfa2d56cae4cb75722d694720978fa2f10638fbdbb6d527e87cb",
+      ".claude/commands/sdlc-test.md": "cc679efcbcb1b27633e1c87f4e0b44b14969db35389d959cf8ac6a7742b3dc50",
+      ".claude/commands/sdlc.md": "81a2599c6ca3b98226dd225ea139304c6af169648a3d633c643e7f6bb088b4e9",
+      ".claude/settings.json": "96562bd79c5a57c4e96f921ae11cec07850cdf0f16360cb912a14d9251d14e4a",
+      "CLAUDE.md": "e69543840f43969639110ea57429d5389be840667fbaff14d2357a282bed5e99"
+    }
+  },
+  {
+    "id": "quality-trailing-slash",
+    "argv": [
+      "-p",
+      "quality",
+      "proj/"
+    ],
+    "setup": null,
+    "returncode": 0,
+    "stdout": "carcara VERSION: installing profile 'quality' into proj/\n  create     proj//.claude/agents/architect.md\n  create     proj//.claude/agents/doc-writer.md\n  create     proj//.claude/agents/explorer.md\n  create     proj//.claude/agents/implementer.md\n  create     proj//.claude/agents/reviewer.md\n  create     proj//.claude/agents/test-runner.md\n  create     proj//.claude/commands/sdlc-build.md\n  create     proj//.claude/commands/sdlc-plan.md\n  create     proj//.claude/commands/sdlc-review.md\n  create     proj//.claude/commands/sdlc-test.md\n  create     proj//.claude/commands/sdlc.md\n  create     proj//.claude/settings.json\n  create     proj//CLAUDE.md\ndone: 12 file(s) written, 0 skipped.\nNext: start Claude Code in proj/ and run: /sdlc <task>\n",
+    "stderr": "",
+    "tree_sha256": {
+      ".claude/agents/architect.md": "c25fc7bb515813a7b7cd4656480c68daecf228b8f78325b92f676d4a7f4a4745",
+      ".claude/agents/doc-writer.md": "357067a1aae62aaf5fda5665a68f10c978a79c8176d52270af042b2f36ae7b9b",
+      ".claude/agents/explorer.md": "d0185f2b119c1acc3fe581b080860e02050e2ea4c6f970c7123f9c480f921858",
+      ".claude/agents/implementer.md": "1d8e87c9711f6a4fc789b3bf54511741af27b1da550c0d9fb62b42fbc88189fb",
+      ".claude/agents/reviewer.md": "9ff9703b368a91374d0a729a4bdb00145531612c76ca2e391d908fd963f2eca7",
+      ".claude/agents/test-runner.md": "6a0a96c62fd5a3a8cfe108f7a070f7334fe2a3d21733c393807db19f38b64329",
+      ".claude/commands/sdlc-build.md": "be35ac6aeca99d0d94293769820dd7e781aae81efb95fcfc00b31aafbebe6803",
+      ".claude/commands/sdlc-plan.md": "452e242ebc22327bd5bdd9db48535f1e22a11d925adc1ae465b4152e385713a4",
+      ".claude/commands/sdlc-review.md": "e3083c8e1eaddfa2d56cae4cb75722d694720978fa2f10638fbdbb6d527e87cb",
+      ".claude/commands/sdlc-test.md": "cc679efcbcb1b27633e1c87f4e0b44b14969db35389d959cf8ac6a7742b3dc50",
+      ".claude/commands/sdlc.md": "81a2599c6ca3b98226dd225ea139304c6af169648a3d633c643e7f6bb088b4e9",
+      ".claude/settings.json": "39458f40163b3df5ceceb25104facd527efc8e604ebaf6b51f261c9a983daacd",
+      "CLAUDE.md": "314d93a985f03b00d9e7c03957e04a732c297c46ca4ad62047a9d82d57b3c790"
+    }
+  },
+  {
+    "id": "existing-skip",
+    "argv": [
+      "proj"
+    ],
+    "setup": "existing",
+    "returncode": 0,
+    "stdout": "carcara VERSION: installing profile 'balanced' into proj\n  create     proj/.claude/agents/architect.md\n  create     proj/.claude/agents/doc-writer.md\n  create     proj/.claude/agents/explorer.md\n  create     proj/.claude/agents/implementer.md\n  skip       proj/.claude/agents/reviewer.md (exists; use --force to overwrite)\n  create     proj/.claude/agents/test-runner.md\n  create     proj/.claude/commands/sdlc-build.md\n  create     proj/.claude/commands/sdlc-plan.md\n  create     proj/.claude/commands/sdlc-review.md\n  create     proj/.claude/commands/sdlc-test.md\n  create     proj/.claude/commands/sdlc.md\n  create     proj/.claude/settings.json\n  update     proj/CLAUDE.md\ndone: 11 file(s) written, 1 skipped.\nnote: skipped files keep their previous content; re-run with --force to apply profile 'balanced' to them.\nNext: start Claude Code in proj and run: /sdlc <task>\n",
+    "stderr": "",
+    "tree_sha256": {
+      ".claude/agents/architect.md": "c25fc7bb515813a7b7cd4656480c68daecf228b8f78325b92f676d4a7f4a4745",
+      ".claude/agents/doc-writer.md": "bf7cda99dd7fe506530b9280941f03bad3d2c54d5f82b11130272592d699c26d",
+      ".claude/agents/explorer.md": "10124cc7f603e56d4e5e3e461039de78c983e2bfb1b151ea877d9c10ee82e7f4",
+      ".claude/agents/implementer.md": "b92e1edd11df9c2b72234852db3de1a99e7c79a6edb7bb84f7a5588965139ae8",
+      ".claude/agents/reviewer.md": "c95b74032c438c7a91af14ef1af75c773ccd775ad81bf98a2a1fbdd1d75ea38d",
+      ".claude/agents/test-runner.md": "6a0a96c62fd5a3a8cfe108f7a070f7334fe2a3d21733c393807db19f38b64329",
+      ".claude/commands/sdlc-build.md": "be35ac6aeca99d0d94293769820dd7e781aae81efb95fcfc00b31aafbebe6803",
+      ".claude/commands/sdlc-plan.md": "452e242ebc22327bd5bdd9db48535f1e22a11d925adc1ae465b4152e385713a4",
+      ".claude/commands/sdlc-review.md": "e3083c8e1eaddfa2d56cae4cb75722d694720978fa2f10638fbdbb6d527e87cb",
+      ".claude/commands/sdlc-test.md": "cc679efcbcb1b27633e1c87f4e0b44b14969db35389d959cf8ac6a7742b3dc50",
+      ".claude/commands/sdlc.md": "81a2599c6ca3b98226dd225ea139304c6af169648a3d633c643e7f6bb088b4e9",
+      ".claude/settings.json": "96562bd79c5a57c4e96f921ae11cec07850cdf0f16360cb912a14d9251d14e4a",
+      "CLAUDE.md": "63e6f0768c6fcf76302877dd969501b43cb8161e2b3fdf66bca39267a54971e5"
+    }
+  },
+  {
+    "id": "existing-force-dry-run",
+    "argv": [
+      "-f",
+      "-n",
+      "proj"
+    ],
+    "setup": "existing",
+    "returncode": 0,
+    "stdout": "carcara VERSION: installing profile 'balanced' into proj (dry run)\n  create     proj/.claude/agents/architect.md\n  create     proj/.claude/agents/doc-writer.md\n  create     proj/.claude/agents/explorer.md\n  create     proj/.claude/agents/implementer.md\n  overwrite  proj/.claude/agents/reviewer.md\n  create     proj/.claude/agents/test-runner.md\n  create     proj/.claude/commands/sdlc-build.md\n  create     proj/.claude/commands/sdlc-plan.md\n  create     proj/.claude/commands/sdlc-review.md\n  create     proj/.claude/commands/sdlc-test.md\n  create     proj/.claude/commands/sdlc.md\n  create     proj/.claude/settings.json\n  update     proj/CLAUDE.md\ndone: 12 file(s) written, 0 skipped.\nNext: start Claude Code in proj and run: /sdlc <task>\n",
+    "stderr": "",
+    "tree_sha256": {
+      ".claude/agents/reviewer.md": "c95b74032c438c7a91af14ef1af75c773ccd775ad81bf98a2a1fbdd1d75ea38d",
+      "CLAUDE.md": "af9e0c013bf4c3b8747d55eb4e712b5b1f2857140db5b80c03562ff5cb83433e"
+    }
+  },
+  {
+    "id": "existing-force",
+    "argv": [
+      "--force",
+      "proj"
+    ],
+    "setup": "existing",
+    "returncode": 0,
+    "stdout": "carcara VERSION: installing profile 'balanced' into proj\n  create     proj/.claude/agents/architect.md\n  create     proj/.claude/agents/doc-writer.md\n  create     proj/.claude/agents/explorer.md\n  create     proj/.claude/agents/implementer.md\n  overwrite  proj/.claude/agents/reviewer.md\n  create     proj/.claude/agents/test-runner.md\n  create     proj/.claude/commands/sdlc-build.md\n  create     proj/.claude/commands/sdlc-plan.md\n  create     proj/.claude/commands/sdlc-review.md\n  create     proj/.claude/commands/sdlc-test.md\n  create     proj/.claude/commands/sdlc.md\n  create     proj/.claude/settings.json\n  update     proj/CLAUDE.md\ndone: 12 file(s) written, 0 skipped.\nNext: start Claude Code in proj and run: /sdlc <task>\n",
+    "stderr": "",
+    "tree_sha256": {
+      ".claude/agents/architect.md": "c25fc7bb515813a7b7cd4656480c68daecf228b8f78325b92f676d4a7f4a4745",
+      ".claude/agents/doc-writer.md": "bf7cda99dd7fe506530b9280941f03bad3d2c54d5f82b11130272592d699c26d",
+      ".claude/agents/explorer.md": "10124cc7f603e56d4e5e3e461039de78c983e2bfb1b151ea877d9c10ee82e7f4",
+      ".claude/agents/implementer.md": "b92e1edd11df9c2b72234852db3de1a99e7c79a6edb7bb84f7a5588965139ae8",
+      ".claude/agents/reviewer.md": "aeface5d0996e925e50abd1b268c88ce8bcfda6604a1af62a9fb9b3b5a60cb2f",
+      ".claude/agents/test-runner.md": "6a0a96c62fd5a3a8cfe108f7a070f7334fe2a3d21733c393807db19f38b64329",
+      ".claude/commands/sdlc-build.md": "be35ac6aeca99d0d94293769820dd7e781aae81efb95fcfc00b31aafbebe6803",
+      ".claude/commands/sdlc-plan.md": "452e242ebc22327bd5bdd9db48535f1e22a11d925adc1ae465b4152e385713a4",
+      ".claude/commands/sdlc-review.md": "e3083c8e1eaddfa2d56cae4cb75722d694720978fa2f10638fbdbb6d527e87cb",
+      ".claude/commands/sdlc-test.md": "cc679efcbcb1b27633e1c87f4e0b44b14969db35389d959cf8ac6a7742b3dc50",
+      ".claude/commands/sdlc.md": "81a2599c6ca3b98226dd225ea139304c6af169648a3d633c643e7f6bb088b4e9",
+      ".claude/settings.json": "96562bd79c5a57c4e96f921ae11cec07850cdf0f16360cb912a14d9251d14e4a",
+      "CLAUDE.md": "63e6f0768c6fcf76302877dd969501b43cb8161e2b3fdf66bca39267a54971e5"
+    }
+  },
+  {
+    "id": "path-like-profile",
+    "argv": [
+      "-p",
+      "../x",
+      "proj"
+    ],
+    "setup": null,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "carcara: unknown profile: ../x\n",
+    "tree_sha256": {}
+  },
+  {
+    "id": "unknown-profile",
+    "argv": [
+      "-p",
+      "nope",
+      "proj"
+    ],
+    "setup": null,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "carcara: unknown profile: nope (try --list-profiles)\n",
+    "tree_sha256": {}
+  },
+  {
+    "id": "unknown-option",
+    "argv": [
+      "--bogus",
+      "proj"
+    ],
+    "setup": null,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "carcara: unknown option: --bogus (see --help)\n",
+    "tree_sha256": {}
+  },
+  {
+    "id": "two-targets",
+    "argv": [
+      "proj",
+      "proj"
+    ],
+    "setup": null,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "carcara: only one target directory may be given\n",
+    "tree_sha256": {}
+  },
+  {
+    "id": "missing-target",
+    "argv": [
+      "proj/missing"
+    ],
+    "setup": null,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "carcara: target directory does not exist: proj/missing\n",
+    "tree_sha256": {}
+  },
+  {
+    "id": "unbalanced",
+    "argv": [
+      "proj"
+    ],
+    "setup": "unbalanced",
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "carcara: proj/CLAUDE.md has unbalanced carcara markers; fix them manually\n",
+    "tree_sha256": {
+      "CLAUDE.md": "05740aa2a4badd3d9251342c753cd456c6addd3c21e22301ae1b7a6496a307b1"
+    }
+  },
+  {
+    "id": "list-profiles",
+    "argv": [
+      "-l"
+    ],
+    "setup": null,
+    "returncode": 0,
+    "stdout": "balanced\n  MODEL_MAIN=sonnet\n  MODEL_ARCHITECT=opus\n  MODEL_IMPLEMENTER=sonnet\n  MODEL_REVIEWER=sonnet\n  MODEL_EXPLORER=haiku\n  MODEL_TEST_RUNNER=haiku\n  MODEL_DOC_WRITER=haiku\neconomy\n  MODEL_MAIN=sonnet\n  MODEL_ARCHITECT=sonnet\n  MODEL_IMPLEMENTER=sonnet\n  MODEL_REVIEWER=haiku\n  MODEL_EXPLORER=haiku\n  MODEL_TEST_RUNNER=haiku\n  MODEL_DOC_WRITER=haiku\nquality\n  MODEL_MAIN=opus\n  MODEL_ARCHITECT=opus\n  MODEL_IMPLEMENTER=opus\n  MODEL_REVIEWER=opus\n  MODEL_EXPLORER=sonnet\n  MODEL_TEST_RUNNER=haiku\n  MODEL_DOC_WRITER=sonnet\n",
+    "stderr": "",
+    "tree_sha256": {}
+  }
+]

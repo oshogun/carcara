@@ -1,4 +1,5 @@
-## carcara agentic SDLC (profile: {{PROFILE}})
+<!-- carcara:begin -->
+## carcara agentic SDLC (profile: economy)
 
 This project uses the carcara SDLC framework. Work is split across
 specialised subagents in `.claude/agents/`, each pinned to the cheapest model
@@ -6,15 +7,16 @@ that does its job well:
 
 | Agent | Model | Role |
 |---|---|---|
-| explorer | {{MODEL_EXPLORER}} | read-only code search, file:line facts |
-| architect | {{MODEL_ARCHITECT}} | plans for non-trivial changes |
-| implementer | {{MODEL_IMPLEMENTER}} | writes code and tests |
-| test-runner | {{MODEL_TEST_RUNNER}} | runs build/lint/tests, summarises |
-| reviewer | {{MODEL_REVIEWER}} | high-signal diff review |
-| doc-writer | {{MODEL_DOC_WRITER}} | updates affected docs |
+| explorer | haiku | read-only code search, file:line facts |
+| architect | sonnet | plans for non-trivial changes |
+| implementer | sonnet | writes code and tests |
+| test-runner | haiku | runs build/lint/tests, summarises |
+| reviewer | haiku | high-signal diff review |
+| doc-writer | haiku | updates affected docs |
 
 Commands: `/sdlc <task>` (full triaged pipeline), `/sdlc-plan`, `/sdlc-build`,
-`/sdlc-test`, `/sdlc-review`.
+`/sdlc-test`, `/sdlc-review`. `carcara run "<task>"` runs this pipeline
+headlessly from the terminal.
 
 ### Token discipline
 - Triage first: do S-sized changes directly; only escalate to subagents when
@@ -28,3 +30,4 @@ Commands: `/sdlc <task>` (full triaged pipeline), `/sdlc-plan`, `/sdlc-build`,
   design questions, not routine edits.
 - Cap fix loops at 2 iterations, then ask the user.
 - Run `/compact` between large phases of long sessions.
+<!-- carcara:end -->
