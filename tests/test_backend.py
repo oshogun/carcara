@@ -315,3 +315,20 @@ def test_sdk_backend_use_api_key_passes_keys_through(monkeypatch):
     seen = install_env_capturing_query(monkeypatch)
     run(SdkBackend(use_api_key=True), impl_request())
     assert seen == [{"ANTHROPIC_API_KEY": "sk-test", "ANTHROPIC_AUTH_TOKEN": "tok-test"}]
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_unrestricted_bash_reaches_policy_callbacks(monkeypatch, flag):
+    from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+    calls = install_query(monkeypatch, [result_message(IMPLEMENT_OK)])
+    kwargs = {"unrestricted_bash": True} if flag else {}
+    req = build_request("implement", ROLES["implementer"], PROFILE, "do it", CWD, **kwargs)
+    assert req.unrestricted_bash is flag
+    run(SdkBackend(), req)
+    opts = calls[0]["options"]
+    push = {"tool_name": "Bash", "tool_input": {"command": "git push"}}
+    out = asyncio.run(opts.hooks["PreToolUse"][0].hooks[0](push, None, None))
+    assert (out == {}) is flag
+    res = asyncio.run(opts.can_use_tool("Bash", push["tool_input"], None))
+    assert isinstance(res, PermissionResultAllow if flag else PermissionResultDeny)

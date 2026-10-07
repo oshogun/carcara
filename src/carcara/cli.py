@@ -120,6 +120,12 @@ def _add_run_parser(sub: Any) -> None:
     )
     run.add_argument("--list", action="store_true", help="list stored runs and their status")
     run.add_argument("--allow-dirty", action="store_true", help="allow uncommitted changes")
+    run.add_argument(
+        "--unrestricted-bash",
+        action="store_true",
+        help="disable the implementer/test-runner Bash deny-list for this invocation only "
+        "(not persisted; pass it again with --resume)",
+    )
     run.add_argument("--review", action="store_true", help="also review S-sized changes")
     run.add_argument(
         "--project-settings",
@@ -608,7 +614,13 @@ def _run_main(ns: argparse.Namespace) -> int:
             allow_dirty=ns.allow_dirty,
             project_settings=ns.project_settings,
             use_api_key=use_api_key,
+            unrestricted_bash=ns.unrestricted_bash,
         )
+        if ns.unrestricted_bash:
+            _err(
+                "warning: --unrestricted-bash: Bash deny-list disabled for "
+                "implementer/test-runner stages"
+            )
         name = profile.name
         orch = Orchestrator(
             backend,

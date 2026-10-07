@@ -861,3 +861,30 @@ def test_proc_start_identity():
     if sys.platform.startswith("linux"):
         assert _proc_start(os.getpid()) == _proc_start(os.getpid()) is not None
         assert _proc_start(_dead_pid()) is None
+
+
+def _events(repo, run_id):
+    path = RunStore(repo).load(run_id).dir / "events.jsonl"
+    return [json.loads(line)["event"] for line in path.read_text().splitlines()]
+
+
+def test_unrestricted_bash_flag_warns_and_reaches_stages(repo, fake, monkeypatch, capsys):
+    from carcara.orchestrator import Orchestrator
+
+    seen = []
+    real_init = Orchestrator.__init__
+
+    def spy(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        seen.append(self.options.unrestricted_bash)
+
+    monkeypatch.setattr(Orchestrator, "__init__", spy)
+    fake({"implement": [IMPL], "test": [TEST_OK]})
+    assert run(repo, "tiny", "--size", "S") == 0
+    assert "--unrestricted-bash" not in capsys.readouterr().err
+    fake({"implement": [IMPL], "test": [TEST_OK]})
+    assert run(repo, "tiny", "--size", "S", "--unrestricted-bash") == 0
+    assert "warning: --unrestricted-bash" in capsys.readouterr().err
+    assert seen == [False, True]
+    flagged = [r for r in RunStore(repo).list_runs() if "warning" in _events(repo, r)]
+    assert len(flagged) == 1

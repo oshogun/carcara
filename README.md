@@ -202,6 +202,7 @@ fail, the fix loop runs at most 2 iterations, then exits with code 4.
 | `--feedback TEXT` | with `--resume`: re-plan with this feedback, or guide a needs_human retry; `-` reads stdin |
 | `--accept-failures` | with `--resume`: finish a needs_human run, accepting its failures |
 | `--allow-dirty` | allow uncommitted changes (clean tree required by default); the diff base is a snapshot of your uncommitted work |
+| `--unrestricted-bash` | turn off the implementer/test-runner Bash deny-list for this invocation only (prints a warning; pass it again with `--resume`) |
 | `--review` | also review S-sized changes |
 | `--project-settings` | load the project's Claude Code settings and CLAUDE.md (note: their `env` / `apiKeyHelper` can re-enable API billing) |
 | `--cwd DIR` | project directory (default `.`) |
@@ -252,10 +253,28 @@ refuse `.git`, `.claude` and `.carcara`. The policy is
 enforced by a PreToolUse hook, which applies in every permission mode;
 `bypassPermissions` is never used.
 
+implementer and test-runner may run any Bash command except those caught by a
+deny-list: `git push`, `git reset --hard`, `git clean -f`, curl/wget piped or
+substituted into a shell or interpreter, shell access to `.env`/`secrets/`
+paths, and shell writes (redirections, `tee`, `rm`/`mv`/`cp`/`mkdir`/...)
+outside the repo or into `.git`, `.claude` or `.carcara`. Reads outside the
+repo stay allowed. Wrappers such as `sudo -u root`, `nice -n 5`, `env -u X`,
+`env -S '...'`, `timeout -s KILL 5` and `xargs -n 1` are looked through, including
+their option values. To turn the deny-list off, pass
+`carcara run --unrestricted-bash`. It applies to that invocation only (a
+resume needs it again), prints a warning on stderr and is recorded in the
+run's events.
+
 Known risks:
 
-- implementer and test-runner have unrestricted Bash. This is mitigated by the
-  clean-tree requirement and the base commit recorded for each run.
+- implementer and test-runner Bash is guarded only by a best-effort deny-list.
+  Variables, `eval`, base64, `cd`, aliases, or a script written into the repo
+  and then run all bypass it. It is string matching on the command line, so a
+  wrapper option missing from its table can also hide a command. The opt-out
+  is a CLI flag resolved before the run starts, so a stage cannot turn it on
+  (files a stage creates have no effect). The real safety net is still the clean-tree
+  requirement and the base commit recorded for each run. A per-project
+  test-command allowlist is not implemented yet.
 - Grep and recursive searches may still surface secrets in a searched directory.
 - `setting_sources` is empty by default, so project settings and CLAUDE.md are
   not loaded into stages; pass `--project-settings` to opt in.

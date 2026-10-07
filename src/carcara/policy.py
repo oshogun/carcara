@@ -23,8 +23,18 @@ Accepted limitations:
   blocked, so pattern-based discovery (e.g. ``find . -name '*nv'``) is not.
 - git pathspec globs (``git log -- ':(glob)**'``) are not secret-checked;
   git only reads tracked content, which should not include secrets.
-- test-runner and implementer have unrestricted Bash (no path confinement or
-  secret checks).
+- test-runner and implementer Bash is guarded only by a best-effort deny-list
+  (``_check_unrestricted_bash``: git push, git reset --hard, git clean -f,
+  fetch-and-exec, shell access to secret paths, shell writes outside ``cwd``
+  or into ``.git``/``.carcara``/``.claude``). Variables, eval, base64, ``cd``,
+  aliases or scripts written into the repo and then run all bypass it; reads
+  outside ``cwd`` are allowed. Wrapper options that take a value (``sudo -u``,
+  ``nice -n``, ``env -u``/``-C``/``-S``, ...) are skipped via
+  ``_WRAPPER_VALUE_OPTS``; options missing from that table can still hide the
+  wrapped command. The only opt-out is ``carcara run --unrestricted-bash``,
+  resolved by the orchestrator before the run and passed to ``decide`` as
+  ``unrestricted_bash``, so a stage cannot turn it on. There is no
+  per-project test-command allowlist yet.
 
 Read-only Bash (explorer/reviewer) is a strict allowlist: the command prefix
 must be in ``READ_ONLY_PREFIXES`` (git status/diff/log/show, ls, rg, grep,
@@ -54,6 +64,15 @@ from carcara.roles import Role, get_role
 
 WRITER_ROLES = frozenset({"implementer", "doc-writer"})
 UNRESTRICTED_BASH_ROLES = frozenset({"implementer", "test-runner"})
+# Best-effort Bash deny-list for UNRESTRICTED_BASH_ROLES (see _check_unrestricted_bash).
+SHELL_EXEC_TARGETS = frozenset(
+    {"sh", "bash", "zsh", "dash", "ksh", "python", "python3", "perl", "ruby", "node"}
+    | {"eval", "source", "."}
+)
+NETWORK_FETCHERS = frozenset({"curl", "wget"})
+SHELL_WRITE_COMMANDS = frozenset(
+    {"rm", "mv", "cp", "ln", "mkdir", "touch", "chmod", "chown", "truncate", "install", "rmdir"}
+)
 WRITE_TOOLS = frozenset({"Edit", "Write", "NotebookEdit", "MultiEdit"})
 READ_TOOLS = frozenset({"Read", "Grep", "Glob"})
 ALWAYS_DENIED = frozenset({"Task", "Agent"})
@@ -426,6 +445,65 @@ def _unsafe_shell(command: str) -> str | None:
     return None
 
 
+_SEGMENT_PUNCT = "();<>|&\n"
+_SEGMENT_PUNCT_SET = frozenset(_SEGMENT_PUNCT)
+# ``2>``/``1>>``: drop the fd number so it is not mistaken for an argument.
+_FD_PREFIX = re.compile(r"(?<![\w$-])\d+(?=[<>])")
+_HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][\w.-]*)\1[^\n]*\n")
+
+
+def _strip_heredocs(command: str) -> str:
+    """Drop here-document bodies so their text is not parsed as commands."""
+    out: list[str] = []
+    pos = 0
+    while (m := _HEREDOC.search(command, pos)) is not None:
+        out.append(command[pos : m.end()])
+        delim = re.compile(rf"^\t*{re.escape(m.group(2))}[ \t]*$", re.MULTILINE)
+        end = delim.search(command, m.end())
+        if end is None:
+            return "".join(out)  # unterminated: the rest is body
+        pos = end.end()
+    out.append(command[pos:])
+    return "".join(out)
+
+
+def _shell_segments(command: str) -> list[tuple[str, list[str]]] | None:
+    """Split ``command`` into simple commands as (preceding operator, tokens).
+
+    Quote-aware via shlex: ``;``, ``&&``, ``||``, ``|``, ``|&``, ``&``,
+    newlines and subshell parentheses separate segments (the operator is
+    ``"|"`` for any pipe). Redirection operators stay in the tokens.
+    Here-document bodies are skipped. Returns None when unparseable
+    (e.g. unbalanced quotes).
+    """
+    text = _strip_heredocs(command.replace("\\\n", " "))
+    lex = shlex.shlex(_FD_PREFIX.sub("", text), posix=True, punctuation_chars=_SEGMENT_PUNCT)
+    lex.whitespace = " \t\r"
+    lex.whitespace_split = True
+    try:
+        tokens = list(lex)
+    except ValueError:
+        return None
+    segments: list[tuple[str, list[str]]] = []
+    op = ""
+    current: list[str] = []
+    for tok in tokens:
+        is_punct = bool(tok) and set(tok) <= _SEGMENT_PUNCT_SET
+        if not is_punct or (("<" in tok or ">" in tok) and "(" not in tok and ")" not in tok):
+            current.append(tok)
+            continue
+        sep = "|" if "|" in tok and "||" not in tok else tok
+        if current:
+            segments.append((op, current))
+            current = []
+            op = sep
+        elif sep != "(":
+            op = sep
+    if current:
+        segments.append((op, current))
+    return segments
+
+
 def _flag_denied(tok: str) -> Decision:
     return _deny(f"argument not allowed for read-only roles: {tok}")
 
@@ -613,10 +691,216 @@ def _is_within(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
 
+_WRAPPERS = frozenset(
+    {"sudo", "env", "command", "builtin", "exec", "xargs", "nohup", "nice", "time", "timeout"}
+)
+# Wrapper options whose value is the next argv token (attached forms need no skip).
+_WRAPPER_VALUE_OPTS: dict[str, frozenset[str]] = {
+    "sudo": frozenset(
+        {"-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T"}
+        | {"--user", "--group", "--host", "--prompt", "--chdir", "--close-from"}
+        | {"--role", "--type", "--other-user", "--command-timeout"}
+    ),
+    "env": frozenset({"-u", "-C", "-S", "--unset", "--chdir", "--split-string"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "timeout": frozenset({"-s", "-k", "--signal", "--kill-after"}),
+    "xargs": frozenset(
+        {"-I", "-n", "-P", "-L", "-d", "-E", "-s", "-a"}
+        | {"--max-args", "--max-procs", "--delimiter", "--arg-file", "--max-chars"}
+        | {"--eof", "--replace"}
+    ),
+    "time": frozenset({"-f", "-o", "--format", "--output"}),
+}
+_ASSIGNMENT = re.compile(r"^[A-Za-z_]\w*=")
+_GIT_VALUE_OPTS = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
+)
+_DEV_SINKS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"})
+_FETCH_SUBST = re.compile(r"(?:[<$]\(|`)\s*(?:curl|wget)\b")
+_DEST_COMMANDS = frozenset({"cp", "mv", "ln", "install"})
+
+
+def _strip_wrappers(argv: list[str]) -> list[str]:
+    """Drop leading ``VAR=x`` assignments and wrappers like ``sudo``/``env``/``xargs``.
+
+    Values of ``_WRAPPER_VALUE_OPTS`` are skipped too; ``env -S``/``--split-string``
+    strings are split and checked as the wrapped command.
+    """
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if _ASSIGNMENT.match(tok):
+            i += 1
+            continue
+        base = posixpath.basename(tok)
+        if base not in _WRAPPERS:
+            break
+        value_opts = _WRAPPER_VALUE_OPTS.get(base, frozenset())
+        i += 1
+        while i < len(argv) and (argv[i].startswith("-") or _ASSIGNMENT.match(argv[i])):
+            opt = argv[i]
+            i += 1
+            split = None
+            if base == "env" and opt in ("-S", "--split-string") and i < len(argv):
+                split, i = argv[i], i + 1
+            elif base == "env" and opt.startswith("--split-string="):
+                split = opt.partition("=")[2]
+            elif base == "env" and opt.startswith("-S") and len(opt) > 2:
+                split = opt[2:]
+            elif opt in value_opts:
+                i += 1
+            if split is not None:
+                try:
+                    words = shlex.split(split)
+                except ValueError:
+                    words = split.split()
+                argv, i = ["env", *words, *argv[i:]], 0
+                break
+        else:
+            if base == "timeout" and i < len(argv):
+                i += 1  # duration
+    return argv[i:]
+
+
+def _split_redirects(tokens: list[str]) -> tuple[list[str], list[str]]:
+    """(argv without redirections, files written by ``>``-style redirections)."""
+    argv: list[str] = []
+    targets: list[str] = []
+    it = iter(tokens)
+    for tok in it:
+        if not (tok and set(tok) <= _SEGMENT_PUNCT_SET):
+            argv.append(tok)
+            continue
+        target = next(it, "")
+        if ">" not in tok or (tok.endswith("&") and (target.isdigit() or target == "-")):
+            continue  # input, here-string or fd duplication
+        if target not in _DEV_SINKS:
+            targets.append(target)
+    return argv, targets
+
+
+def _is_exec_target(cmd: str) -> bool:
+    base = posixpath.basename(cmd)
+    return base in SHELL_EXEC_TARGETS or base.startswith("python")
+
+
+def _git_subcommand(args: list[str]) -> tuple[str, list[str]]:
+    """Skip git global options; return (subcommand, its arguments)."""
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok in _GIT_VALUE_OPTS:
+            i += 2
+        elif tok.startswith("-"):
+            i += 1
+        else:
+            return tok, args[i + 1 :]
+    return "", []
+
+
+def _write_operands(cmd: str, args: list[str]) -> list[str]:
+    """Paths a SHELL_WRITE_COMMANDS invocation modifies (destination only for cp/mv/ln/install)."""
+    operands: list[str] = []
+    dests: list[str] = []
+    end_opts = False
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        i += 1
+        if not end_opts and tok == "--":
+            end_opts = True
+        elif not end_opts and tok.startswith("-") and tok != "-":
+            if cmd not in _DEST_COMMANDS:
+                continue
+            if tok in ("-t", "--target-directory") and i < len(args):
+                dests.append(args[i])
+                i += 1
+            elif tok.startswith("--target-directory="):
+                dests.append(tok.partition("=")[2])
+            elif tok.startswith("-t") and not tok.startswith("--"):
+                dests.append(tok[2:])
+        else:
+            operands.append(tok)
+    if cmd not in _DEST_COMMANDS:
+        return operands
+    if dests:
+        return dests
+    if cmd == "ln" and len(operands) == 1:
+        return ["."]  # link created in the current directory
+    return operands[-1:]
+
+
+def _check_unrestricted_bash(command: str, cwd: str | None) -> Decision | None:
+    """Best-effort deny-list for implementer/test-runner Bash; None if acceptable.
+
+    Denies git push, git reset --hard, git clean -f, curl/wget piped or
+    substituted into a shell/interpreter, shell access to secret paths, and
+    writes (redirections, tee, rm/mv/cp/...) outside ``cwd`` or into
+    ``.git``/``.carcara``/``.claude``. Reads outside ``cwd`` stay allowed.
+    Trivially bypassable (variables, eval, scripts, cd): defence in depth only.
+    """
+    segments = _shell_segments(command)
+    if segments is None:
+        return _deny("could not parse shell command")
+    fetching = False
+    any_exec = False
+    for op, tokens in segments:
+        for tok in tokens:
+            pieces = re.split(r"[:=]", tok)
+            if any(is_secret_path(p, cwd) for p in pieces) or (
+                _GLOB_CHARS & set(tok) and _mentions_secret(tok)
+            ):
+                return _deny(f"shell access to secret files is denied: {tok}")
+        argv, targets = _split_redirects(tokens)
+        argv = _strip_wrappers(argv)
+        if not argv:
+            continue
+        cmd = posixpath.basename(argv[0])
+        if cmd == "git":
+            sub, rest = _git_subcommand(argv[1:])
+            if sub == "push":
+                return _deny("git push is denied")
+            if sub == "reset" and "--hard" in rest:
+                return _deny("git reset --hard is denied")
+            if sub == "clean" and any(
+                t == "--force" or (t.startswith("-") and not t.startswith("--") and "f" in t)
+                for t in rest
+            ):
+                return _deny("git clean -f is denied")
+        if op != "|":
+            fetching = False
+        if cmd in NETWORK_FETCHERS:
+            fetching = True
+        elif _is_exec_target(argv[0]):
+            any_exec = True
+            if fetching:
+                return _deny(f"piping downloaded content into {cmd} is denied")
+        if cmd == "tee":
+            targets += [a for a in argv[1:] if not a.startswith("-") and a not in _DEV_SINKS]
+        elif cmd in SHELL_WRITE_COMMANDS:
+            targets += _write_operands(cmd, argv[1:])
+        for target in targets:
+            problem = _write_path_problem(target, cwd)
+            if problem:
+                return _deny(f"shell write {problem}: {target}")
+    if any_exec and _FETCH_SUBST.search(command):
+        return _deny("executing downloaded content (curl/wget substitution) is denied")
+    return None
+
+
 def decide(
-    role: Role | str, tool_name: str, tool_input: Mapping[str, Any] | None, cwd: str | None
+    role: Role | str,
+    tool_name: str,
+    tool_input: Mapping[str, Any] | None,
+    cwd: str | None,
+    *,
+    unrestricted_bash: bool = False,
 ) -> Decision:
-    """Pure policy decision for one tool call by ``role``."""
+    """Pure policy decision for one tool call by ``role``.
+
+    ``unrestricted_bash`` (from ``carcara run --unrestricted-bash``) skips the
+    implementer/test-runner Bash deny-list; read-only roles are unaffected.
+    """
     if tool_name == STRUCTURED_OUTPUT_TOOL:
         return ALLOW
     resolved = _resolve_role(role)
@@ -649,6 +933,10 @@ def decide(
             return _deny("Bash requires a string command")
         if name not in UNRESTRICTED_BASH_ROLES:
             return _check_read_only_bash(command, cwd)
+        if not unrestricted_bash:
+            denied = _check_unrestricted_bash(command, cwd)
+            if denied:
+                return denied
     return ALLOW
 
 
@@ -677,13 +965,21 @@ def permission_mode_for(role: Role | str) -> str:
 HookCallback = Callable[[dict[str, Any], "str | None", Any], Awaitable[dict[str, Any]]]
 
 
-def make_pre_tool_use_hook(role: Role | str, cwd: str | None) -> HookCallback:
+def make_pre_tool_use_hook(
+    role: Role | str, cwd: str | None, *, unrestricted_bash: bool = False
+) -> HookCallback:
     """PreToolUse hook: deny per ``decide``; ``{}`` (pass through) otherwise."""
 
     async def hook(
         input_data: dict[str, Any], tool_use_id: str | None, context: Any
     ) -> dict[str, Any]:
-        decision = decide(role, input_data.get("tool_name", ""), input_data.get("tool_input"), cwd)
+        decision = decide(
+            role,
+            input_data.get("tool_name", ""),
+            input_data.get("tool_input"),
+            cwd,
+            unrestricted_bash=unrestricted_bash,
+        )
         if decision.allow:
             return {}
         return {
@@ -698,14 +994,14 @@ def make_pre_tool_use_hook(role: Role | str, cwd: str | None) -> HookCallback:
 
 
 def make_can_use_tool(
-    role: Role | str, cwd: str | None
+    role: Role | str, cwd: str | None, *, unrestricted_bash: bool = False
 ) -> Callable[[str, dict[str, Any], Any], Awaitable[Any]]:
     """Secondary ``can_use_tool`` callback mirroring ``decide`` (SDK imported lazily)."""
 
     async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context: Any) -> Any:
         from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
-        decision = decide(role, tool_name, tool_input, cwd)
+        decision = decide(role, tool_name, tool_input, cwd, unrestricted_bash=unrestricted_bash)
         if decision.allow:
             return PermissionResultAllow()
         return PermissionResultDeny(message=f"carcara policy: {decision.reason}")

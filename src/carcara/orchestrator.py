@@ -113,6 +113,8 @@ class RunOptions:
     allow_dirty: bool = False
     project_settings: bool = False
     use_api_key: bool = False
+    # Not persisted: a resume gets the Bash deny-list back unless the flag is given again.
+    unrestricted_bash: bool = False
     max_turns: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_MAX_TURNS))
 
 
@@ -464,6 +466,12 @@ class Orchestrator:
 
     def _started(self, run: Run, *, resumed: bool) -> None:
         self.run_state = run
+        if self.options.unrestricted_bash:
+            run.event(
+                "warning",
+                message="--unrestricted-bash: Bash deny-list disabled for "
+                "implementer/test-runner stages",
+            )
         if self.on_start is not None:
             self.on_start(run.id, resumed)
 
@@ -563,6 +571,7 @@ class Orchestrator:
                 max_turns=self.options.max_turns.get(turns_key),
                 max_budget_usd=remaining,
                 setting_sources=["project"] if self.options.project_settings else [],
+                unrestricted_bash=self.options.unrestricted_bash,
             )
             run.event("stage_started", key=key, stage=stage, role=role_name, model=request.model)
             try:

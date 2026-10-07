@@ -1120,3 +1120,17 @@ def test_resume_revalidates_state_after_taking_lock(repo, monkeypatch):
     out = asyncio.run(orch2.resume(run_id))
     assert out.status == "done" and backend.requests == []
     assert not store.lock_path.exists()
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_unrestricted_bash_option_reaches_requests(repo, flag):
+    orch, backend, _ = make(
+        repo, {"implement": [impl()], "test": [TEST_OK]}, size="S", unrestricted_bash=flag
+    )
+    assert go(orch).status == "done"
+    assert backend.requests and all(r.unrestricted_bash is flag for r in backend.requests)
+    events = (orch.run_state.dir / "events.jsonl").read_text().splitlines()
+    warned = [json.loads(e) for e in events if json.loads(e)["event"] == "warning"]
+    assert bool(warned) is flag
+    if flag:
+        assert "--unrestricted-bash" in warned[0]["message"]

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Added
+- implementer and test-runner Bash now goes through a best-effort deny-list.
+  It blocks `git push`, `git reset --hard`, `git clean -f`, curl/wget
+  fetch-and-exec, shell access to secret paths, and shell writes outside the
+  repo or into `.git`/`.claude`/`.carcara`. Pass
+  `carcara run --unrestricted-bash` to disable it for one invocation; it
+  prints a warning and is not persisted across `--resume`. A stage cannot
+  enable the opt-out (#6).
+- The Bash deny-list skips the values of wrapper options (`sudo -u`,
+  `nice -n`, `env -u`/`-C`, `timeout -s`/`-k`, `xargs -n`/`-I`, ...) and
+  splits `env -S` strings, so commands like `sudo -u root git push` or
+  `nice -n 5 git push` no longer get past it.
+
 ### Fixed
 - `carcara run` now defaults to the profile chosen at `carcara install`
   (recorded in `.carcara/profile`) instead of always using balanced; an

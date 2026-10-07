@@ -110,6 +110,8 @@ class StageRequest:
     setting_sources: list[str] = field(default_factory=list)
     # Extra environment for the stage's CLI process (merged over os.environ).
     env: dict[str, str] = field(default_factory=dict)
+    # From ``carcara run --unrestricted-bash``: skip the implementer/test-runner deny-list.
+    unrestricted_bash: bool = False
 
 
 @dataclass
@@ -135,6 +137,7 @@ def build_request(
     max_turns: int | None = None,
     max_budget_usd: float | None = None,
     setting_sources: list[str] | None = None,
+    unrestricted_bash: bool = False,
 ) -> StageRequest:
     """Assemble a stage request; ``role=None`` means the main model with no tools."""
     if role is None:
@@ -168,6 +171,7 @@ def build_request(
         max_budget_usd=max_budget_usd,
         setting_sources=list(setting_sources or []),
         env={STAGE_ENV_VAR: role_name or "main"},
+        unrestricted_bash=unrestricted_bash,
     )
 
 
@@ -219,11 +223,16 @@ class SdkBackend:
             hook = _deny_all_hook
             can_use_tool = None
         else:
-            hook = policy.make_pre_tool_use_hook(request.role, request.cwd)
+            unrestricted = request.unrestricted_bash
+            hook = policy.make_pre_tool_use_hook(
+                request.role, request.cwd, unrestricted_bash=unrestricted
+            )
             can_use_tool = (
                 None
                 if request.permission_mode == "dontAsk"
-                else policy.make_can_use_tool(request.role, request.cwd)
+                else policy.make_can_use_tool(
+                    request.role, request.cwd, unrestricted_bash=unrestricted
+                )
             )
         return sdk.ClaudeAgentOptions(
             model=request.model,
