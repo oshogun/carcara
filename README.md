@@ -219,8 +219,13 @@ for machine-readable output, `--plan` for the stored plan); `carcara diff
 excluding secrets and `.carcara/`. Both default to the active run, else the
 latest one.
 
-The budget is checked from the estimated stage costs the SDK reports; a stage
-that errors out reports none, so its usage may go uncounted.
+The budget is checked from the estimated stage costs the SDK reports. A stage
+attempt that errors out but still returns SDK usage counts toward the total and
+the `--max-budget-usd` cap, and appears in the report as `<stage> $x.xx
+(failed)`. An attempt that dies before the SDK reports a result has unknown
+cost: it is flagged as uncounted (`stage_error` with `"uncounted": true` in
+`events.jsonl`, `uncounted_stages` in `carcara status --json`, and a note on
+the report's total line), and the cap may be exceeded by that unknown amount.
 
 **Run directory.** Each run is stored in `.carcara/runs/<id>/`: `state.json`,
 `events.jsonl` (append-only log) and `report.md`. The base commit is recorded

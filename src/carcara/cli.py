@@ -253,9 +253,10 @@ def _list_runs(cwd: str) -> str:
         task = " ".join(str(state.get("task", "")).split())
         task = task if len(task) <= 60 else task[:57] + "..."
         cost = float(state.get("totals", {}).get("cost_usd", 0.0))
+        unknown = "+?" if state.get("totals", {}).get("uncounted_stages") else ""
         lines.append(
             f"{run_id}  {state.get('status', '?'):<17} {state.get('size') or '?'}  "
-            f"${cost:.2f}  {task}"
+            f"${cost:.2f}{unknown}  {task}"
         )
     return "\n".join(lines) + "\n" if lines else "no runs\n"
 
@@ -443,6 +444,8 @@ def status_main(ns: argparse.Namespace) -> int:
     plan = _stored_plan(state)
     resume_cmd = _status_resume_cmd(run.id, status, active, ns.cwd)
     report = run.read_report()
+    attempts = state.get("failed_attempts") or []
+    uncounted = [a.get("key") for a in attempts if not a.get("counted")]
     if ns.json:
         data = {
             "run_id": run.id,
@@ -456,6 +459,9 @@ def status_main(ns: argparse.Namespace) -> int:
             "failing": _failing(state) if status == "needs_human" else [],
             "resume_cmd": resume_cmd,
             "active": active,
+            "cost_usd": float(state.get("totals", {}).get("cost_usd", 0.0)),
+            "failed_attempts": len(attempts),
+            "uncounted_stages": uncounted,
         }
         sys.stdout.write(json.dumps(data, indent=2) + "\n")
         return 0
@@ -470,6 +476,11 @@ def status_main(ns: argparse.Namespace) -> int:
         lines = [f"carcara run {run.id}: {status} (size {state.get('size') or '?'})"]
         if state.get("message"):
             lines.append(f"note: {state['message']}")
+        if uncounted:
+            lines.append(
+                f"warning: cost unknown for {len(uncounted)} failed stage attempt(s): "
+                f"{', '.join(map(str, uncounted))}"
+            )
         report = "\n".join(lines) + "\n"
     sys.stdout.write(report)
     if holder is not None and active:

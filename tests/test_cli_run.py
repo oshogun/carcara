@@ -561,6 +561,9 @@ STATUS_KEYS = {
     "failing",
     "resume_cmd",
     "active",
+    "cost_usd",
+    "failed_attempts",
+    "uncounted_stages",
 }
 
 
@@ -602,6 +605,35 @@ def test_status_needs_human_failing(repo, fake, capsys):
     assert data["resume_cmd"] == f'carcara run --resume {run_id} --cwd {repo} --feedback "..."'
     assert status(repo, "--plan") == 1
     assert f"run {run_id} has no plan" in capsys.readouterr().err
+
+
+def test_status_json_includes_uncounted(repo, fake, capsys):
+    # No test entry: the stage errors before a result, so its cost is unknown.
+    fake({"implement": [IMPL]}, {"implement": 0.25})
+    assert run(repo, "small fix", "--size", "S", "--yes") == 1
+    (run_id,) = RunStore(repo).list_runs()
+    data = _status_json(repo, capsys)
+    assert data["cost_usd"] == pytest.approx(0.25)
+    assert data["failed_attempts"] == 1 and data["uncounted_stages"] == ["test"]
+    assert "(+1 stage attempt uncounted)" in data["report"]
+
+    assert run(repo, "--list") == 0
+    assert "$0.25+?" in capsys.readouterr().out
+
+    # Without report.md the text status still warns about the unknown cost.
+    (RunStore(repo).load(run_id).dir / "report.md").unlink()
+    assert status(repo) == 0
+    out = capsys.readouterr().out
+    assert "warning: cost unknown for 1 failed stage attempt(s): test" in out
+
+
+def test_status_json_old_state_defaults(repo, capsys):
+    run_ = RunStore(repo).create("t", "balanced", "sha", size="S")
+    del run_.state["failed_attempts"]
+    run_.save()
+    data = _status_json(repo, capsys)
+    assert data["cost_usd"] == 0.0
+    assert data["failed_attempts"] == 0 and data["uncounted_stages"] == []
 
 
 def test_status_review_findings_and_done(repo):

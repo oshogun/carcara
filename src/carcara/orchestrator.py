@@ -25,7 +25,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
-from carcara.backend import Backend, BackendError, build_request
+from carcara.backend import Backend, BackendError, StageResult, build_request
 from carcara.profiles import Profile
 from carcara.roles import Role, get_role
 from carcara.runstore import Run, RunBusy, RunStore
@@ -474,6 +474,36 @@ class Orchestrator:
             self._roles[name] = get_role(name)
         return self._roles[name]
 
+    @staticmethod
+    def _record_failure(
+        run: Run,
+        key: str,
+        stage: str,
+        role_name: str | None,
+        model: str,
+        result: StageResult | None,
+        error: str,
+    ) -> dict[str, Any]:
+        """Record an errored attempt (its cost is already in the totals, if known).
+
+        Returns the cost fields for the ``stage_error`` event.
+        """
+        if result is None:
+            run.record_failed_attempt(key, stage, role_name, model, error, None, None, 0, False)
+            return {"cost_usd": None, "uncounted": True}
+        run.record_failed_attempt(
+            key,
+            stage,
+            role_name,
+            model,
+            error,
+            result.cost_usd,
+            result.usage,
+            result.num_turns,
+            True,
+        )
+        return {"cost_usd": result.cost_usd, "usage": result.usage, "num_turns": result.num_turns}
+
     async def _stage(
         self,
         key: str,
@@ -528,23 +558,32 @@ class Orchestrator:
             if exc.result is not None:
                 failed = exc.result
                 run.add_cost(failed.cost_usd, failed.usage, failed.num_turns)
-                run.save()
-            run.event("stage_error", key=key, error=str(exc))
+            cost = self._record_failure(
+                run, key, stage, role_name, request.model, exc.result, str(exc)
+            )
+            run.event("stage_error", key=key, error=str(exc), **cost)
             raise _Stop("failed", f"stage {key} failed: {exc}") from exc
+        except BaseException as exc:
+            # Unexpected error or interrupt: the stage's spend is unknown.
+            cost = self._record_failure(run, key, stage, role_name, request.model, None, repr(exc))
+            run.event("stage_error", key=key, error=repr(exc), **cost)
+            raise
 
         run.add_cost(result.cost_usd, result.usage, result.num_turns)
         if result.subtype == "error_max_budget_usd":
-            run.save()
-            run.event("stage_error", key=key, subtype=result.subtype, cost_usd=result.cost_usd)
+            cost = self._record_failure(
+                run, key, stage, role_name, request.model, result, "budget exhausted"
+            )
+            run.event("stage_error", key=key, subtype=result.subtype, **cost)
             raise _Stop("budget_exceeded", f"budget exhausted during stage {key}")
         if result.is_error:
-            run.save()
             detail = (
                 "; ".join(result.errors)
                 or (result.text or "").strip()[:500]
                 or f"error result (subtype {result.subtype})"
             )
-            run.event("stage_error", key=key, subtype=result.subtype, errors=result.errors)
+            cost = self._record_failure(run, key, stage, role_name, request.model, result, detail)
+            run.event("stage_error", key=key, subtype=result.subtype, errors=result.errors, **cost)
             raise _Stop("failed", f"stage {key} failed: {detail}")
 
         output = result.structured
@@ -866,7 +905,21 @@ class Orchestrator:
                 review_line = (
                     f"{out['verdict']} ({len(out['findings'])} findings, {serious} serious)"
                 )
-        costs = ", ".join(f"{e['key']} ${e['cost_usd']:.2f}" for e in stages) or "none"
+        attempts = state.get("failed_attempts", [])
+        cost_items = [f"{e['key']} ${e['cost_usd']:.2f}" for e in stages]
+        cost_items += [
+            f"{a['key']} ${a['cost_usd']:.2f} (failed)"
+            if a.get("counted")
+            else f"{a['key']} cost unknown (failed, uncounted)"
+            for a in attempts
+        ]
+        costs = ", ".join(cost_items) or "none"
+        uncounted = sum(1 for a in attempts if not a.get("counted"))
+        uncounted_note = (
+            f" (+{uncounted} stage attempt{'s' if uncounted != 1 else ''} uncounted)"
+            if uncounted
+            else ""
+        )
         try:
             rel_dir = run.dir.relative_to(self.store.cwd)
         except ValueError:
@@ -878,7 +931,8 @@ class Orchestrator:
             f"review: {review_line}",
             f"est. cost: {costs}",
             f"total est. cost: ${state['totals']['cost_usd']:.2f} "
-            f"({'API key' if state.get('use_api_key') else 'subscription login'})",
+            f"({'API key' if state.get('use_api_key') else 'subscription login'})"
+            f"{uncounted_note}",
             f"run dir: {rel_dir}",
         ]
         if state.get("base_kind"):

@@ -144,6 +144,37 @@ class Run:
             if isinstance(value, int):
                 totals[name] += value
 
+    def record_failed_attempt(
+        self,
+        key: str,
+        stage: str,
+        role: str | None,
+        model: str,
+        error: str,
+        cost_usd: float | None,
+        usage: dict[str, Any] | None,
+        num_turns: int,
+        counted: bool,
+    ) -> None:
+        """Remember an errored stage attempt; its cost (if known) is added separately."""
+        self.state.setdefault("failed_attempts", []).append(
+            {
+                "key": key,
+                "stage": stage,
+                "role": role,
+                "model": model,
+                "error": error if len(error) <= 500 else error[:497] + "...",
+                "cost_usd": cost_usd if counted else None,
+                "usage": usage,
+                "num_turns": num_turns,
+                "counted": counted,
+            }
+        )
+        if not counted:
+            totals = self.state["totals"]
+            totals["uncounted_stages"] = int(totals.get("uncounted_stages", 0)) + 1
+        self.save()
+
     def record_stage(
         self,
         key: str,
@@ -221,6 +252,7 @@ class RunStore:
             "plan_feedback": [],
             "accepted_failures": None,
             "stages": [],
+            "failed_attempts": [],
             "totals": _empty_totals(),
             "created_at": _now(),
             "updated_at": _now(),

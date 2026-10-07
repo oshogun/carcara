@@ -530,12 +530,20 @@ def test_stage_error_detail_fallbacks(repo, result, expected):
 class _FailingBackend(FakeBackend):
     """Raises a BackendError carrying a costed StageResult for the test stage."""
 
+    spent = 0.008
+
     async def run_stage(self, request):
         if request.stage == "test":
             self.requests.append(request)
-            spent = StageResult(cost_usd=0.008, usage={"input_tokens": 7}, num_turns=4)
+            spent = StageResult(cost_usd=self.spent, usage={"input_tokens": 7}, num_turns=4)
             raise BackendError("stage test: no structured output", spent)
         return await super().run_stage(request)
+
+
+def _events(orch, kind):
+    path = orch.run_state.dir / "events.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    return [r for r in records if r["event"] == kind]
 
 
 def test_failed_stage_cost_counted_in_totals(repo):
@@ -557,6 +565,118 @@ def test_is_error_stage_cost_counted_in_totals(repo):
     out = go(orch)
     assert out.status == "failed"
     assert orch.run_state.state["totals"]["cost_usd"] == pytest.approx(0.008)
+
+
+def test_failed_stage_cost_on_stage_error_event(repo):
+    backend = _FailingBackend({"implement": [impl()]}, {"implement": 0.01})
+    orch = Orchestrator(
+        backend, PROFILE, str(repo), RunStore(repo), AutoGate(), RunOptions(size="S")
+    )
+    asyncio.run(orch.run("do it"))
+    (error,) = _events(orch, "stage_error")
+    assert error["cost_usd"] == pytest.approx(0.008)
+    assert error["num_turns"] == 4 and "uncounted" not in error
+    (attempt,) = orch.run_state.state["failed_attempts"]
+    assert attempt["key"] == "test" and attempt["counted"] is True
+    assert attempt["error"] == "stage test: no structured output"
+
+
+def test_is_error_stage_cost_on_event_and_failed_attempts(repo):
+    err = StageResult(subtype="error_max_turns", is_error=True, cost_usd=0.008, num_turns=3)
+    orch, _, _ = make(repo, {"implement": [impl()], "test": [err]}, size="S")
+    go(orch)
+    (error,) = _events(orch, "stage_error")
+    assert error["subtype"] == "error_max_turns" and error["cost_usd"] == pytest.approx(0.008)
+    (attempt,) = orch.run_state.state["failed_attempts"]
+    assert attempt["counted"] is True and attempt["cost_usd"] == pytest.approx(0.008)
+    # Recorded once: the totals are not charged twice.
+    assert orch.run_state.state["totals"]["cost_usd"] == pytest.approx(0.008)
+
+
+def test_budget_exceeded_stage_itemised_as_failed(repo):
+    over = StageResult(subtype="error_max_budget_usd", is_error=True, cost_usd=0.7)
+    orch, _, _ = make(repo, {"implement": [over]}, size="S", max_budget_usd=0.5)
+    out = go(orch)
+    assert "implement $0.70 (failed)" in out.report_text
+    assert orch.run_state.state["totals"]["cost_usd"] == pytest.approx(0.7)
+
+
+def test_uncounted_stage_flagged(repo):
+    # The script has no test entry: BackendError without a StageResult.
+    orch, _, _ = make(repo, {"implement": [impl()]}, costs={"implement": 0.1}, size="S")
+    out = go(orch)
+    assert out.status == "failed"
+    (error,) = _events(orch, "stage_error")
+    assert error["uncounted"] is True and error["cost_usd"] is None
+    state = orch.run_state.state
+    (attempt,) = state["failed_attempts"]
+    assert attempt["key"] == "test" and attempt["counted"] is False
+    assert attempt["cost_usd"] is None
+    assert state["totals"]["uncounted_stages"] == 1
+    assert state["totals"]["cost_usd"] == pytest.approx(0.1)
+
+
+def test_report_flags_uncounted(repo):
+    orch, _, _ = make(repo, {"implement": [impl()]}, costs={"implement": 0.1}, size="S")
+    out = go(orch)
+    assert "test cost unknown (failed, uncounted)" in out.report_text
+    assert (
+        "total est. cost: $0.10 (subscription login) (+1 stage attempt uncounted)"
+        in out.report_text
+    )
+
+
+def test_report_itemises_failed_attempt_across_resume(repo):
+    costs = {"triage": 0.02, "implement": 0.10, "test": 0.13}
+    backend = _FailingBackend({"triage": [TRIAGE_S], "implement": [impl()]}, costs)
+    backend.spent = 0.18
+    orch = Orchestrator(backend, PROFILE, str(repo), RunStore(repo), AutoGate(), RunOptions())
+    out = asyncio.run(orch.run("do it"))
+    assert out.status == "failed"
+    assert "est. cost: triage $0.02, implement $0.10, test $0.18 (failed)\n" in out.report_text
+    assert "total est. cost: $0.30 " in out.report_text
+
+    orch2, _, _ = make(repo, {"test": [TEST_OK]}, costs=costs)
+    out2 = asyncio.run(orch2.resume(out.run_id))
+    assert out2.status == "done"
+    assert (
+        "est. cost: triage $0.02, implement $0.10, test $0.13, test $0.18 (failed)\n"
+        in out2.report_text
+    )
+    assert "total est. cost: $0.43 " in out2.report_text
+    state = orch2.run_state.state
+    itemised = sum(s["cost_usd"] for s in state["stages"]) + sum(
+        a["cost_usd"] for a in state["failed_attempts"]
+    )
+    assert itemised == pytest.approx(state["totals"]["cost_usd"])
+
+
+def test_budget_cap_counts_failed_attempt_cost(repo):
+    backend = _FailingBackend({"implement": [impl()]}, {"implement": 0.05})
+    backend.spent = 0.18
+    orch = Orchestrator(
+        backend,
+        PROFILE,
+        str(repo),
+        RunStore(repo),
+        AutoGate(),
+        RunOptions(size="S", max_budget_usd=0.2),
+    )
+    out = asyncio.run(orch.run("do it"))
+    assert out.status == "failed"
+    orch2, backend2, _ = make(repo, {"test": [TEST_OK]})
+    out2 = asyncio.run(orch2.resume(out.run_id))
+    assert (out2.status, out2.exit_code) == ("budget_exceeded", 5)
+    assert backend2.requests == []
+
+
+def test_old_state_without_failed_attempts_reports(repo):
+    store = RunStore(repo)
+    run_ = store.create("t", "balanced", "sha", size="S")
+    del run_.state["failed_attempts"]
+    orch, _, _ = make(repo, {})
+    text = orch._report(run_)
+    assert "est. cost: none\n" in text and "uncounted" not in text
 
 
 def test_lock_acquire_release_and_ownership(repo):
