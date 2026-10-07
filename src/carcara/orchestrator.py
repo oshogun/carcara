@@ -25,7 +25,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
-from carcara.backend import Backend, BackendError, StageResult, build_request
+from carcara.backend import (
+    Backend,
+    BackendError,
+    NoStructuredOutput,
+    StageResult,
+    build_request,
+)
 from carcara.profiles import Profile
 from carcara.roles import Role, get_role
 from carcara.runstore import Run, RunBusy, RunStore
@@ -54,6 +60,13 @@ DEFAULT_MAX_TURNS: dict[str, int] = {
 
 MAX_FIX_ITERATIONS = 2
 DIFF_CAP = 20_000
+
+# Appended to a stage's prompt when retrying after it returned no structured output.
+_STRUCTURED_OUTPUT_NUDGE = (
+    "\n\nYour previous attempt at this stage ended without a result. When done, you"
+    " MUST call the StructuredOutput tool exactly once with a result matching the"
+    " stage's output schema."
+)
 
 
 class OrchestratorError(Exception):
@@ -521,12 +534,6 @@ class Orchestrator:
             run.event("stage_replayed", key=key)
             return done["output"]
 
-        remaining: float | None = None
-        if self.options.max_budget_usd is not None:
-            remaining = round(self.options.max_budget_usd - run.state["totals"]["cost_usd"], 6)
-            if remaining <= 0:
-                raise _Stop("budget_exceeded", f"budget exhausted before stage {key}")
-
         role = self._role(role_name) if role_name else None
         text = prompt()
         blocked = run.state.get("blocked_feedback")
@@ -541,35 +548,48 @@ class Orchestrator:
                 f"\n\nA previous attempt at this stage was blocked: {blocked.get('notes', '')}"
                 f"\n\nUser guidance:\n{blocked['feedback']}"
             )
-        request = build_request(
-            stage,
-            role,
-            self.profile,
-            text,
-            self.cwd,
-            max_turns=self.options.max_turns.get(turns_key),
-            max_budget_usd=remaining,
-            setting_sources=["project"] if self.options.project_settings else [],
-        )
-        run.event("stage_started", key=key, stage=stage, role=role_name, model=request.model)
-        try:
-            result = await self.backend.run_stage(request)
-        except BackendError as exc:
-            # Count whatever the stage spent (e.g. a result with missing or
-            # invalid structured output); with no StageResult the cost is unknown.
-            if exc.result is not None:
-                failed = exc.result
-                run.add_cost(failed.cost_usd, failed.usage, failed.num_turns)
-            cost = self._record_failure(
-                run, key, stage, role_name, request.model, exc.result, str(exc)
+        for attempt in range(2):
+            remaining: float | None = None
+            if self.options.max_budget_usd is not None:
+                remaining = round(self.options.max_budget_usd - run.state["totals"]["cost_usd"], 6)
+                if remaining <= 0:
+                    raise _Stop("budget_exceeded", f"budget exhausted before stage {key}")
+            request = build_request(
+                stage,
+                role,
+                self.profile,
+                text if attempt == 0 else text + _STRUCTURED_OUTPUT_NUDGE,
+                self.cwd,
+                max_turns=self.options.max_turns.get(turns_key),
+                max_budget_usd=remaining,
+                setting_sources=["project"] if self.options.project_settings else [],
             )
-            run.event("stage_error", key=key, error=str(exc), **cost)
-            raise _Stop("failed", f"stage {key} failed: {exc}") from exc
-        except BaseException as exc:
-            # Unexpected error or interrupt: the stage's spend is unknown.
-            cost = self._record_failure(run, key, stage, role_name, request.model, None, repr(exc))
-            run.event("stage_error", key=key, error=repr(exc), **cost)
-            raise
+            run.event("stage_started", key=key, stage=stage, role=role_name, model=request.model)
+            try:
+                result = await self.backend.run_stage(request)
+                break
+            except BackendError as exc:
+                # Count whatever the stage spent (e.g. a result with missing or
+                # invalid structured output); with no StageResult the cost is unknown.
+                if exc.result is not None:
+                    failed = exc.result
+                    run.add_cost(failed.cost_usd, failed.usage, failed.num_turns)
+                cost = self._record_failure(
+                    run, key, stage, role_name, request.model, exc.result, str(exc)
+                )
+                run.event("stage_error", key=key, error=str(exc), **cost)
+                if isinstance(exc, NoStructuredOutput) and attempt == 0:
+                    # A missing result is usually a one-off slip: retry once.
+                    run.event("stage_retry", key=key, reason=str(exc))
+                    continue
+                raise _Stop("failed", f"stage {key} failed: {exc}") from exc
+            except BaseException as exc:
+                # Unexpected error or interrupt: the stage's spend is unknown.
+                cost = self._record_failure(
+                    run, key, stage, role_name, request.model, None, repr(exc)
+                )
+                run.event("stage_error", key=key, error=repr(exc), **cost)
+                raise
 
         run.add_cost(result.cost_usd, result.usage, result.num_turns)
         if result.subtype == "error_max_budget_usd":

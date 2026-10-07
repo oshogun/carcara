@@ -85,6 +85,10 @@ class BackendError(Exception):
         self.result = result
 
 
+class NoStructuredOutput(BackendError):
+    """The stage finished without emitting its structured output."""
+
+
 class BackendUnavailable(BackendError):
     """The backend cannot run at all (e.g. Claude Code CLI missing)."""
 
@@ -189,7 +193,7 @@ def _check_structured(
     request: StageRequest, structured: Any, result: StageResult | None = None
 ) -> None:
     if structured is None:
-        raise BackendError(f"stage {request.stage}: no structured output", result)
+        raise NoStructuredOutput(f"stage {request.stage}: no structured output", result)
     errors = validate(request.output_schema, structured)
     if errors:
         raise BackendError(f"stage {request.stage}: invalid output: " + "; ".join(errors), result)

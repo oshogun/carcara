@@ -7,6 +7,9 @@
   (recorded in `.carcara/profile`) instead of always using balanced; an
   unloadable recorded profile warns and falls back to balanced. The run start
   line shows the profile: `carcara: run <id> started (profile <name>)` (#16).
+- A stage that ends without structured output is retried once, with a nudge
+  to emit its result, before the run fails. Both attempts' costs are counted
+  (#15).
 
 ### Removed
 - The deprecated bash `bin/carcara` (deprecated in 0.2.0). Install the Python

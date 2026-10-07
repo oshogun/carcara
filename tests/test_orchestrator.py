@@ -6,7 +6,7 @@ import tempfile
 
 import pytest
 
-from carcara.backend import BackendError, FakeBackend, StageResult
+from carcara.backend import FakeBackend, NoStructuredOutput, StageResult
 from carcara.orchestrator import (
     AutoGate,
     Orchestrator,
@@ -528,15 +528,21 @@ def test_stage_error_detail_fallbacks(repo, result, expected):
 
 
 class _FailingBackend(FakeBackend):
-    """Raises a BackendError carrying a costed StageResult for the test stage."""
+    """Raises NoStructuredOutput carrying a costed StageResult for the test stage.
+
+    Fails the first ``fails`` test attempts (every one when None).
+    """
 
     spent = 0.008
+    fails: int | None = None
 
     async def run_stage(self, request):
-        if request.stage == "test":
+        if request.stage == "test" and (self.fails is None or self.fails > 0):
+            if self.fails is not None:
+                self.fails -= 1
             self.requests.append(request)
             spent = StageResult(cost_usd=self.spent, usage={"input_tokens": 7}, num_turns=4)
-            raise BackendError("stage test: no structured output", spent)
+            raise NoStructuredOutput("stage test: no structured output", spent)
         return await super().run_stage(request)
 
 
@@ -554,9 +560,50 @@ def test_failed_stage_cost_counted_in_totals(repo):
     orch_out = asyncio.run(orch.run("do it"))
     assert orch_out.status == "failed"
     totals = orch.run_state.state["totals"]
-    assert totals["cost_usd"] == pytest.approx(0.018)
-    assert totals["input_tokens"] >= 7 and totals["num_turns"] >= 5
-    assert "total est. cost: $0.02 (subscription login)" in orch_out.report_text
+    # implement + the failed attempt + its failed retry.
+    assert totals["cost_usd"] == pytest.approx(0.026)
+    assert totals["input_tokens"] >= 14 and totals["num_turns"] >= 9
+    assert "total est. cost: $0.03 (subscription login)" in orch_out.report_text
+
+
+def test_missing_structured_output_retried_once(repo):
+    backend = _FailingBackend({"implement": [impl()], "test": [TEST_OK]}, {"implement": 0.01})
+    backend.fails = 1
+    orch = Orchestrator(
+        backend, PROFILE, str(repo), RunStore(repo), AutoGate(), RunOptions(size="S")
+    )
+    out = asyncio.run(orch.run("do it"))
+    assert (out.status, out.exit_code) == ("done", 0)
+    first, retry = [r for r in backend.requests if r.stage == "test"]
+    assert "StructuredOutput" not in first.prompt.split("\n\n")[-1]
+    assert "MUST call the StructuredOutput tool" in retry.prompt
+    assert len(_events(orch, "stage_retry")) == 1
+    (attempt,) = orch.run_state.state["failed_attempts"]
+    assert attempt["key"] == "test" and attempt["counted"] is True
+    # The failed attempt's cost is counted alongside the retry's.
+    assert orch.run_state.state["totals"]["cost_usd"] == pytest.approx(0.018)
+    assert "test $0.00, test $0.01 (failed)" in out.report_text
+
+
+def test_missing_structured_output_fails_after_retry(repo):
+    backend = _FailingBackend({"implement": [impl()]}, {"implement": 0.01})
+    orch = Orchestrator(
+        backend, PROFILE, str(repo), RunStore(repo), AutoGate(), RunOptions(size="S")
+    )
+    out = asyncio.run(orch.run("do it"))
+    assert (out.status, out.exit_code) == ("failed", 1)
+    assert out.run_id is not None  # resumable: the CLI derives resume_cmd from it
+    assert [r.stage for r in backend.requests].count("test") == 2
+    assert len(_events(orch, "stage_retry")) == 1
+
+
+def test_other_backend_errors_not_retried(repo):
+    # Script exhausted for test: a BackendError that is not a missing result.
+    orch, backend, _ = make(repo, {"implement": [impl()]}, size="S")
+    out = go(orch)
+    assert out.status == "failed"
+    assert [r.stage for r in backend.requests].count("test") == 1
+    assert _events(orch, "stage_retry") == []
 
 
 def test_is_error_stage_cost_counted_in_totals(repo):
@@ -573,12 +620,16 @@ def test_failed_stage_cost_on_stage_error_event(repo):
         backend, PROFILE, str(repo), RunStore(repo), AutoGate(), RunOptions(size="S")
     )
     asyncio.run(orch.run("do it"))
-    (error,) = _events(orch, "stage_error")
-    assert error["cost_usd"] == pytest.approx(0.008)
-    assert error["num_turns"] == 4 and "uncounted" not in error
-    (attempt,) = orch.run_state.state["failed_attempts"]
-    assert attempt["key"] == "test" and attempt["counted"] is True
-    assert attempt["error"] == "stage test: no structured output"
+    errors = _events(orch, "stage_error")
+    assert len(errors) == 2  # the attempt and its retry
+    for error in errors:
+        assert error["cost_usd"] == pytest.approx(0.008)
+        assert error["num_turns"] == 4 and "uncounted" not in error
+    attempts = orch.run_state.state["failed_attempts"]
+    assert len(attempts) == 2
+    for attempt in attempts:
+        assert attempt["key"] == "test" and attempt["counted"] is True
+        assert attempt["error"] == "stage test: no structured output"
 
 
 def test_is_error_stage_cost_on_event_and_failed_attempts(repo):
@@ -629,19 +680,22 @@ def test_report_flags_uncounted(repo):
 def test_report_itemises_failed_attempt_across_resume(repo):
     costs = {"triage": 0.02, "implement": 0.10, "test": 0.13}
     backend = _FailingBackend({"triage": [TRIAGE_S], "implement": [impl()]}, costs)
-    backend.spent = 0.18
+    backend.spent = 0.09
     orch = Orchestrator(backend, PROFILE, str(repo), RunStore(repo), AutoGate(), RunOptions())
     out = asyncio.run(orch.run("do it"))
     assert out.status == "failed"
-    assert "est. cost: triage $0.02, implement $0.10, test $0.18 (failed)\n" in out.report_text
+    assert (
+        "est. cost: triage $0.02, implement $0.10, test $0.09 (failed), test $0.09 (failed)\n"
+        in out.report_text
+    )
     assert "total est. cost: $0.30 " in out.report_text
 
     orch2, _, _ = make(repo, {"test": [TEST_OK]}, costs=costs)
     out2 = asyncio.run(orch2.resume(out.run_id))
     assert out2.status == "done"
     assert (
-        "est. cost: triage $0.02, implement $0.10, test $0.13, test $0.18 (failed)\n"
-        in out2.report_text
+        "est. cost: triage $0.02, implement $0.10, test $0.13, "
+        "test $0.09 (failed), test $0.09 (failed)\n" in out2.report_text
     )
     assert "total est. cost: $0.43 " in out2.report_text
     state = orch2.run_state.state
@@ -653,7 +707,7 @@ def test_report_itemises_failed_attempt_across_resume(repo):
 
 def test_budget_cap_counts_failed_attempt_cost(repo):
     backend = _FailingBackend({"implement": [impl()]}, {"implement": 0.05})
-    backend.spent = 0.18
+    backend.spent = 0.08  # attempt + retry push the total to 0.21
     orch = Orchestrator(
         backend,
         PROFILE,
