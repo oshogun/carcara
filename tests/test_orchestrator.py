@@ -1011,6 +1011,24 @@ def test_run_diff_matches_review_diff_and_hides_secrets(repo):
     assert "b.py" in stat and ".env" not in stat
 
 
+def test_run_diff_sees_racily_clean_rewrite(repo):
+    from carcara.orchestrator import run_diff
+
+    # Same-size rewrite whose stat data matches the cached index entry; only
+    # git's racy-git check (entry mtime >= index mtime) can catch it, so the
+    # snapshot's temp index must keep the real index's mtime.
+    git(repo, "config", "core.trustctime", "false")
+    stamp = 1_000_000_000_123_456_789
+    os.utime(repo / "a.py", ns=(stamp, stamp))
+    git(repo, "add", "a.py")  # cache the old stamp; the index is written later
+    head = git(repo, "rev-parse", "HEAD")
+    (repo / "a.py").write_text("x = 2\n")
+    os.utime(repo / "a.py", ns=(stamp, stamp))
+    os.utime(repo / ".git" / "index", ns=(stamp, stamp))
+    assert "a.py" in run_diff(str(repo), head, stat=True)
+    assert "+x = 2" in run_diff(str(repo), head)
+
+
 def test_run_refuses_non_toplevel_cwd(repo):
     (repo / "sub").mkdir()
     orch = Orchestrator(

@@ -181,7 +181,9 @@ def _snapshot_tree(cwd: str) -> str:
     try:
         tmp_index = os.path.join(tmp_dir, "index")
         if os.path.isfile(real_index):
-            shutil.copyfile(real_index, tmp_index)
+            # copy2 keeps the index mtime, which git's racy-git check compares
+            # entry mtimes against; a fresh mtime would trust stale stat data.
+            shutil.copy2(real_index, tmp_index)
         env = {"GIT_INDEX_FILE": tmp_index}
         if _git(cwd, "add", "-A", "--", *_SNAPSHOT_PATHSPECS, env=env).returncode != 0:
             # Unusable seed (e.g. split index): start over from an empty index.
