@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed
+- The PyPI distribution is now named `carcara-sdlc` (`carcara` is taken on
+  PyPI): install with `pipx install carcara-sdlc`. The import package and the
+  `carcara` command are unchanged.
+
 ### Added
 - `carcara uninstall [target] [-n] [-f] [--purge]` removes carcara's agents,
   commands, skill, `settings.json` entries, `CLAUDE.md` section and

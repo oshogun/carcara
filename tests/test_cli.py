@@ -1,5 +1,6 @@
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +17,15 @@ def test_version_flag(capsys):
 
 def test_version_is_0_2_0():
     assert __version__ == "0.3.0"
+
+
+def test_distribution_name_and_script():
+    tomllib = pytest.importorskip("tomllib")
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    project = tomllib.loads(pyproject.read_text())["project"]
+    assert project["name"] == "carcara-sdlc"
+    assert project["version"] == __version__
+    assert project["scripts"] == {"carcara": "carcara.cli:main"}
 
 
 def test_help_flag(capsys):

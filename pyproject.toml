@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "carcara"
+name = "carcara-sdlc"
 version = "0.3.0"
 description = "Token-balanced agentic SDLC framework for Claude Code"
 readme = "README.md"

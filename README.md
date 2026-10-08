@@ -28,7 +28,7 @@ carcara balances this by:
 Requirements: Python 3.10 or newer.
 
 ```sh
-pipx install carcara    # or: uv tool install carcara
+pipx install carcara-sdlc    # or: uv tool install carcara-sdlc
 ```
 
 For the latest unreleased code, install from source:
@@ -362,7 +362,7 @@ See `tests/fixtures/golden/README.md` for the golden and install-snapshot fixtur
    and wheel, and publishes them to PyPI.
 
 One-time setup: on PyPI, add a (pending) trusted publisher for project
-`carcara` with owner `oshogun`, repository `carcara`, workflow `release.yml`
+`carcara-sdlc` with owner `oshogun`, repository `carcara`, workflow `release.yml`
 and environment `pypi`; then create a `pypi` environment in the GitHub repo
 settings (optionally with required reviewers). Publishing uses OIDC trusted
 publishing, so no API token is needed.
