@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: extract version from tag
+        id: tag_version
+        run: |
+          TAG_VERSION="${{ github.ref_name }}"
+          echo "version=${TAG_VERSION#v}" >> "$GITHUB_OUTPUT"
+      - name: get version from pyproject.toml
+        id: toml_version
+        run: |
+          VERSION=$(python3 -c "import tomllib; f = open('pyproject.toml', 'rb'); print(tomllib.load(f)['project']['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: verify tag matches pyproject.toml version
+        run: |
+          TAG_VERSION="${{ steps.tag_version.outputs.version }}"
+          TOML_VERSION="${{ steps.toml_version.outputs.version }}"
+          if [ "$TAG_VERSION" != "$TOML_VERSION" ]; then
+            echo "Error: tag version ($TAG_VERSION) does not match pyproject.toml version ($TOML_VERSION)"
+            exit 1
+          fi
+      - name: build sdist and wheel
+        run: |
+          python3 -m pip install build
+          python3 -m build
+      - name: check package data in dists
+        run: python3 scripts/check_dist.py dist/*.whl dist/*.tar.gz
+      - name: install wheel into a fresh venv
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install dist/*.whl
+      - name: smoke test installed wheel
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          carcara="$RUNNER_TEMP/venv/bin/carcara"
+          "$carcara" profiles | tee profiles.txt
+          for p in balanced economy quality; do grep -qx "$p" profiles.txt; done
+          mkdir proj
+          "$carcara" install --dry-run proj | tee install.txt
+          grep -q "agents/implementer.md" install.txt
+          grep -q "skills/carcara/SKILL.md" install.txt
+          grep -q "CLAUDE.md" install.txt
+      - name: publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

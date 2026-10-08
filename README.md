@@ -28,6 +28,12 @@ carcara balances this by:
 Requirements: Python 3.10 or newer.
 
 ```sh
+pipx install carcara    # or: uv tool install carcara
+```
+
+For the latest unreleased code, install from source:
+
+```sh
 git clone https://github.com/oshogun/carcara.git && cd carcara
 pipx install .          # or: uv tool install .
 # or straight from git: pipx install git+https://github.com/oshogun/carcara.git
@@ -346,3 +352,17 @@ tests/fixtures/regen_golden.sh     # regenerate golden installer output after te
 ```
 
 See `tests/fixtures/golden/README.md` for the golden and install-snapshot fixtures.
+
+### Release
+
+1. Bump `version` in `pyproject.toml` and commit to `main`.
+2. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. The `release` workflow (`.github/workflows/release.yml`) checks that the
+   tag matches the `pyproject.toml` version, builds and smoke-tests the sdist
+   and wheel, and publishes them to PyPI.
+
+One-time setup: on PyPI, add a (pending) trusted publisher for project
+`carcara` with owner `oshogun`, repository `carcara`, workflow `release.yml`
+and environment `pypi`; then create a `pypi` environment in the GitHub repo
+settings (optionally with required reviewers). Publishing uses OIDC trusted
+publishing, so no API token is needed.
