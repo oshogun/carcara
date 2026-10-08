@@ -42,5 +42,6 @@ installer. 0.2.0 replaced the `CLAUDE.md` hashes (one line about `carcara
 run`); 0.3.0 regenerated the success cases from the Python installer (new
 `skills/carcara/SKILL.md`, settings.json hooks and permissions, routing text in
 `CLAUDE.md`, S-size delegation in `sdlc.md`, new final hint). The error cases
-and `-l` output are unchanged 0.1.0 values. Regenerate it with a script that
+and `-l` output are unchanged 0.1.0 values. The uninstall work (#9) added
+the `.carcara/install.json` manifest line and hash to the success cases. Regenerate it with a script that
 replays each scenario, and review the diff before committing.

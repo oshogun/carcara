@@ -87,6 +87,27 @@ def _holder_alive(data: dict[str, Any]) -> bool:
     return current is None or current == start
 
 
+# Leftovers of an interrupted ``acquire_lock`` next to ``active.json``.
+LOCK_LEFTOVER_GLOBS = (".active.json.*.tmp", ".active.json.*.stale")
+
+
+def _live_holder(text: str | None) -> dict[str, Any] | None:
+    data = RunStore._parse_lock(text)
+    if data is None or not _holder_alive(data):
+        return None
+    return data
+
+
+def live_lock_holder(path: str | os.PathLike[str]) -> dict[str, Any] | None:
+    """The live holder of the lock file at ``path``; None if missing,
+    unreadable, corrupt or stale. Only reads: never creates anything."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return _live_holder(text)
+
+
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
@@ -306,10 +327,7 @@ class RunStore:
 
     def active(self) -> dict[str, Any] | None:
         """The live lock holder ``{pid, run_id, started}``; None if absent or stale."""
-        data = self._read_lock()
-        if data is None or not _holder_alive(data):
-            return None
-        return data
+        return _live_holder(self._read_lock_text())
 
     def acquire_lock(self, run_id: str) -> None:
         """Create ``active.json`` exclusively; take over stale/corrupt locks.
@@ -324,6 +342,7 @@ class RunStore:
             lock["start"] = start
         payload = json.dumps(lock)
         token = f"{os.getpid()}.{secrets.token_hex(4)}"
+        # Names must match LOCK_LEFTOVER_GLOBS.
         tmp = self.base / f".active.json.{token}.tmp"
         aside = self.base / f".active.json.{token}.stale"
         tmp.write_text(payload + "\n", encoding="utf-8")

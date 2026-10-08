@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Added
+- `carcara uninstall [target] [-n] [-f] [--purge]` removes carcara's agents,
+  commands, skill, `settings.json` entries, `CLAUDE.md` section and
+  `.carcara/` files while keeping user content; install then uninstall
+  restores the original files (#9). Install now records what it added in
+  `.carcara/install.json`.
 - implementer and test-runner Bash now goes through a best-effort deny-list.
   It blocks `git push`, `git reset --hard`, `git clean -f`, curl/wget
   fetch-and-exec, shell access to secret paths, and shell writes outside the

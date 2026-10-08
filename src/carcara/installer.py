@@ -18,6 +18,8 @@ Messages, ordering, dry-run, skip/--force and the CLAUDE.md markers follow the
   carcara-role subagents in interactive sessions; without it both are removed.
 - ``.carcara/profile`` records the chosen profile (name, or absolute path of a
   custom file) so ``carcara run`` defaults to it.
+- ``.carcara/install.json`` (the manifest) records what install added to
+  settings.json and CLAUDE.md, so ``carcara uninstall`` can undo exactly that.
 
 All validation (CLAUDE.md markers, settings.json JSON/shape) happens before
 any write.
@@ -26,23 +28,32 @@ any write.
 from __future__ import annotations
 
 import copy
+import glob
 import json
 import os
+import shutil
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
-from carcara import __version__
+from carcara import __version__, runstore
 from carcara.profiles import (
     INSTALLED_PROFILE_REL,
     Profile,
     ProfileError,
     list_profiles,
     load_profile,
+    read_installed_profile,
 )
-from carcara.resources import claude_md_template, iter_claude_templates, render, templates_root
+from carcara.resources import (
+    claude_md_template,
+    iter_claude_templates,
+    profiles_root,
+    render,
+    templates_root,
+)
 
 BEGIN_MARKER = b"<!-- carcara:begin -->"
 END_MARKER = b"<!-- carcara:end -->"
@@ -57,6 +68,11 @@ LEGACY_ALLOW = ("Bash(carcara run *)", "Bash(carcara status *)", "Bash(carcara d
 STRICT_MATCHERS = ("Read", "Grep", "Glob")
 STRICT_POLICY_REL = ".carcara/strict-policy"
 CARCARA_GITIGNORE_REL = ".carcara/.gitignore"
+# What install added (settings entries, CLAUDE.md mode), so uninstall can undo it.
+INSTALL_MANIFEST_REL = ".carcara/install.json"
+ROUTING_OFF_REL = ".carcara/routing-off"  # written by `carcara routing off`
+RUNS_REL = ".carcara/runs"
+ACTIVE_RUN_REL = ".carcara/active.json"
 ROUTING_PLACEHOLDER = "{{ROUTING}}"
 ROUTING_ON_TEXT = """- Code changes in this repo are routed to the carcara orchestrator: use the
   `carcara` skill (it runs `carcara run`); don't edit project files directly.
@@ -149,26 +165,28 @@ def _action(name: str, dest: str) -> str:
 
 def _install_claude_md(
     dest: str, profile: Profile, routing: bool, dry_run: bool, out: TextIO
-) -> None:
+) -> str:
+    """Install the CLAUDE.md block; returns the action (create/append/update)."""
     block = _claude_md_block(profile, routing)
     if not os.path.exists(dest):
         out.write(_action("create", dest))
         if not dry_run:
             with open(dest, "wb") as fh:
                 fh.write(block)
-        return
+        return "create"
     with open(dest, "rb") as fh:
         data = fh.read()
     if count_markers(dest, data) == 0:
-        out.write(_action("append", dest))
+        action = "append"
         new = data + b"\n" + block
     else:
-        out.write(_action("update", dest))
+        action = "update"
         new = _replace_block(data, block)
-    if dry_run:
-        return
-    with open(dest, "wb") as fh:
-        fh.write(new)
+    out.write(_action(action, dest))
+    if not dry_run:
+        with open(dest, "wb") as fh:
+            fh.write(new)
+    return action
 
 
 # --- settings.json ------------------------------------------------------------
@@ -296,15 +314,56 @@ def merge_settings(
     return out
 
 
-def _plan_settings(dest: str, carcara: dict[str, Any], force: bool) -> tuple[str, bytes | None]:
-    """(action, bytes to write or None) for ``dest``; validates before any write."""
+def _settings_additions(
+    existing: dict[str, Any], carcara: dict[str, Any], *, force: bool
+) -> dict[str, Any]:
+    """What ``merge_settings`` adds to ``existing``, for the install manifest:
+    ``permissions`` entries not already present and whether ``model`` is set."""
+    perms_existing = existing.get("permissions")
+    perms_existing = perms_existing if isinstance(perms_existing, dict) else {}
+    added_perms = {
+        key: [v for v in values if v not in (perms_existing.get(key) or [])]
+        for key, values in carcara.get("permissions", {}).items()
+    }
+    hooks = existing.get("hooks")
+    # Events holding only carcara hook groups are carcara's (merge drops them).
+    hooks_existing = {
+        event
+        for event, groups in (hooks if isinstance(hooks, dict) else {}).items()
+        if not groups or any(_strip_carcara_hooks(g) is not None for g in groups)
+    }
+    added_hook_events = [
+        event for event in carcara.get("hooks", {}).keys() if event not in hooks_existing
+    ]
+    sets_model = "model" in carcara and ("model" not in existing or force)
+    perms_created = "permissions" not in existing
+    hooks_created = "hooks" not in existing or (
+        bool(hooks) and isinstance(hooks, dict) and not hooks_existing
+    )
+    permission_keys = [key for key, values in added_perms.items() if key not in perms_existing]
+    return {
+        "permissions": added_perms,
+        "model": carcara["model"] if sets_model else None,
+        "model_was_absent": "model" not in existing,
+        "permissions_created": perms_created,
+        "hooks_created": hooks_created,
+        "permission_keys": permission_keys,
+        "hook_events": added_hook_events,
+    }
+
+
+def _plan_settings(
+    dest: str, carcara: dict[str, Any], force: bool
+) -> tuple[str, bytes | None, dict[str, Any]]:
+    """(action, bytes to write or None, additions) for ``dest``; validates before any write."""
     if not os.path.exists(dest):
-        return "create", _dump_settings(carcara)
+        return "create", _dump_settings(carcara), _settings_additions({}, carcara, force=force)
     raw, existing = _load_settings(dest)
+    additions = _settings_additions(existing, carcara, force=force)
     new = _dump_settings(merge_settings(existing, carcara, force=force))
     if new == raw:
-        return "up-to-date", None
-    return "merge", new
+        return "up-to-date", None, additions
+    return "merge", new, additions
 
 
 def _is_carcara_skill(path: str) -> bool:
@@ -380,16 +439,119 @@ def _install_strict_flag(target: str, strict: bool, dry_run: bool, out: TextIO) 
             os.unlink(flag)
 
 
+def _recorded_spec(profile_spec: str, profile: Profile) -> str:
+    # Same test as load_profile: a file spec (even one named like a built-in)
+    # is recorded by path, a packaged profile by name.
+    return os.path.abspath(profile.source) if os.path.isfile(profile_spec) else profile.name
+
+
+def _load_manifest(target: str) -> dict[str, Any] | None:
+    """The install manifest of ``target``; None if absent. InstallError if invalid."""
+    path = f"{target}/{INSTALL_MANIFEST_REL}"
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except FileNotFoundError:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InstallError(f"{path} is not valid JSON ({exc}); fix it or remove it") from exc
+    perms = data.get("permissions_added") if isinstance(data, dict) else None
+    if not isinstance(perms, dict) or not all(
+        isinstance(v, list) and all(isinstance(e, str) for e in v) for v in perms.values()
+    ):
+        raise InstallError(f"{path}: unexpected content; fix it or remove it")
+    if "settings_created_keys" in data and not _valid_created_keys(data["settings_created_keys"]):
+        raise InstallError(f"{path}: unexpected content; fix it or remove it")
+    return data
+
+
+def _valid_created_keys(keys: Any) -> bool:
+    def is_str_list(v: Any) -> bool:
+        return isinstance(v, list) and all(isinstance(e, str) for e in v)
+
+    return (
+        isinstance(keys, dict)
+        and isinstance(keys.get("permissions"), bool)
+        and isinstance(keys.get("hooks"), bool)
+        and is_str_list(keys.get("permission_keys"))
+        and is_str_list(keys.get("hook_events"))
+    )
+
+
+def _created_keys(prev: dict[str, Any], additions: dict[str, Any]) -> dict[str, Any]:
+    """Which settings containers install created, so uninstall drops only those:
+    whether it created ``permissions`` / ``hooks`` and the lists / events it added."""
+    return {
+        "permissions": prev.get("permissions", additions["permissions_created"]),
+        "permission_keys": sorted(
+            set(prev.get("permission_keys", [])) | set(additions["permission_keys"])
+        ),
+        "hooks": prev.get("hooks", additions["hooks_created"]),
+        "hook_events": sorted(set(prev.get("hook_events", [])) | set(additions["hook_events"])),
+    }
+
+
+def _build_manifest(
+    prev: dict[str, Any] | None,
+    settings_action: str,
+    additions: dict[str, Any],
+    claude_md_mode: str,
+    spec: str,
+) -> dict[str, Any]:
+    """Record what this install added, merged with an earlier manifest."""
+    model = additions["model"]
+    if prev is None:
+        return {
+            "profile": spec,
+            "settings_created": settings_action == "create",
+            "claude_md_mode": claude_md_mode,
+            "model_set": model if additions["model_was_absent"] else None,
+            "permissions_added": additions["permissions"],
+            "settings_created_keys": _created_keys({}, additions),
+        }
+    perms = {k: list(v) for k, v in prev["permissions_added"].items()}
+    for key, values in additions["permissions"].items():
+        current = perms.setdefault(key, [])
+        current.extend(v for v in values if v not in current)
+    model_set = prev.get("model_set")
+    if model is not None and (additions["model_was_absent"] or model_set is not None):
+        model_set = model
+    manifest = {
+        "profile": spec,
+        "settings_created": bool(prev.get("settings_created")),
+        "claude_md_mode": prev.get("claude_md_mode", claude_md_mode),
+        "model_set": model_set,
+        "permissions_added": perms,
+    }
+    # A manifest from before settings_created_keys keeps the old behaviour.
+    if "settings_created_keys" in prev:
+        manifest["settings_created_keys"] = _created_keys(prev["settings_created_keys"], additions)
+    return manifest
+
+
+def _install_manifest(target: str, manifest: dict[str, Any], dry_run: bool, out: TextIO) -> None:
+    path = f"{target}/{INSTALL_MANIFEST_REL}"
+    data = (json.dumps(manifest, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    if os.path.exists(path):
+        with open(path, "rb") as fh:
+            if fh.read() == data:
+                return
+        action = "overwrite"
+    else:
+        action = "create"
+    out.write(_action(action, path))
+    if not dry_run:
+        _write_atomic(path, data)
+
+
 def _install_profile_record(
     target: str, profile_spec: str, profile: Profile, dry_run: bool, out: TextIO
 ) -> None:
     """Record the profile for ``carcara run``. Gitignored on purpose: a custom
     profile is recorded as an absolute, machine-local path."""
-    # Same test as load_profile: a file spec (even one named like a built-in)
-    # is recorded by path, a packaged profile by name.
-    is_file = os.path.isfile(profile_spec)
-    spec = os.path.abspath(profile.source) if is_file else profile.name
-    data = f"{spec}\n".encode()
+    data = f"{_recorded_spec(profile_spec, profile)}\n".encode()
     path = f"{target}/{INSTALLED_PROFILE_REL}"
     if os.path.exists(path):
         with open(path, "rb") as fh:
@@ -448,6 +610,10 @@ def install(
     settings = _plan_settings(
         settings_dest, _carcara_settings(profile, routing, strict_policy), force
     )
+    prev_manifest = _load_manifest(target)
+    # Installs made before the manifest existed don't know what they added:
+    # leave them without one so uninstall uses its fallback instead.
+    track = prev_manifest is not None or not os.path.exists(f"{target}/{INSTALLED_PROFILE_REL}")
 
     suffix = " (dry run)" if dry_run else ""
     out.write(f"carcara {__version__}: installing profile '{profile.name}' into {target}{suffix}\n")
@@ -456,7 +622,7 @@ def install(
     for rel, res in iter_claude_templates():
         dest = f"{target}/.claude/{rel}"
         if rel == SETTINGS_REL:
-            action, data = settings
+            action, data, _ = settings
             out.write(_action(action, dest))
             if data is not None:
                 result.written += 1
@@ -483,10 +649,19 @@ def install(
             continue
         _write(dest, _render_resource(res, profile))
 
-    _install_claude_md(claude_md, profile, routing, dry_run, out)
+    claude_md_mode = _install_claude_md(claude_md, profile, routing, dry_run, out)
     _install_carcara_gitignore(target, dry_run, out)
     _install_strict_flag(target, strict_policy, dry_run, out)
     _install_profile_record(target, profile_spec, profile, dry_run, out)
+    if track:
+        manifest = _build_manifest(
+            prev_manifest,
+            settings[0],
+            settings[2],
+            claude_md_mode,
+            _recorded_spec(profile_spec, profile),
+        )
+        _install_manifest(target, manifest, dry_run, out)
 
     out.write(f"done: {result.written} file(s) written, {result.skipped} skipped.\n")
     if result.skipped > 0:
@@ -502,6 +677,344 @@ def install(
     else:
         out.write(f"Next: start Claude Code in {target} and run: /sdlc <task>\n")
     return result
+
+
+# --- uninstall -------------------------------------------------------------------
+
+UNINSTALL_USAGE = f"""carcara {__version__} - remove carcara from a project
+
+Usage: carcara uninstall [options] [target-dir]
+
+Removes the agents, commands, skill, settings entries, CLAUDE.md section and
+.carcara files that `carcara install` added to <target-dir> (default: current
+directory). Your own settings, edited agents/commands and run history are kept.
+
+Options:
+  -f, --force          also remove carcara agents and commands you edited
+  -n, --dry-run        show what would be done without changing anything
+      --purge          also delete the run history in .carcara/runs
+  -h, --help           show this help
+"""
+
+# .carcara files owned by carcara (run history is handled separately).
+CARCARA_FILES = (
+    STRICT_POLICY_REL,
+    ROUTING_OFF_REL,
+    INSTALLED_PROFILE_REL,
+    CARCARA_GITIGNORE_REL,
+    INSTALL_MANIFEST_REL,
+)
+CLAUDE_DIRS = ("agents", "commands", "skills/carcara", "skills", "")
+
+
+def _strip_claude_md(path: str, data: bytes, mode: str | None) -> bytes | None:
+    """``data`` without the carcara block; None when the file should be deleted.
+
+    ``mode`` is how install handled the file (manifest ``claude_md_mode``):
+    ``append`` also drops the newline separator it added, ``create`` deletes
+    an emptied file. Without a manifest (None) a blank line before the block is
+    taken as the separator and an emptied file is deleted.
+    """
+    if count_markers(path, data) == 0:
+        return data
+    pieces = data.split(b"\n")
+    begin, end = pieces.index(BEGIN_MARKER), pieces.index(END_MARKER)
+    before = b"".join(p + b"\n" for p in pieces[:begin])
+    after = b"\n".join(pieces[end + 1 :])
+    if (mode == "append" and before.endswith(b"\n")) or (mode is None and before.endswith(b"\n\n")):
+        before = before[:-1]
+    new = before + after
+    if not new and mode in ("create", None):
+        return None
+    return new
+
+
+def _template_permissions() -> dict[str, list[str]]:
+    res = templates_root().joinpath("claude", SETTINGS_REL)
+    return json.loads(res.read_bytes().decode("utf-8")).get("permissions", {})
+
+
+def unmerge_settings(
+    settings: dict[str, Any], template: dict[str, list[str]], manifest: dict[str, Any] | None
+) -> dict[str, Any]:
+    """``settings`` (not modified) without what install merged into it.
+
+    Carcara hook entries are always stripped. Permissions: with a manifest only
+    the entries install added, else every ``template`` entry plus the legacy
+    allow rules. ``model``: only when the manifest says install set it and it
+    is unchanged. Lists, events and objects are dropped only when this emptied
+    them and, if the manifest records ``settings_created_keys``, install
+    created them.
+    """
+    created = manifest.get("settings_created_keys") if manifest else None
+    out = copy.deepcopy(settings)
+    hooks = out.get("hooks")
+    if isinstance(hooks, dict):
+        emptied = False
+        for event in list(hooks):
+            groups = hooks[event]
+            kept = [g for g in map(_strip_carcara_hooks, groups) if g is not None]
+            if groups and not kept and (created is None or event in created["hook_events"]):
+                del hooks[event]
+                emptied = True
+            else:
+                hooks[event] = kept
+        if emptied and not hooks and (created is None or created["hooks"]):
+            del out["hooks"]
+    if manifest is None:
+        remove = {k: list(v) for k, v in template.items()}
+        remove.setdefault("allow", []).extend(LEGACY_ALLOW)
+    else:
+        remove = manifest["permissions_added"]
+    perms = out.get("permissions")
+    if isinstance(perms, dict):
+        emptied = False
+        for key, values in remove.items():
+            current = perms.get(key)
+            if not isinstance(current, list) or not current:
+                continue
+            kept = [v for v in current if v not in values]
+            if kept or (created is not None and key not in created["permission_keys"]):
+                perms[key] = kept
+            else:
+                del perms[key]
+                emptied = True
+        if emptied and not perms and (created is None or created["permissions"]):
+            del out["permissions"]
+    model_set = manifest.get("model_set") if manifest else None
+    if model_set is not None and out.get("model") == model_set:
+        del out["model"]
+    return out
+
+
+def _uninstall_profiles(target: str, manifest: dict[str, Any] | None) -> list[Profile]:
+    """Profiles the installed files may have been rendered with: the recorded
+    one (possibly a custom file) first, then every packaged profile."""
+    specs: list[str] = []
+    for spec in (manifest.get("profile") if manifest else None, read_installed_profile(target)):
+        if spec and spec not in specs:
+            specs.append(spec)
+    for entry in sorted(profiles_root().iterdir(), key=lambda e: e.name):
+        if entry.name.endswith(".env") and entry.is_file():
+            specs.append(entry.name[: -len(".env")])
+    profiles = []
+    for spec in specs:
+        try:
+            profiles.append(load_profile(spec))
+        except (ProfileError, OSError):
+            pass  # e.g. a custom profile file that was deleted since
+    return profiles
+
+
+def _uninstall_claude_files(
+    target: str, profiles: list[Profile], force: bool, dry_run: bool, out: TextIO
+) -> int:
+    """Remove carcara's agents, commands and skill; returns the number removed."""
+    removed = 0
+    for rel, res in iter_claude_templates():
+        dest = f"{target}/.claude/{rel}"
+        if rel == SETTINGS_REL or not os.path.isfile(dest):
+            continue
+        if rel == SKILL_REL:
+            if not _is_carcara_skill(dest):
+                out.write(f"  keep       {dest} (not installed by carcara)\n")
+                continue
+        else:
+            with open(dest, "rb") as fh:
+                data = fh.read()
+            if not force and data not in {_render_resource(res, p) for p in profiles}:
+                out.write(f"  keep       {dest} (modified; use --force to remove)\n")
+                continue
+        out.write(_action("remove", dest))
+        removed += 1
+        if not dry_run:
+            os.unlink(dest)
+    return removed
+
+
+def _prune_dirs(dirs: list[str]) -> None:
+    """rmdir each directory that exists and is empty (never recursive)."""
+    for d in dirs:
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
+
+
+def _check_purge(target: str, runs: str) -> None:
+    """Only a real directory inside ``target`` may be rmtree'd."""
+    inside = os.path.join(os.path.realpath(target), RUNS_REL)
+    if os.path.islink(runs) or not os.path.isdir(runs) or os.path.realpath(runs) != inside:
+        raise InstallError(f"refusing to purge {runs}: not a directory inside {target}")
+
+
+def uninstall(
+    target: str = ".",
+    *,
+    dry_run: bool = False,
+    force: bool = False,
+    purge: bool = False,
+    out: TextIO | None = None,
+) -> int:
+    """Remove what ``install`` added to ``target``; returns the number of changes.
+
+    Raises InstallError before any change (bad CLAUDE.md markers, bad
+    settings.json or manifest, home directory, unsafe --purge path).
+    """
+    out = sys.stdout if out is None else out
+    target = target or "."
+    if not os.path.isdir(target):
+        raise InstallError(f"target directory does not exist: {target}")
+    if _is_user_config_dir(target):
+        raise InstallError(
+            "refusing to uninstall from your home directory (Claude Code loads it as "
+            "user-level config for every project); pass a project directory"
+        )
+    for rel in CARCARA_FILES:
+        path = f"{target}/{rel}"
+        if os.path.isdir(path) and not os.path.islink(path):
+            raise InstallError(f"{path} is a directory, not a carcara file; refusing to uninstall")
+    if purge:
+        holder = runstore.live_lock_holder(f"{target}/{ACTIVE_RUN_REL}")
+        if holder is not None:
+            raise InstallError(f"refusing to purge: run {holder['run_id']} is active")
+    manifest = _load_manifest(target)
+    claude_md = f"{target}/CLAUDE.md"
+    claude_md_new: bytes | None = None
+    claude_md_data = None
+    if os.path.isfile(claude_md):
+        with open(claude_md, "rb") as fh:
+            claude_md_data = fh.read()
+        claude_md_new = _strip_claude_md(
+            claude_md, claude_md_data, manifest.get("claude_md_mode") if manifest else None
+        )
+    settings_dest = f"{target}/.claude/{SETTINGS_REL}"
+    settings = _load_settings(settings_dest) if os.path.exists(settings_dest) else None
+    runs = f"{target}/{RUNS_REL}"
+    if purge and os.path.lexists(runs):
+        _check_purge(target, runs)
+
+    suffix = " (dry run)" if dry_run else ""
+    out.write(f"carcara {__version__}: uninstalling from {target}{suffix}\n")
+    changes = _uninstall_claude_files(
+        target, _uninstall_profiles(target, manifest), force, dry_run, out
+    )
+
+    if settings is not None:
+        raw, data = settings
+        new = unmerge_settings(data, _template_permissions(), manifest)
+        if new != data:
+            if manifest is None:
+                out.write(
+                    "warning: no install manifest; removing every carcara template "
+                    "permission (also ones you added yourself) and keeping 'model'\n"
+                )
+            changes += 1
+            created = manifest.get("settings_created") if manifest else True
+            if not new and created:
+                out.write(_action("remove", settings_dest))
+                if not dry_run:
+                    os.unlink(settings_dest)
+            elif _dump_settings(new) != raw:
+                out.write(_action("strip", settings_dest))
+                if not dry_run:
+                    _write_atomic(settings_dest, _dump_settings(new))
+    if not dry_run:
+        _prune_dirs([os.path.join(target, ".claude", d) for d in CLAUDE_DIRS])
+
+    if claude_md_data is not None and claude_md_new != claude_md_data:
+        changes += 1
+        if claude_md_new is None:
+            out.write(_action("remove", claude_md))
+            if not dry_run:
+                os.unlink(claude_md)
+        else:
+            out.write(_action("strip", claude_md))
+            if not dry_run:
+                with open(claude_md, "wb") as fh:
+                    fh.write(claude_md_new)
+
+    # install.json last: if anything fails before it, uninstall can be retried.
+    for rel in CARCARA_FILES:
+        path = f"{target}/{rel}"
+        if os.path.lexists(path):
+            out.write(_action("remove", path))
+            changes += 1
+            if not dry_run:
+                os.unlink(path)
+    if os.path.lexists(runs):
+        if purge:
+            out.write(_action("purge", runs))
+            changes += 1
+            if not dry_run:
+                shutil.rmtree(runs)
+        else:
+            out.write(f"  keep       {runs} (run history; use --purge to delete)\n")
+    if purge:
+        active = f"{target}/{ACTIVE_RUN_REL}"
+        leftovers = sorted(
+            path
+            for pattern in runstore.LOCK_LEFTOVER_GLOBS
+            for path in glob.glob(os.path.join(glob.escape(f"{target}/.carcara"), pattern))
+        )
+        for path in ([active] if os.path.lexists(active) else []) + leftovers:
+            out.write(_action("purge", path))
+            changes += 1
+            if not dry_run:
+                os.unlink(path)
+    if not dry_run:
+        _prune_dirs([f"{target}/.carcara"])
+
+    if changes:
+        out.write(f"done: {changes} item(s) removed or stripped.\n")
+    else:
+        out.write("nothing to uninstall\n")
+    return changes
+
+
+def uninstall_main(argv: list[str]) -> int:
+    """``carcara uninstall`` argument handling, in the style of ``main``."""
+    target = ""
+    force = dry_run = purge = False
+    args = list(argv)
+    try:
+        while args:
+            arg = args[0]
+            if arg in ("-f", "--force"):
+                force = True
+            elif arg in ("-n", "--dry-run"):
+                dry_run = True
+            elif arg == "--purge":
+                purge = True
+            elif arg in ("-h", "--help"):
+                sys.stdout.write(UNINSTALL_USAGE)
+                return 0
+            elif arg == "--":
+                del args[0]
+                break
+            elif arg.startswith("-"):
+                raise InstallError(f"unknown option: {arg} (see --help)")
+            else:
+                if target:
+                    raise InstallError("only one target directory may be given")
+                target = arg
+            del args[0]
+        if args:
+            if target or len(args) != 1:
+                raise InstallError("only one target directory may be given")
+            target = args[0]
+        uninstall(target or ".", dry_run=dry_run, force=force, purge=purge)
+    except (InstallError, ProfileError) as exc:
+        sys.stdout.flush()
+        print(f"carcara: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        sys.stdout.flush()
+        detail = exc.strerror or str(exc)
+        where = f": {exc.filename}" if exc.filename else ""
+        print(f"carcara: {detail}{where}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def main(argv: list[str]) -> int:

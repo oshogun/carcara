@@ -79,10 +79,11 @@ def test_output_format(tmp_path, capsys):
     out = capsys.readouterr().out.splitlines()
     assert out[0] == f"carcara {__version__}: installing profile 'economy' into d"
     assert out[1] == "  create     d/.claude/agents/architect.md"
-    assert out[-5:-2] == [
+    assert out[-6:-2] == [
         "  create     d/CLAUDE.md",
         "  create     d/.carcara/.gitignore",
         "  create     d/.carcara/profile",
+        "  create     d/.carcara/install.json",
     ]
     assert out[-2] == "done: 13 file(s) written, 0 skipped."
 

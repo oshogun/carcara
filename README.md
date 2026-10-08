@@ -79,6 +79,7 @@ The `/sdlc*` slash commands stay available as an optional manual path.
 
 ```sh
 carcara [install] [options] [target-dir]   # target-dir defaults to the current directory
+carcara uninstall [options] [target-dir]   # remove what install added (see below)
 carcara profiles                           # list profiles
 carcara run "<task>"                       # run the pipeline headlessly (see below)
 carcara status [RUN_ID] [--json|--plan]    # show a run (default: active, else latest)
@@ -86,7 +87,7 @@ carcara diff [RUN_ID] [--stat]             # a run's changes since its base (sec
 carcara routing on|off|status              # Claude Code routing for this project
 ```
 
-`install`, `profiles`, `run`, `status`, `diff`, `routing` and `hook` as the
+`install`, `uninstall`, `profiles`, `run`, `status`, `diff`, `routing` and `hook` as the
 first argument are subcommands; to
 target a directory with one of those names use `carcara -- <dir>` or
 `carcara install <dir>`.
@@ -139,6 +140,33 @@ hooks and model are kept; carcara's hook entries are replaced); and an
 existing `CLAUDE.md` keeps its content — carcara
 only appends or updates the section between `<!-- carcara:begin -->` and
 `<!-- carcara:end -->`.
+
+### Uninstalling
+
+`carcara uninstall [target-dir]` removes what `carcara install` added: the
+carcara agents, commands and `carcara` skill, carcara's hooks, permissions and
+`model` in `settings.json`, the marked `CLAUDE.md` section and carcara's files
+in `.carcara/`. Files and empty directories that install created are deleted;
+install followed by uninstall gives back the original files (an existing
+`settings.json` is rewritten as 2-space-indented JSON if anything in it changed).
+
+| Option | Description |
+|---|---|
+| `-n, --dry-run` | show what would be removed without changing anything |
+| `-f, --force` | also remove carcara agents and commands you edited |
+| `--purge` | also delete the run history in `.carcara/runs` |
+
+Kept: agents and commands you edited (`keep ... (modified)`, unless `-f`), a
+`carcara` skill that carcara didn't write, your own `settings.json` entries
+(including permissions identical to carcara's that you had before installing,
+and a `model` you changed), and `.carcara/runs` unless `--purge`. Like
+install, it refuses to run in your home directory or `~/.claude`.
+
+Install records what it added in `.carcara/install.json`. Projects installed
+before that file existed have no record: uninstall then removes every
+permission from carcara's template (also identical ones you added yourself;
+it prints a warning), keeps `model`, and treats a blank line before the
+`CLAUDE.md` section as the separator install added.
 
 ### Pipeline (`/sdlc`)
 

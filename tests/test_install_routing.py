@@ -413,3 +413,22 @@ def test_symlinked_settings_stay_a_symlink(proj, tmp_path):
     assert main(["d"]) == 0
     assert (proj / ".claude" / "settings.json").is_symlink()
     assert pre_matchers(json.loads(real.read_text())) == DEFAULT_PRE
+
+
+# --- carcara uninstall routing --------------------------------------------------------
+
+
+def test_uninstall_subcommand_dispatch(proj, capsys):
+    assert main(["d"]) == 0
+    capsys.readouterr()
+    assert main(["uninstall", "d"]) == 0
+    out = capsys.readouterr().out
+    assert "  remove     d/.claude/agents/architect.md\n" in out
+    assert "  remove     d/.claude/settings.json\n" in out
+    assert os.listdir(proj) == []
+
+
+def test_help_lists_uninstall(capsys):
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    assert "uninstall" in capsys.readouterr().out

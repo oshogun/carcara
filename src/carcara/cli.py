@@ -16,7 +16,7 @@ from typing import Any
 
 from carcara import __version__
 
-SUBCOMMANDS = ("install", "run", "status", "diff", "profiles", "hook", "routing")
+SUBCOMMANDS = ("install", "uninstall", "run", "status", "diff", "profiles", "hook", "routing")
 SIZES = ("S", "M", "L")
 DEFAULT_PROFILE = "balanced"
 STAGE_ENV_VAR = "CARCARA_STAGE"  # mirrors carcara.backend.STAGE_ENV_VAR (kept import-light)
@@ -35,6 +35,11 @@ def build_parser() -> argparse.ArgumentParser:
         "install",
         add_help=False,
         help="install agents, commands and CLAUDE.md section (see `carcara install -h`)",
+    )
+    sub.add_parser(
+        "uninstall",
+        add_help=False,
+        help="remove what `carcara install` added (see `carcara uninstall -h`)",
     )
     sub.add_parser("profiles", help="list available profiles and their model routing")
     _add_run_parser(sub)
@@ -692,6 +697,11 @@ def main(argv: list[str] | None = None) -> int:
         from carcara.installer import main as install_main
 
         return install_main(args[1:])
+
+    if args[0] == "uninstall":
+        from carcara.installer import uninstall_main
+
+        return uninstall_main(args[1:])
 
     parser = build_parser()
     ns = parser.parse_args(args)
