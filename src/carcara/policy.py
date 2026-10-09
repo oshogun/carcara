@@ -25,9 +25,12 @@ Accepted limitations:
   git only reads tracked content, which should not include secrets.
 - test-runner and implementer Bash is guarded only by a best-effort deny-list
   (``_check_unrestricted_bash``: git push, git reset --hard, git clean -f,
-  fetch-and-exec, shell access to secret paths, shell writes outside ``cwd``
-  or into ``.git``/``.carcara``/``.claude``). Variables, eval, base64, ``cd``,
-  aliases or scripts written into the repo and then run all bypass it; reads
+  fetch-and-exec, shell access to secret paths, shell writes -- including
+  ``sed -i``/``perl -i``/``ruby -i`` -- outside ``cwd`` or into
+  ``.git``/``.carcara``/``.claude``, and ``-c``/``-e``/``eval`` code strings
+  naming those directories). Variables, paths built at runtime, base64,
+  ``cd``, aliases, heredoc/stdin programs, scripts written into the repo and
+  then run, ``awk -i inplace``, ex/vi/ed and ``dd of=`` all bypass it; reads
   outside ``cwd`` are allowed. Wrapper options that take a value (``sudo -u``,
   ``nice -n``, ``env -u``/``-C``/``-S``, ...) are skipped via
   ``_WRAPPER_VALUE_OPTS``; options missing from that table can still hide the
@@ -830,14 +833,294 @@ def _write_operands(cmd: str, args: list[str]) -> list[str]:
     return operands[-1:]
 
 
+_SED_COMMANDS = frozenset({"sed", "gsed"})
+_SED_VALUE_LONG = frozenset({"--expression", "--file", "--line-length"})
+_SED_LONG = _SED_VALUE_LONG | {
+    "--binary",
+    "--debug",
+    "--follow-symlinks",
+    "--help",
+    "--in-place",
+    "--null-data",
+    "--posix",
+    "--quiet",
+    "--regexp-extended",
+    "--sandbox",
+    "--separate",
+    "--silent",
+    "--unbuffered",
+    "--version",
+    "--zero-terminated",
+}
+
+
+def _sed_long_name(name: str) -> str:
+    """Expand a getopt_long abbreviation (``--in`` -> ``--in-place``)."""
+    if name in _SED_LONG:
+        return name
+    matches = [opt for opt in _SED_LONG if opt.startswith(name)]
+    return matches[0] if len(matches) == 1 else name
+
+
+def _sed_in_place_operands(args: list[str]) -> list[str]:
+    """Files ``sed -i``/``--in-place`` edits (GNU option permutation honoured)."""
+    in_place = False
+    has_script = False
+    operands: list[str] = []
+    end_opts = False
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        i += 1
+        if end_opts or tok == "-" or not tok.startswith("-"):
+            operands.append(tok)
+        elif tok == "--":
+            end_opts = True
+        elif tok.startswith("--"):
+            name, eq, _ = tok.partition("=")
+            name = _sed_long_name(name)
+            if name == "--in-place":
+                in_place = True
+            elif name in _SED_VALUE_LONG:
+                has_script = has_script or name != "--line-length"
+                if not eq:
+                    i += 1
+        else:
+            for pos, ch in enumerate(tok[1:], 1):
+                if ch == "i":
+                    in_place = True
+                    break  # the rest of the cluster is the backup suffix
+                if ch in "ef":
+                    has_script = True
+                    if pos + 1 == len(tok):
+                        i += 1  # value is the next argument
+                    break
+                if ch == "l":
+                    if pos + 1 == len(tok) and i < len(args) and not args[i].startswith("-"):
+                        i += 1  # optional numeric value
+                    break
+    if not in_place:
+        return []
+    operands = [t for t in operands if t]  # BSD ``sed -i '' ...``
+    return operands if has_script else operands[1:]
+
+
+@dataclass(frozen=True)
+class _PerlishSpec:
+    """Options of perl/ruby: ``code`` letters take a program, ``rest`` letters
+    take the rest of the cluster (or the next argument when ``rest_next`` and
+    nothing is attached), ``digits`` letters take trailing digits only.
+    ``value_long`` options take the next argument unless written ``--opt=v``.
+    A separate value is only skipped when it does not look like an option, so
+    scanning errs towards still seeing a later ``-i``/``-e``."""
+
+    code: str
+    rest: str
+    rest_next: str
+    digits: str
+    value_long: frozenset[str] = frozenset()
+
+
+_PERLISH_SPECS = {
+    "perl": _PerlishSpec(code="eE", rest="iIMmxdDF", rest_next="IMmx", digits="0lC"),
+    "ruby": _PerlishSpec(
+        code="e",
+        rest="iIrCEFxWK",
+        rest_next="IrCEFxW",
+        digits="0",
+        value_long=frozenset(
+            {
+                "--enable",
+                "--disable",
+                "--encoding",
+                "--external-encoding",
+                "--internal-encoding",
+                "--dump",
+                "--backtrace-limit",
+                "--crash-report",
+                "--parser",
+            }
+        ),
+    ),
+}
+
+
+def _takes_next(args: list[str], i: int) -> bool:
+    """True if ``args[i]`` exists and can be a separate option value."""
+    return i < len(args) and not args[i].startswith("-")
+
+
+def _perlish_options(cmd: str, args: list[str]) -> tuple[bool, list[str], list[str]]:
+    """(in-place?, code strings, operands) for a perl/ruby command line."""
+    spec = _PERLISH_SPECS[cmd]
+    in_place = False
+    codes: list[str] = []
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == "--":
+            i += 1
+            break
+        if tok == "-" or not tok.startswith("-"):
+            break
+        i += 1
+        if tok.startswith("--"):
+            if tok in spec.value_long and _takes_next(args, i):
+                i += 1
+            continue
+        pos = 1
+        while pos < len(tok):
+            ch = tok[pos]
+            pos += 1
+            if ch in spec.code:
+                code = tok[pos:]
+                if not code and i < len(args):
+                    code, i = args[i], i + 1
+                codes.append(code)
+                break
+            if ch in spec.rest:
+                in_place = in_place or ch == "i"
+                if ch in spec.rest_next and pos == len(tok) and _takes_next(args, i):
+                    i += 1
+                break
+            if ch in spec.digits:
+                while pos < len(tok) and tok[pos].isdigit():
+                    pos += 1
+    return in_place, codes, args[i:]
+
+
+def _in_place_operands(cmd: str, args: list[str]) -> list[str]:
+    """Files edited in place by ``sed -i``, ``perl -i`` or ``ruby -i``; [] otherwise."""
+    if cmd in _SED_COMMANDS:
+        return _sed_in_place_operands(args)
+    if cmd not in _PERLISH_SPECS:
+        return []
+    in_place, codes, operands = _perlish_options(cmd, args)
+    if not in_place:
+        return []
+    return operands if codes else operands[1:]  # without -e the first operand is the script
+
+
+# Kept in sync with _PROTECTED_DIRS. The guards stop ``.gitignore``,
+# ``.github`` and ``.git-blame-ignore-revs`` from matching.
+_PROTECTED_CODE_RE = re.compile(
+    r"(?<![\w.-])\.(?:"
+    + "|".join(re.escape(d[1:]) for d in sorted(_PROTECTED_DIRS))
+    + r")(?![\w.-])",
+    re.IGNORECASE,
+)
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_SHELL_VALUE_LONG = frozenset({"--rcfile", "--init-file"})
+_NODE_LIKE = frozenset({"node", "nodejs", "bun", "deno"})
+_NODE_VALUE_OPTS = frozenset(
+    {
+        "-r",
+        "--require",
+        "--import",
+        "--loader",
+        "-C",
+        "--conditions",
+        "--experimental-loader",
+        "--input-type",
+    }
+)
+
+
+def _shell_code(args: list[str]) -> list[str]:
+    has_c = False
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        i += 1
+        if tok in ("--", "-"):
+            break
+        if tok.startswith("--"):
+            if tok in _SHELL_VALUE_LONG:
+                i += 1
+        elif tok[:1] in "-+" and len(tok) > 1:
+            has_c = has_c or "c" in tok[1:]
+            if ("o" in tok[1:] or "O" in tok[1:]) and i < len(args):
+                i += 1
+        else:
+            return [tok] if has_c else []
+    return [args[i]] if has_c and i < len(args) else []
+
+
+def _python_code(args: list[str]) -> list[str]:
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        i += 1
+        if tok in ("--", "-") or not tok.startswith("-"):
+            return []
+        if tok.startswith("--"):
+            if tok == "--check-hash-based-pycs":
+                i += 1
+            continue
+        for pos, ch in enumerate(tok[1:], 1):
+            if ch == "c":
+                code = tok[pos + 1 :]
+                if not code and i < len(args):
+                    code = args[i]
+                return [code]
+            if ch == "m":
+                return []
+            if ch in "WX":
+                if pos + 1 == len(tok) and i < len(args):
+                    i += 1
+                break
+    return []
+
+
+def _node_code(cmd: str, args: list[str]) -> list[str]:
+    if cmd == "deno" and args[:1] == ["eval"]:
+        return [" ".join(args[1:])]
+    # Node-style CLIs have many value options (``--title x``, ...), so keep
+    # scanning past non-option words rather than guess where the script is.
+    codes: list[str] = []
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        i += 1
+        if tok == "--":
+            break
+        name, eq, value = tok.partition("=")
+        if name in ("--eval", "--print") and eq:
+            codes.append(value)
+        elif tok in ("-e", "--eval", "-p", "--print", "-pe", "-ep") and i < len(args):
+            codes.append(args[i])
+            i += 1
+        elif tok in _NODE_VALUE_OPTS and i < len(args):
+            i += 1
+    return codes
+
+
+def _interpreter_code(cmd: str, args: list[str]) -> list[str]:
+    """Program text passed on the command line (``-c``, ``-e``, ``--eval``, eval, ...)."""
+    if cmd == "eval":
+        return [" ".join(args)]
+    if cmd in _SHELLS:
+        return _shell_code(args)
+    if cmd.startswith("python"):
+        return _python_code(args)
+    if cmd in _NODE_LIKE:
+        return _node_code(cmd, args)
+    if cmd in _PERLISH_SPECS:
+        return _perlish_options(cmd, args)[1]
+    return []
+
+
 def _check_unrestricted_bash(command: str, cwd: str | None) -> Decision | None:
     """Best-effort deny-list for implementer/test-runner Bash; None if acceptable.
 
     Denies git push, git reset --hard, git clean -f, curl/wget piped or
     substituted into a shell/interpreter, shell access to secret paths, and
-    writes (redirections, tee, rm/mv/cp/...) outside ``cwd`` or into
-    ``.git``/``.carcara``/``.claude``. Reads outside ``cwd`` stay allowed.
-    Trivially bypassable (variables, eval, scripts, cd): defence in depth only.
+    writes (redirections, tee, rm/mv/cp/..., ``sed -i``/``perl -i``/``ruby -i``)
+    outside ``cwd`` or into ``.git``/``.carcara``/``.claude``. Interpreter
+    code strings (``sh -c``, ``python -c``, ``node -e``, ``perl -e``,
+    ``eval``, ...) naming one of those directories are denied outright, even
+    read-only ones such as ``bash -c 'ls .git'``. Reads outside ``cwd`` stay
+    allowed. Trivially bypassable (variables, scripts, cd): defence in depth only.
     """
     segments = _shell_segments(command)
     if segments is None:
@@ -879,6 +1162,10 @@ def _check_unrestricted_bash(command: str, cwd: str | None) -> Decision | None:
             targets += [a for a in argv[1:] if not a.startswith("-") and a not in _DEV_SINKS]
         elif cmd in SHELL_WRITE_COMMANDS:
             targets += _write_operands(cmd, argv[1:])
+        targets += _in_place_operands(cmd, argv[1:])
+        for code in _interpreter_code(cmd, argv[1:]):
+            if _PROTECTED_CODE_RE.search(code):
+                return _deny(f"interpreter code naming .git/.carcara/.claude is denied: {cmd}")
         for target in targets:
             problem = _write_path_problem(target, cwd)
             if problem:

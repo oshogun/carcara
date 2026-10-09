@@ -369,8 +369,11 @@ enforced by a PreToolUse hook, which applies in every permission mode;
 implementer and test-runner may run any Bash command except those caught by a
 deny-list: `git push`, `git reset --hard`, `git clean -f`, curl/wget piped or
 substituted into a shell or interpreter, shell access to `.env`/`secrets/`
-paths, and shell writes (redirections, `tee`, `rm`/`mv`/`cp`/`mkdir`/...)
-outside the repo or into `.git`, `.claude` or `.carcara`. Reads outside the
+paths, shell writes (redirections, `tee`, `rm`/`mv`/`cp`/`mkdir`/...,
+`sed -i`/`perl -i`/`ruby -i`) outside the repo or into `.git`, `.claude` or
+`.carcara`, and interpreter one-liners (`sh -c`, `python -c`, `node -e`,
+`perl -e`, `ruby -e`, `eval`, ...) whose code names one of those
+directories, even to read it (use Read or `cat` instead). Reads outside the
 repo stay allowed. Wrappers such as `sudo -u root`, `nice -n 5`, `env -u X`,
 `env -S '...'`, `timeout -s KILL 5` and `xargs -n 1` are looked through, including
 their option values. To turn the deny-list off, pass
@@ -396,6 +399,14 @@ Known risks:
   (files a stage creates have no effect). The real safety net is still the clean-tree
   requirement and the base commit recorded for each run. A per-project
   test-command allowlist is not implemented yet.
+- Writes into `.git`, `.claude` or `.carcara` can still get through Bash:
+  scripts written to disk and then run, heredoc/stdin programs
+  (`python - <<EOF`), paths built at runtime (string concatenation,
+  variables, base64), `awk -i inplace`, ex/vi/ed and `dd of=` are not caught
+  (#19). sed is parsed with GNU grammar, so BSD/macOS `sed -I` (capital I)
+  and `sed -i .bak` (backup suffix as a separate argument) are not caught; sed
+  script writes via `w FILE` within the script or `s/a/b/w FILE` syntax are
+  missed too.
 - Grep and recursive searches may still surface secrets in a searched directory.
 - `setting_sources` is empty by default, so project settings and CLAUDE.md are
   not loaded into stages; pass `--project-settings` to opt in.

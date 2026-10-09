@@ -15,6 +15,10 @@
 - Feedback given with `carcara resume --reject --feedback` now also reaches
   the implement prompts (each L step and the M implement), not only the
   revised plan (#20). All feedback entries are included, latest last.
+- implementer and test-runner Bash now denies `sed -i`, `perl -i` and
+  `ruby -i` edits into `.git`, `.carcara`, `.claude` or outside the repo, and
+  interpreter `-c`/`-e`/`--eval`/`eval` code that names those directories
+  (#19). The gaps that remain are listed in README "Known risks".
 
 ### Added
 - `carcara run --ultra` fans out the read-only roles. A `scope` stage picks

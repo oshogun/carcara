@@ -480,6 +480,52 @@ def test_implementer_bash_reads_unconfined():
         "env --split-string='git push origin'",
         "timeout -s KILL 5 git push",
         "xargs -n 1 git push",
+        "sed -i s/a/b/ .carcara/config.json",
+        "sed -i.bak s/a/b/ .claude/settings.json",
+        "sed -ni -e p .git/config",
+        "sed --in-place=.bak -e s/a/b/ x .carcara/config.json",
+        "sed s/a/b/ -i .carcara/config.json",
+        "sed -i s/a/b/ .CARCARA/config.json",
+        "perl -pi -e s/a/b/ .carcara/config.json",
+        "perl -i.bak -pe s/a/b/ .git/config",
+        "ruby -i -pe 'x' .claude/settings.json",
+        "sudo sed -i s/a/b/ .carcara/config.json",
+        "sed -i s/a/b/ ../outside.txt",
+        "python -c \"open('.carcara/config.json','w')\"",
+        "python3 -Ic \"open('.git/x','w')\"",
+        "python -c \"open('.CARCARA/config.json','w')\"",
+        "bash -c 'echo x > .claude/settings.json'",
+        "bash -lc 'rm .git/index'",
+        "node -e \"require('fs').writeFileSync('.carcara/c','x')\"",
+        "node --eval=\"x('.git/HEAD')\"",
+        "perl -e \"open F,'>.git/x'\"",
+        "perl -le \"unlink '.git/index'\"",
+        "ruby -e \"File.write('.claude/x','')\"",
+        'eval "echo x > .carcara/config.json"',
+        "perl -I lib -pi -e s/a/b/ .carcara/config.json",
+        "perl -I lib -e \"unlink '.git/index'\"",
+        "perl -M strict -pi -e s/a/b/ .git/config",
+        "perl -i fix.pl .git/config",
+        "ruby -i fix.rb .git/config",
+        "ruby -I lib -i -pe x .git/config",
+        "ruby -r json -e \"File.write('.claude/x','')\"",
+        "ruby --disable gems -i -pe x .git/config",
+        "perl -0777 -pi -e s/a/b/ .git/config",
+        "sed -f s.sed -i .git/config",
+        "sed --expression s/a/b/ -i .git/config",
+        "sed --in -e s/a/b/ .git/config",
+        "deno eval \"Deno.removeSync('.git/index')\"",
+        "bun -e \"Bun.write('.carcara/c','x')\"",
+        "nodejs -e \"x('.git/HEAD')\"",
+        "node -p \"x('.git/HEAD')\"",
+        "node -pe \"x('.git/HEAD')\"",
+        "node --print=\"x('.git/HEAD')\"",
+        "node --title t -e \"x('.git/HEAD')\"",
+        "bash -o pipefail -c 'rm .git/index'",
+        "bash --rcfile f -c 'rm .git/index'",
+        "python -W ignore -c \"open('.git/x','w')\"",
+        "python -X dev -c \"open('.git/x','w')\"",
+        "bash -c 'ls .git'",
     ],
 )
 @pytest.mark.parametrize("role", sorted(UNRESTRICTED_BASH_ROLES))
@@ -512,6 +558,24 @@ def test_unrestricted_bash_denials(role, command):
         "nice -n 5 pytest",
         "sudo -u root ls",
         "env -S 'pytest -q'",
+        "sed -i s/a/b/ src/x.py",
+        "sed -i '' s/a/b/ src/x.py",
+        "sed -i s/a/b/ .gitignore",
+        "sed -i s/a/b/ .github/workflows/ci.yml",
+        "sed s/a/b/ .carcara/config.json",
+        "perl -pe s/a/b/ .git/config",
+        "perl -pi -e s/a/b/ src/x.py",
+        "python -c 'print(1)'",
+        "python -c \"open('.gitignore').read()\"",
+        "python -c \"open('.git-blame-ignore-revs').read()\"",
+        "node -e \"console.log('.github')\"",
+        "bash -c 'echo hi'",
+        "python script.py",
+        "git commit -m 'touch .carcara docs'",
+        "bash -c 'cat .gitignore'",
+        "node -e \"require('./.github/x')\"",
+        "perl -I lib -pi -e s/a/b/ src/x.py",
+        "perl -i fix.pl src/x.py",
     ],
 )
 @pytest.mark.parametrize("role", sorted(UNRESTRICTED_BASH_ROLES))
@@ -612,5 +676,136 @@ def test_project_config_not_writable_by_any_role(role):
     target = ".carcara/config.json"
     for tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
         assert not allowed(role, tool, {"file_path": target, "notebook_path": target}), tool
-    for command in (f"echo x > {target}", f"tee {target}", f"cp a {target}"):
+    for command in (
+        f"echo x > {target}",
+        f"tee {target}",
+        f"cp a {target}",
+        f"sed -i s/a/b/ {target}",
+    ):
         assert not allowed(role, "Bash", {"command": command}), command
+
+
+# --- protected directory write bypasses (GitHub issue #19) ---
+
+
+def test_perl_with_i_option_separate_value_denied():
+    """perl -I lib -pi -e should deny writes to .git/.carcara/.claude"""
+    assert not allowed(
+        "test-runner", "Bash", {"command": "perl -I lib -pi -e 's/a/b/' .git/config"}
+    )
+    assert not allowed(
+        "test-runner", "Bash", {"command": "perl -I lib -pi -e 's/a/b/' .carcara/config.json"}
+    )
+
+
+def test_perl_i_option_code_execution_denied():
+    """perl -I lib -e with protected directory access denied"""
+    assert not allowed("test-runner", "Bash", {"command": "perl -I lib -e \"unlink '.git/index'\""})
+
+
+def test_perl_i_without_code_option_denied():
+    """perl -i file.pl (script as first operand) with protected dir denied"""
+    assert not allowed("test-runner", "Bash", {"command": "perl -i /tmp/script.pl .git/config"})
+
+
+def test_ruby_i_option_separate_value_denied():
+    """ruby -I lib -i -pe with protected directory access denied"""
+    assert not allowed("test-runner", "Bash", {"command": "ruby -I lib -i -pe 'x' .git/config"})
+
+
+def test_perl_zero_option_with_in_place_denied():
+    """perl -0777 -pi -e should deny writes to protected dirs"""
+    assert not allowed("test-runner", "Bash", {"command": "perl -0777 -pi -e 's/a/b/' .git/config"})
+
+
+def test_sed_f_option_with_in_place_denied():
+    """sed -f script.sed -i should deny writes to protected dirs"""
+    assert not allowed("test-runner", "Bash", {"command": "sed -f /tmp/script.sed -i .git/config"})
+
+
+def test_sed_expression_option_with_in_place_denied():
+    """sed --expression VALUE -i should deny writes to protected dirs"""
+    assert not allowed(
+        "test-runner", "Bash", {"command": "sed --expression 's/a/b/' -i .git/config"}
+    )
+
+
+def test_deno_eval_protected_dir_denied():
+    """deno eval with protected directory access denied"""
+    assert not allowed(
+        "test-runner", "Bash", {"command": "deno eval 'Deno.remove(\".git/config\")'"}
+    )
+
+
+def test_bun_e_option_protected_dir_denied():
+    """bun -e with protected directory access denied"""
+    assert not allowed(
+        "test-runner", "Bash", {"command": "bun -e \"require('fs').unlinkSync('.git/index')\""}
+    )
+
+
+def test_nodejs_e_option_protected_dir_denied():
+    """nodejs -e with protected directory access denied"""
+    assert not allowed(
+        "test-runner", "Bash", {"command": "nodejs -e \"require('fs').unlinkSync('.git/index')\""}
+    )
+
+
+def test_node_p_option_protected_dir_denied():
+    """node -p with protected directory access denied"""
+    assert not allowed(
+        "test-runner", "Bash", {"command": "node -p \"require('fs').readFileSync('.git/config')\""}
+    )
+
+
+def test_bash_c_option_with_wrapper_options_denied():
+    """bash -o pipefail -c with protected directory access denied"""
+    assert not allowed("test-runner", "Bash", {"command": "bash -o pipefail -c 'rm .git/config'"})
+
+
+def test_bash_rcfile_option_with_c_denied():
+    """bash --rcfile f -c with protected directory access denied"""
+    assert not allowed(
+        "test-runner", "Bash", {"command": "bash --rcfile ~/.bashrc -c 'cat .git/config'"}
+    )
+
+
+def test_python_W_option_with_c_denied():
+    """python -W ignore -c with protected directory access denied"""
+    assert not allowed(
+        "test-runner", "Bash", {"command": "python -W ignore -c \"open('.git/config').read()\""}
+    )
+
+
+def test_python_X_option_with_c_denied():
+    """python -X dev -c with protected directory access denied"""
+    assert not allowed(
+        "test-runner",
+        "Bash",
+        {"command": "python -X dev -c \"open('.carcara/config.json','w').close()\""},
+    )
+
+
+def test_bash_c_ls_git_denied_for_test_runner():
+    """bash -c 'ls .git' denied for test-runner (read-only code execution)"""
+    assert not allowed("test-runner", "Bash", {"command": "bash -c 'ls .git'"})
+
+
+def test_safe_sed_i_allowed():
+    """sed -i on regular file allowed"""
+    assert allowed("test-runner", "Bash", {"command": "sed -i 's/a/b/' src/x.py"})
+
+
+def test_safe_python_c_allowed():
+    """python -c without protected dir access allowed"""
+    assert allowed("test-runner", "Bash", {"command": "python -c 'print(1)'"})
+
+
+def test_safe_bash_c_allowed():
+    """bash -c 'cat .gitignore' allowed (not protected directory)"""
+    assert allowed("test-runner", "Bash", {"command": "bash -c 'cat .gitignore'"})
+
+
+def test_safe_node_e_allowed():
+    """node -e without protected dir access allowed"""
+    assert allowed("test-runner", "Bash", {"command": "node -e \"require('./.github/x')\""})
