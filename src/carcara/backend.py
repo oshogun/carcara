@@ -24,7 +24,8 @@ SDK notes (claude-agent-sdk 0.2.x):
   subscription login. This is process-global, which is fine for the
   single-run, sequential ``carcara run`` CLI. ``StageRequest.env`` (which
   sets ``CARCARA_STAGE``) is passed as ``options.env`` and never contains
-  those keys.
+  those keys. The Urutau settings (``URUTAU_ENV_VARS``) are always dropped
+  the same way, so agent stages never see the Urutau token.
 """
 
 from __future__ import annotations
@@ -58,6 +59,8 @@ MAIN_PROMPT = (
 
 
 API_KEY_ENV_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+# Urutau MCP settings: only carcara itself talks to Urutau; stages never see them.
+URUTAU_ENV_VARS = ("URUTAU_MCP_TOKEN", "URUTAU_URL")
 # Set to the stage's role name (or "main") in every stage's CLI process, so
 # carcara's Claude Code hooks no-op there and `carcara run` refuses to nest.
 STAGE_ENV_VAR = "CARCARA_STAGE"
@@ -258,7 +261,7 @@ class SdkBackend:
 
         options = self.build_options(request)
         result_msg: Any = None
-        hidden = () if self.use_api_key else API_KEY_ENV_VARS
+        hidden = URUTAU_ENV_VARS + (() if self.use_api_key else API_KEY_ENV_VARS)
         try:
             with _without_env(hidden), warnings.catch_warnings():
                 warnings.simplefilter("ignore", sdk.CanUseToolShadowedWarning)

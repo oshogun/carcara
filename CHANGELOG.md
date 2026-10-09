@@ -51,6 +51,25 @@
 - Extent facts in the state, the report and `carcara status`: files changed,
   top-level areas (at most 10) and fix rounds, tagged with the rule version
   `carcara/extent-1`.
+- `carcara run --issue N [--repo owner/name]` takes the task from GitHub issue
+  N via `gh` (the repo defaults to the `origin` remote); task text given as
+  well is appended as additional instructions. `--no-urutau` turns off Urutau
+  reporting for the invocation.
+- Triage also outputs a size range (`S`, `M`, `L`, `S-M`, `M-L`, `S-L`) and the
+  main uncertainty kind (`external`, `normative`, `untested`, `none`). Both
+  are stored in the state and shown in the report and `carcara status`; they
+  are null when `--size` forced the size.
+- Urutau reporting for `--issue` runs when `URUTAU_MCP_TOKEN` (or
+  `~/.config/carcara/urutau.json`) provides a token: `record_run` claims the
+  card at start, renews it with a 10-minute heartbeat, and reports pauses,
+  resumes and the end, with the unverified inventory, confirmed probes and
+  findings at pauses and the end. The card estimate is read at start. A card
+  claimed by another run stops the run before any work; other Urutau failures
+  after the start only add a warning event. Each call uses its own MCP
+  session, and the token is only ever sent to `<base>/mcp` (redirects are not
+  followed with it). Interactive gates send `awaiting_approval` while they
+  wait; resuming a run Urutau already saw end reports under `<run id>-rN`.
+  See "Urutau integration" in the README.
 
 ### Fixed
 - `carcara run` now defaults to the profile chosen at `carcara install`

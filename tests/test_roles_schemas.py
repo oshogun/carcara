@@ -3,7 +3,14 @@ import pytest
 from carcara.profiles import load_profile
 from carcara.resources import templates_root
 from carcara.roles import Role, RoleError, load_roles, model_for, parse_role, to_agent_definition
-from carcara.schemas import MAX_UNVERIFIED, MAX_UNVERIFIED_TEXT, SCHEMAS, validate
+from carcara.schemas import (
+    MAX_UNVERIFIED,
+    MAX_UNVERIFIED_TEXT,
+    SCHEMAS,
+    TRIAGE_RANGES,
+    UNCERTAINTY_KINDS,
+    validate,
+)
 
 EXPECTED_TOOLS = {
     "architect": ("Read", "Grep", "Glob"),
@@ -78,10 +85,25 @@ def test_schemas_are_strict():
 
 
 def test_validate():
-    assert validate("triage", {"size": "M", "rationale": "x"}) == []
-    assert validate("triage", {"size": "XL", "rationale": "x"})
-    assert validate("triage", {"size": "S"})
-    assert validate("triage", {"size": "S", "rationale": "x", "extra": 1})
+    tri = {"rationale": "x", "triageRange": "S-M", "uncertaintyKind": "none"}
+    assert validate("triage", {"size": "M", **tri}) == []
+    assert validate("triage", {"size": "XL", **tri})
+    assert validate("triage", {"size": "S", "triageRange": "S", "uncertaintyKind": "none"})
+    assert validate("triage", {"size": "S", **tri, "extra": 1})
+    assert validate("triage", {"size": "M", "rationale": "x"})
+
+
+def test_triage_range_and_uncertainty_schema():
+    props = SCHEMAS["triage"]["properties"]
+    assert {"triageRange", "uncertaintyKind"} <= set(SCHEMAS["triage"]["required"])
+    assert props["triageRange"]["enum"] == ["S", "M", "L", "S-M", "M-L", "S-L"]
+    assert tuple(props["triageRange"]["enum"]) == TRIAGE_RANGES
+    assert props["uncertaintyKind"]["enum"] == ["external", "normative", "untested", "none"]
+    assert tuple(props["uncertaintyKind"]["enum"]) == UNCERTAINTY_KINDS
+    base = {"size": "M", "rationale": "x", "triageRange": "S-M", "uncertaintyKind": "external"}
+    assert validate("triage", base) == []
+    assert validate("triage", {**base, "triageRange": "S\u2013M"})
+    assert validate("triage", {**base, "uncertaintyKind": "unknown"})
     ok_review = {
         "verdict": "request_changes",
         "findings": [{"severity": "major", "path": "a.py", "issue": "i", "fix": "f"}],

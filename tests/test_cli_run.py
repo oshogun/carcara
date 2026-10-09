@@ -572,6 +572,11 @@ STATUS_KEYS = {
     "unverified",
     "probe_results",
     "extent",
+    "triage_range",
+    "uncertainty_kind",
+    "issue",
+    "card_estimate",
+    "urutau",
 }
 
 
@@ -926,3 +931,68 @@ def test_unrestricted_bash_flag_warns_and_reaches_stages(repo, fake, monkeypatch
     assert seen == [False, True]
     flagged = [r for r in RunStore(repo).list_runs() if "warning" in _events(repo, r)]
     assert len(flagged) == 1
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "git@github.com:octo/repo.git",
+        "git@github.com:octo/repo",
+        "https://github.com/octo/repo.git",
+        "https://github.com/octo/repo",
+    ],
+)
+def test_origin_repo_parses_github_remotes(repo, url):
+    subprocess.run(["git", "remote", "add", "origin", url], cwd=repo, check=True)
+    assert cli._origin_repo(str(repo)) == "octo/repo"
+
+
+def test_origin_repo_unknown_remote(repo):
+    with pytest.raises(cli.IssueError, match="pass --repo owner/name"):
+        cli._origin_repo(str(repo))
+
+
+@pytest.fixture
+def no_token(tmp_path, monkeypatch):
+    monkeypatch.delenv("URUTAU_MCP_TOKEN", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+
+
+@pytest.mark.parametrize("no_urutau", [False, True])
+def test_issue_builds_task_without_urutau(repo, fake, monkeypatch, no_token, no_urutau):
+    calls = []
+
+    def gh(repo_name, n):
+        calls.append((repo_name, n))
+        return "Fix the thing", "It is broken."
+
+    monkeypatch.setattr(cli, "_gh_issue", gh)
+    if no_urutau:
+        monkeypatch.setenv("URUTAU_MCP_TOKEN", "tok-SECRET-123")
+    fake({"implement": [IMPL], "test": [TEST_OK]})
+    args = ["also add a test", "--issue", "7", "--repo", "octo/repo", "--size", "S"]
+    assert run(repo, *args, *(["--no-urutau"] if no_urutau else [])) == 0
+    assert calls == [("octo/repo", 7)]
+    (run_id,) = RunStore(repo).list_runs()
+    state = _state(repo, run_id)
+    assert state["task"] == (
+        "GitHub issue #7: Fix the thing\n\nIt is broken.\n\n"
+        "Additional instructions:\nalso add a test"
+    )
+    assert state["issue"] == 7
+    assert state["urutau"]["enabled"] is False and state["urutau"]["repo"] == "octo/repo"
+
+
+def test_issue_flag_errors(repo, fake, capsys):
+    assert run(repo, "x", "--repo", "octo/repo") == 1
+    assert "--repo requires --issue" in capsys.readouterr().err
+    assert run(repo, "--resume", "r1", "--issue", "3") == 1
+    assert "--issue cannot be combined with --resume" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        run(repo, "--issue", "0")
+
+
+def test_dry_run_issue_shows_urutau_state(repo, monkeypatch, no_token, capsys):
+    monkeypatch.setattr(cli, "_gh_issue", lambda *a: pytest.fail("gh called in dry-run"))
+    assert run(repo, "--dry-run", "--issue", "5", "--repo", "octo/repo") == 0
+    assert "issue #5 (octo/repo); Urutau reporting: off" in capsys.readouterr().out

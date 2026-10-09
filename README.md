@@ -371,6 +371,72 @@ Known risks:
 - `setting_sources` is empty by default, so project settings and CLAUDE.md are
   not loaded into stages; pass `--project-settings` to opt in.
 
+## Urutau integration
+
+`carcara run --issue N [--repo owner/name]` takes the task from GitHub issue N
+(`gh issue view N -R owner/name --json title,body`; the repo defaults to the
+git `origin` remote). Any task text you pass as well is appended as additional
+instructions. An `--issue` run always triages (`--size` still forces a size)
+and, when Urutau reporting is on, reports its lifecycle to
+Urutau through the `record_run` MCP tool.
+
+Reporting is on only when `--issue` is given **and** a token is available.
+`--no-urutau` turns it off for one invocation. Without it, carcara behaves
+exactly as it does without `--issue`. The report and `carcara status` (and
+`--json`) show whether reporting was on and the last `record_run` outcome
+(claim held, open unverified items by kind).
+
+Configuration (environment variables win over the file):
+
+| Setting | Env var | `~/.config/carcara/urutau.json` key |
+|---|---|---|
+| Urutau base URL (default `http://127.0.0.1:8787`) | `URUTAU_URL` | `url` |
+| MCP token | `URUTAU_MCP_TOKEN` | `token` |
+
+The file lives under `$XDG_CONFIG_HOME/carcara/` when that is set; keep it out
+of any repo. To get a token, open Urutau's **Users** page → **Agent
+integrations**. The token is sent only in the `Authorization: Bearer` header to
+exactly `<base>/mcp`: redirects are not followed with it, and any request to
+another path, host or scheme is refused. Each call opens its own short-lived
+MCP session. The token is never logged, never written to `state.json`, the report or
+the events, and never passed to agent stages (`URUTAU_MCP_TOKEN` and
+`URUTAU_URL` are removed from their environment).
+
+What is sent: the repo, issue, carcara run id and status; triage range
+(`S`, `M`, `L`, `S-M`, `M-L`, `S-L`) and main uncertainty kind (`external`,
+`normative`, `untested`, `none`; both omitted when `--size` forced the size);
+fix rounds; cost; changed paths that pass Urutau's path rules (at most 200)
+plus a count of the omitted ones; top-level areas; `observedBy:
+carcara/extent-1`; and merge SHAs when known. At pauses and at the end it also
+sends the unverified items, withdrawals of items that were reworded or are no
+longer listed, confirmed probes and findings (`plan_only` runs send the plan's
+goal, steps and acceptance criteria as findings, at most 4000 characters). Code, prompts, diffs and the token are never sent. The card's
+estimate (size, confidence) is read with `get_board` at start and stored in
+the run state for comparison.
+
+Claim lifecycle:
+
+- Start: `running` claims the issue's card with a 30-minute lease. If another
+  run holds the claim, the run stops before doing any work. Setup errors (no
+  board for the repo, repo not allowed, bad token, Urutau unreachable) also
+  fail fast with a message saying what to do.
+- While stages run, a heartbeat re-sends `running` every 10 minutes to renew
+  the lease. A crashed run stops renewing, and its claim expires 30 minutes
+  later.
+- Pauses (`awaiting_approval`, `needs_human`, `budget_exceeded`) hold the claim
+  with no lease, until a person releases it from the card. An interactive gate
+  sends `awaiting_approval` before it asks (heartbeats pause while it waits)
+  and `running` again once the run goes on.
+- `--resume` re-sends `running`. If another run has claimed the card since,
+  the resume stops before doing any work. Resuming a run whose end Urutau
+  already recorded (for example a `failed` run) starts a new Urutau run with
+  the id `<run id>-r2` (then `-r3`, ...), since an ended Urutau run never
+  changes.
+- The end (`done`, `failed`, `rejected`, `plan_only`) releases the claim.
+
+Errors on heartbeats, pauses or the final call only add a warning event: the
+run's own result and exit code are never lost because Urutau is down.
+
 ## Profiles
 
 | Role | economy | balanced | quality |

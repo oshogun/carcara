@@ -1,0 +1,22 @@
+{
+  "repo": "acme/widgets",
+  "issue": 7,
+  "runId": "c-20261008-0001",
+  "status": "done",
+  "created": false,
+  "statusChanged": true,
+  "claim": {
+    "held": false,
+    "leaseUntil": null
+  },
+  "unverifiedOpen": {
+    "external": 0,
+    "normative": 1,
+    "untested": 0
+  },
+  "probesApplied": 1,
+  "probesSkipped": 0,
+  "withdrawnApplied": 1,
+  "withdrawnSkipped": 0,
+  "notified": true
+}

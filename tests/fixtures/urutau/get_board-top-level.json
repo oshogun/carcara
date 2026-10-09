@@ -1,0 +1,8 @@
+{
+  "humanWaitLimit": 24,
+  "waitingOnHuman": [
+    { "issue": 3, "runId": "c-20261006-0002", "status": "needs_human", "since": "2026-10-07T06:00:00.000Z", "overLimit": true },
+    { "issue": 7, "runId": "c-20261008-0001", "status": "awaiting_approval", "since": "2026-10-08T12:05:00.000Z", "overLimit": false }
+  ],
+  "_comment": "Top-level get_board fields only (they sit after bucketsOmitted, before buckets), for an answer built at 2026-10-08T14:00:00.000Z. The _comment key is not part of the answer."
+}

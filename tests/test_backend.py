@@ -6,6 +6,7 @@ import pytest
 from claude_agent_sdk import CLINotFoundError, ResultError, ResultMessage
 
 from carcara.backend import (
+    URUTAU_ENV_VARS,
     BackendError,
     BackendUnavailable,
     FakeBackend,
@@ -133,7 +134,14 @@ def test_reviewer_option_mapping_and_hook_denies_edit(monkeypatch):
 
 
 def test_main_model_request_has_no_tools(monkeypatch):
-    calls = install_query(monkeypatch, [result_message({"size": "S", "rationale": "tiny"})])
+    calls = install_query(
+        monkeypatch,
+        [
+            result_message(
+                {"size": "S", "rationale": "tiny", "triageRange": "S", "uncertaintyKind": "none"}
+            )
+        ],
+    )
     req = build_request("triage", None, PROFILE, "triage this", CWD, max_turns=2)
     assert req.role is None and req.model == "opus"
     assert req.allowed_tools == [STRUCTURED_OUTPUT_TOOL]
@@ -315,6 +323,25 @@ def test_sdk_backend_use_api_key_passes_keys_through(monkeypatch):
     seen = install_env_capturing_query(monkeypatch)
     run(SdkBackend(use_api_key=True), impl_request())
     assert seen == [{"ANTHROPIC_API_KEY": "sk-test", "ANTHROPIC_AUTH_TOKEN": "tok-test"}]
+
+
+@pytest.mark.parametrize("use_api_key", [False, True])
+def test_sdk_backend_hides_urutau_env_and_restores(monkeypatch, use_api_key):
+    monkeypatch.setenv("URUTAU_MCP_TOKEN", "tok-SECRET-123")
+    monkeypatch.setenv("URUTAU_URL", "http://127.0.0.1:8787")
+    seen = []
+
+    async def fake_query(*, prompt, options=None, transport=None):
+        seen.append({k: os.environ.get(k) for k in URUTAU_ENV_VARS})
+        yield result_message(IMPLEMENT_OK)
+
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+    req = impl_request()
+    run(SdkBackend(use_api_key=use_api_key), req)
+    assert seen == [{"URUTAU_MCP_TOKEN": None, "URUTAU_URL": None}]
+    assert not set(URUTAU_ENV_VARS) & set(req.env)
+    assert os.environ["URUTAU_MCP_TOKEN"] == "tok-SECRET-123"
+    assert os.environ["URUTAU_URL"] == "http://127.0.0.1:8787"
 
 
 @pytest.mark.parametrize("flag", [False, True])

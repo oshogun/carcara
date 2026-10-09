@@ -22,7 +22,7 @@ from carcara.runstore import RunStore
 
 PROFILE = load_profile("balanced")
 
-TRIAGE_S = {"size": "S", "rationale": "small"}
+TRIAGE_S = {"size": "S", "rationale": "small", "triageRange": "S", "uncertaintyKind": "none"}
 EXPLORE = {"summary": "found", "findings": [{"path": "a.py", "line": 1, "fact": "x"}]}
 PLAN = {
     "goal": "g",
@@ -218,7 +218,14 @@ def test_large_without_user_facing_change_skips_docs(repo):
     orch, backend, _ = make(
         repo,
         {
-            "triage": [{"size": "L", "rationale": "big"}],
+            "triage": [
+                {
+                    "size": "L",
+                    "rationale": "big",
+                    "triageRange": "M-L",
+                    "uncertaintyKind": "untested",
+                }
+            ],
             "explore": [EXPLORE],
             "plan": [PLAN],
             "implement": [impl(), impl()],

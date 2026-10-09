@@ -275,6 +275,21 @@ class RunStore:
             "stages": [],
             "failed_attempts": [],
             "totals": _empty_totals(),
+            "triage_range": None,
+            "uncertainty_kind": None,
+            "issue": None,
+            "card_estimate": None,
+            "plan_rejected": False,
+            # Urutau record_run reporting; ``last`` becomes
+            # {status, ok, code, claim_held, unverified_open, at}. Runs written
+            # before this key existed read it with .get() (missing = disabled).
+            "urutau": {
+                "enabled": False,
+                "repo": None,
+                "issue": None,
+                "sent_items": {},
+                "last": None,
+            },
             "created_at": _now(),
             "updated_at": _now(),
         }

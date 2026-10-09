@@ -21,7 +21,13 @@ def render_plan(plan: dict[str, Any]) -> str:
 
 
 class TtyGate:
-    """Interactive gate; streams default to ``sys.stdin``/``sys.stdout`` at call time."""
+    """Interactive gate; streams default to ``sys.stdin``/``sys.stdout`` at call time.
+
+    ``interactive``: the orchestrator calls it in a worker thread, so the event
+    loop (and Urutau reporting) keeps running while it waits for an answer.
+    """
+
+    interactive = True
 
     def __init__(self, stdin: TextIO | None = None, stdout: TextIO | None = None) -> None:
         self._stdin = stdin
@@ -56,6 +62,8 @@ class TtyGate:
 
 class NonInteractiveGate:
     """No TTY and no ``--yes``: defer plan approval, never continue past failures."""
+
+    interactive = False
 
     def approve_plan(self, plan: dict[str, Any]) -> str:
         return "defer"

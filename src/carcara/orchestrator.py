@@ -21,11 +21,15 @@ iterations (implementer with only the failing items -> test -> review), then
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
@@ -47,8 +51,17 @@ from carcara.project_config import (
     parse_project_config,
 )
 from carcara.roles import Role, get_role
-from carcara.runstore import Run, RunBusy, RunStore
+from carcara.runstore import Run, RunBusy, RunStore, _now
 from carcara.schemas import MAX_UNVERIFIED, UNVERIFIED_KINDS
+from carcara.urutau import (
+    ClaimConflict,
+    UrutauClient,
+    UrutauError,
+    build_inventory,
+    filter_areas,
+    filter_files,
+    urutau_status,
+)
 
 EXIT_CODES = {
     "done": 0,
@@ -77,6 +90,13 @@ DIFF_CAP = 20_000
 # Version of the rule that derives state['extent'] from the stage outputs.
 EXTENT_RULE_VERSION = "carcara/extent-1"
 MAX_EXTENT_AREAS = 10
+# Urutau record_run heartbeat while stages run (the claim's lease is 30 minutes).
+URUTAU_HEARTBEAT_SECONDS = 600.0
+MAX_FINDINGS_CHARS = 4000
+# record_run statuses that end the Urutau run; a resume after one needs a new runId.
+_URUTAU_TERMINAL = ("done", "failed", "rejected", "plan_only")
+_URUTAU_RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_COMMIT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 # Path-specific questions the reviewer must answer in `unverified` when changed
 # files match both the project's verifiability_paths and the row's patterns.
@@ -118,6 +138,9 @@ class OrchestratorError(Exception):
 
 
 class Gate(Protocol):
+    # Optional ``interactive`` attribute: True runs the question off the event
+    # loop and reports awaiting_approval to Urutau while a person answers.
+
     def approve_plan(self, plan: dict[str, Any]) -> str:
         """Return ``"approve"``, ``"reject"`` or ``"defer"``."""
         ...
@@ -129,6 +152,8 @@ class Gate(Protocol):
 
 class AutoGate:
     """Non-interactive gate for tests and ``--yes``; records its calls."""
+
+    interactive = False
 
     def __init__(
         self, approve: bool = True, *, decision: str | None = None, continue_: bool = False
@@ -160,6 +185,9 @@ class RunOptions:
     # Not persisted: a resume gets the Bash deny-list back unless the flag is given again.
     unrestricted_bash: bool = False
     max_turns: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_MAX_TURNS))
+    # GitHub issue the task came from (``--issue``) and its ``owner/name`` repo.
+    issue: int | None = None
+    repo: str | None = None
 
 
 @dataclass
@@ -377,6 +405,7 @@ class Orchestrator:
         gate: Gate,
         options: RunOptions | None = None,
         on_start: Callable[[str, bool], None] | None = None,
+        urutau: UrutauClient | None = None,
     ) -> None:
         self.backend = backend
         self.profile = profile
@@ -398,6 +427,10 @@ class Orchestrator:
             self.config = ProjectConfig()
         # urlopen-compatible callable for probes; None uses urllib (tests inject a fake).
         self.probe_opener: Callable[..., Any] | None = None
+        # record_run reporting for --issue runs; None keeps carcara offline.
+        self.urutau = urutau
+        self.heartbeat_interval = URUTAU_HEARTBEAT_SECONDS
+        self._beats_paused = False
 
     # -- public entry points -------------------------------------------------
 
@@ -438,6 +471,11 @@ class Orchestrator:
             run.state["max_budget_usd"] = self.options.max_budget_usd
             # Snapshot: a resume uses this, not a re-read of .carcara/config.json.
             run.state["project_config"] = self.config.to_dict()
+            self._record_issue(run)
+            if self.urutau is not None:
+                stopped = await self._urutau_start(run)
+                if stopped is not None:
+                    return stopped
             try:
                 self._pin_base(run, snapshot=self.options.allow_dirty)
             except OrchestratorError as exc:
@@ -485,21 +523,38 @@ class Orchestrator:
             else:
                 run.state["max_budget_usd"] = self.options.max_budget_usd
                 run.save()
+            if run.state.get("plan_rejected"):
+                # A rejection belongs to the attempt that ended; this one may fail otherwise.
+                run.state["plan_rejected"] = False
+                run.save()
+            if (run.state.get("urutau") or {}).get("enabled"):
+                if self.urutau is None:
+                    run.event(
+                        "warning",
+                        source="urutau",
+                        message="Urutau reporting is off for this resume (no token or --no-urutau)",
+                    )
+                else:
+                    stopped = await self._urutau_start(run)
+                    if stopped is not None:
+                        return stopped
             if reject and not feedback:
                 run.event("plan_rejected")
                 if (run.state.get("gate") or {}).get("stage") == "post-implement":
-                    return self._finish(
+                    return await self._finish(
                         run,
                         "failed",
                         "changes rejected by user; they remain in the working tree "
                         f"(see carcara diff {run.id})",
                     )
-                return self._finish(run, "failed", "plan rejected by user")
+                run.state["plan_rejected"] = True
+                run.save()
+                return await self._finish(run, "failed", "plan rejected by user")
             if accept_failures:
                 run.state["accepted_failures"] = True
                 run.save()
                 run.event("failures_accepted")
-                return self._finish(run, "done", "unresolved failures accepted by user")
+                return await self._finish(run, "done", "unresolved failures accepted by user")
             if status == "awaiting_approval" and not any(
                 e["stage"] == "implement" for e in run.state["stages"]
             ):
@@ -597,25 +652,254 @@ class Orchestrator:
 
     # -- driver --------------------------------------------------------------
 
-    def _finish(self, run: Run, status: str, message: str | None) -> RunOutcome:
+    async def _finish(self, run: Run, status: str, message: str | None) -> RunOutcome:
         if any(e["stage"] == "implement" for e in run.state["stages"]):
             self._changed_paths(run)
         extent = _extent(run)
         if extent is not None:
             run.state["extent"] = extent
         run.set_status(status, message)
-        report = self._report(run)
-        run.write_report(report)
+        try:
+            await self._report_urutau(run, status)
+        finally:
+            # Even a real cancel during the terminal send leaves a report behind.
+            report = self._report(run)
+            run.write_report(report)
         return RunOutcome(status, EXIT_CODES[status], report, run.id)
 
     async def _drive(self, run: Run) -> RunOutcome:
         self.run_state = run
         run.set_status("running")
+        heartbeat = self._start_heartbeat(run)
         try:
             status, message = await self._pipeline(run)
         except _Stop as stop:
             status, message = stop.status, stop.message
-        return self._finish(run, status, message)
+        finally:
+            await self._stop_heartbeat(heartbeat)
+        return await self._finish(run, status, message)
+
+    # -- urutau --------------------------------------------------------------
+
+    def _record_issue(self, run: Run) -> None:
+        """Store the --issue number/repo and whether Urutau reporting is on."""
+        client = self.urutau
+        issue = client.issue if client is not None else self.options.issue
+        repo = client.repo if client is not None else self.options.repo
+        if issue is None and client is None:
+            return
+        run.state["issue"] = issue
+        urutau = run.state.setdefault("urutau", {})
+        urutau.update({"enabled": client is not None, "repo": repo, "issue": issue})
+        urutau.setdefault("run_id", run.id)
+        urutau.setdefault("sent_items", {})
+        urutau.setdefault("last", None)
+        run.save()
+
+    def _new_urutau_run(self, run: Run) -> None:
+        """Start a new Urutau run (``<run.id>-rN``): the previous one has ended."""
+        urutau = run.state.setdefault("urutau", {})
+        n = int(urutau.get("rerun") or 1) + 1
+        suffix = f"-r{n}"
+        new_id = re.sub(r"[^A-Za-z0-9._-]", "-", run.id)[: 64 - len(suffix)] + suffix
+        assert _URUTAU_RUN_ID_RE.match(new_id), new_id
+        urutau.update({"rerun": n, "run_id": new_id, "sent_items": {}, "last": None})
+        # Persisted before sending, so a crash never reuses the finished id.
+        run.save()
+        run.event("urutau_run", run_id=new_id)
+
+    async def _urutau_start(self, run: Run) -> RunOutcome | None:
+        """Claim the card (record_run running) before any work.
+
+        A resume after a terminal status Urutau accepted gets a new Urutau
+        runId: an ended run never changes. Returns the stopped run's outcome
+        when Urutau refuses, else None.
+        """
+        assert self.urutau is not None
+        urutau = run.state.setdefault("urutau", {})
+        urutau.setdefault("run_id", run.id)
+        last = urutau.get("last") or {}
+        if last.get("ok") and last.get("status") in _URUTAU_TERMINAL:
+            self._new_urutau_run(run)
+        if run.state.get("card_estimate") is None and not run.state["stages"]:
+            try:
+                run.state["card_estimate"] = await self.urutau.get_estimate()
+            except Exception as exc:  # noqa: BLE001 - the estimate is informative only
+                run.event("warning", source="urutau", code=_err_code(exc), message=_err_msg(exc))
+            run.save()
+        try:
+            try:
+                await self._urutau_send(run, "running", inventory=False, fatal=True)
+            except UrutauError as exc:
+                # The id ended (an unconfirmed terminal call landed) or is taken: one new id.
+                if exc.code not in ("run-finished", "run-id-taken"):
+                    raise
+                self._new_urutau_run(run)
+                await self._urutau_send(run, "running", inventory=False, fatal=True)
+        except ClaimConflict:
+            message = (
+                f"Issue #{self.urutau.issue} is claimed by another run in Urutau; stopped "
+                "before doing any work. A person can release the claim from the card."
+            )
+        except Exception as exc:  # noqa: BLE001 - any failure to claim stops the run
+            message = f"Urutau {_err_code(exc)}: {_err_msg(exc)}; stopped before doing any work"
+        else:
+            return None
+        run.set_status("failed", message)
+        report = self._report(run)
+        run.write_report(report)
+        return RunOutcome("failed", EXIT_CODES["failed"], report, run.id)
+
+    def _urutau_payload(self, run: Run, status: str, *, inventory: bool) -> dict[str, Any]:
+        """A §18 record_run input: only known keys, never empty lists."""
+        assert self.urutau is not None
+        state = run.state
+        payload: dict[str, Any] = {
+            "repo": self.urutau.repo,
+            "issue": self.urutau.issue,
+            "runId": (state.get("urutau") or {}).get("run_id") or run.id,
+            "status": status,
+            "observedBy": EXTENT_RULE_VERSION,
+        }
+        if state.get("triage_range") is not None:
+            payload["triageRange"] = state["triage_range"]
+        if state.get("uncertainty_kind") is not None:
+            payload["uncertaintyKind"] = state["uncertainty_kind"]
+        extent = state.get("extent") or (
+            _extent(run) if state.get("changed_paths") is not None else None
+        )
+        if extent is not None:
+            payload["fixRounds"] = int(extent["fix_rounds"])
+            areas = filter_areas(extent.get("areas"))
+            if areas:
+                payload["areas"] = areas
+        payload["costUsd"] = round(float(state["totals"]["cost_usd"]), 6)
+        paths = state.get("changed_paths") or []
+        if paths:
+            files, omitted = filter_files(paths)
+            if files:
+                payload["files"] = files
+            payload["filesOmitted"] = omitted
+        shas = state.get("merge_shas") or []
+        if shas and all(isinstance(s, str) and _COMMIT_SHA_RE.match(s) for s in shas):
+            payload["mergeShas"] = list(shas)[:20]
+        findings: list[str] = []
+        if status == "plan_only":
+            plan = next(
+                (e["output"] for e in reversed(state["stages"]) if e["stage"] == "plan"), None
+            )
+            if plan:
+                findings.extend(_plan_findings(plan))
+        if inventory:
+            unverified, withdrawn, probes, notes, _ = build_inventory(state)
+            if unverified:
+                payload["unverified"] = unverified
+            if withdrawn:
+                payload["withdrawn"] = withdrawn
+            if probes:
+                payload["probes"] = probes
+            findings.extend(notes)
+        text = "\n".join(findings).strip()[:MAX_FINDINGS_CHARS]
+        if text:
+            payload["findings"] = text
+        return payload
+
+    async def _urutau_send(self, run: Run, status: str, *, inventory: bool, fatal: bool) -> None:
+        """record_run; a non-fatal failure only adds a warning event."""
+        if self.urutau is None:
+            return
+        urutau = run.state.setdefault("urutau", {})
+        try:
+            try:
+                payload = self._urutau_payload(run, status, inventory=inventory)
+                new_sent = build_inventory(run.state)[4] if inventory else None
+                result = await self.urutau.record_run(payload)
+            except asyncio.CancelledError:
+                # A stray cancel (not one aimed at this task) must not lose the run outcome.
+                if _really_cancelled():
+                    raise
+                raise UrutauError("cancelled", "record_run was cancelled") from None
+        except Exception as exc:
+            if fatal:
+                raise
+            run.event("warning", source="urutau", code=_err_code(exc), message=_err_msg(exc))
+            urutau["last"] = {
+                "status": status,
+                "ok": False,
+                "code": _err_code(exc),
+                "claim_held": (urutau.get("last") or {}).get("claim_held"),
+                "unverified_open": (urutau.get("last") or {}).get("unverified_open"),
+                "at": _now(),
+            }
+            run.save()
+            return
+        urutau["last"] = {
+            "status": status,
+            "ok": True,
+            "code": result.code,
+            "claim_held": result.claim_held,
+            "unverified_open": result.unverified_open,
+            "at": _now(),
+        }
+        if new_sent is not None:
+            urutau["sent_items"] = new_sent
+        run.save()
+
+    async def _report_urutau(self, run: Run, status: str) -> None:
+        """Pause/terminal record_run with the inventory; never changes the outcome."""
+        if self.urutau is None or not (run.state.get("urutau") or {}).get("enabled"):
+            return
+        await self._urutau_send(run, urutau_status(status, run.state), inventory=True, fatal=False)
+
+    def _start_heartbeat(self, run: Run) -> tuple[asyncio.Task[None], list[bool]] | None:
+        if self.urutau is None or not (run.state.get("urutau") or {}).get("enabled"):
+            return None
+        stopped = [False]
+        self._beats_paused = False
+
+        async def beat() -> None:
+            # The flag ends the loop even if a cancel is swallowed mid-call.
+            while not stopped[0]:
+                await asyncio.sleep(self.heartbeat_interval)
+                if stopped[0]:
+                    break
+                if self._beats_paused:
+                    continue  # a person is at the gate: running would undo awaiting_approval
+                await self._urutau_send(run, "running", inventory=False, fatal=False)
+
+        return asyncio.ensure_future(beat()), stopped
+
+    @staticmethod
+    async def _stop_heartbeat(heartbeat: tuple[asyncio.Task[None], list[bool]] | None) -> None:
+        """Stop the heartbeat; never raises, so the run's outcome is always recorded."""
+        if heartbeat is None:
+            return
+        task, stopped = heartbeat
+        stopped[0] = True
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+    async def _ask_human(
+        self, run: Run, ask: Callable[[], Any], proceeds: Callable[[Any], bool]
+    ) -> Any:
+        """Run a gate question; an interactive one runs off the event loop.
+
+        With Urutau reporting on, the card shows awaiting_approval (a claim
+        with no lease) while a person answers, and running again if they let
+        the run go on.
+        """
+        if not getattr(self.gate, "interactive", False):
+            return ask()
+        reporting = self.urutau is not None and (run.state.get("urutau") or {}).get("enabled")
+        if reporting:
+            self._beats_paused = True
+            await self._urutau_send(run, "awaiting_approval", inventory=False, fatal=False)
+        answer = await _in_daemon_thread(ask)
+        if reporting and proceeds(answer):
+            await self._urutau_send(run, "running", inventory=False, fatal=False)
+            self._beats_paused = False
+        return answer
 
     def _role(self, name: str) -> Role:
         if name not in self._roles:
@@ -818,10 +1102,27 @@ class Orchestrator:
                 lambda: (
                     f"Task: {task}\n\nClassify the task size for the SDLC pipeline: "
                     "S = small/local change, M = multi-file change needing a short plan, "
-                    "L = large/cross-cutting change needing an architect plan."
+                    "L = large/cross-cutting change needing an architect plan.\n\n"
+                    "Also give triageRange, a size range that brackets the uncertainty "
+                    "(one of S, M, L, S-M, M-L, S-L; a single size when you are sure), and "
+                    "uncertaintyKind, the main source of that uncertainty:\n"
+                    "external = depends on a third-party/API behaviour;\n"
+                    "normative = depends on a product/people decision;\n"
+                    "untested = depends on code behaviour nobody has exercised;\n"
+                    "none = no significant uncertainty."
                 ),
             )
             size = triage["size"]
+            if run.state.get("triage_range") is None and triage.get("triageRange"):
+                run.state["triage_range"] = triage.get("triageRange")
+                run.state["uncertainty_kind"] = triage.get("uncertaintyKind")
+                run.save()
+                run.event(
+                    "triage",
+                    size=size,
+                    triage_range=run.state["triage_range"],
+                    uncertainty_kind=run.state["uncertainty_kind"],
+                )
         if run.state.get("size") != size:
             run.state["size"] = size
             run.save()
@@ -874,7 +1175,9 @@ class Orchestrator:
                 else None
             )
             if trigger:
-                self._gate(run, plan, trigger, plan_paths if trigger == "verifiability" else ())
+                await self._gate(
+                    run, plan, trigger, plan_paths if trigger == "verifiability" else ()
+                )
             steps = plan["steps"] if size == "L" else []
             if steps:
                 seen: set[str] = set()
@@ -906,7 +1209,7 @@ class Orchestrator:
                     )
                 )
 
-        self._post_implement_gate(run)
+        await self._post_implement_gate(run)
         message, fixes = await self._verify(run, task, review_on)
         implements.extend(fixes)
 
@@ -971,7 +1274,7 @@ class Orchestrator:
 
         return build
 
-    def _gate(
+    async def _gate(
         self,
         run: Run,
         plan: dict[str, Any],
@@ -990,7 +1293,11 @@ class Orchestrator:
             "flag": "--approve-plan",
             "revision": "revised plan",
         }.get(trigger) or "low-verifiability paths: " + ", ".join(paths)
-        decision = self.gate.approve_plan({**plan, "gate_reason": reason})
+        decision = await self._ask_human(
+            run,
+            lambda: self.gate.approve_plan({**plan, "gate_reason": reason}),
+            lambda d: d == "approve",
+        )
         run.event("gate", decision=decision, trigger=trigger)
         if decision == "approve":
             run.state["plan_approved"] = True
@@ -1006,9 +1313,11 @@ class Orchestrator:
                 "failed",
                 f"changes rejected; they remain in the working tree (see carcara diff {run.id})",
             )
+        run.state["plan_rejected"] = True
+        run.save()
         raise _Stop("failed", "plan rejected")
 
-    def _post_implement_gate(self, run: Run) -> None:
+    async def _post_implement_gate(self, run: Run) -> None:
         """Gate before TEST when ungated implement changes touch low-verifiability paths."""
         if run.state.get("plan_approved"):
             return
@@ -1032,7 +1341,7 @@ class Orchestrator:
                 "rejecting does not revert the working tree."
             ],
         }
-        self._gate(run, plan, "verifiability", changed, stage="post-implement")
+        await self._gate(run, plan, "verifiability", changed, stage="post-implement")
 
     def _inventory_prompt(self, run: Run) -> str:
         """Reviewer instructions for the `unverified` assumptions inventory."""
@@ -1220,7 +1529,7 @@ class Orchestrator:
             return None, fixes
         summary = f"still failing after {MAX_FIX_ITERATIONS} fix iterations: {_dumps(failing)}"
         run.event("fix_loop_exhausted", failing=failing)
-        if self.gate.ask_continue(summary):
+        if await self._ask_human(run, lambda: self.gate.ask_continue(summary), bool):
             run.state["accepted_failures"] = failing
             run.save()
             return "continued despite unresolved failures (user accepted)", fixes
@@ -1307,12 +1616,111 @@ class Orchestrator:
                 res = probes.get(item["id"])
                 probe = f" (probe: {res['outcome']} {res['result']})" if res else ""
                 lines.append(f"  - {item['id']} [{item['kind']}] {item['text']}{probe}")
+        if state.get("triage_range") is not None or state.get("uncertainty_kind") is not None:
+            lines.append(
+                f"Triage range: {state.get('triage_range') or '?'}; "
+                f"uncertainty: {state.get('uncertainty_kind') or '?'}"
+            )
+        elif state.get("issue") is not None or (state.get("urutau") or {}).get("enabled"):
+            lines.append("Triage range: n/a (size forced)")
+        lines.extend(_urutau_report_lines(state))
         if state.get("accepted_failures"):
             lines.append("accepted failures: yes (unresolved failures accepted by user)")
         if state.get("message"):
             note = state["message"]
             lines.append(f"note: {note if len(note) <= 300 else note[:297] + '...'}")
         return "\n".join(lines) + "\n"
+
+
+def _plan_findings(plan: dict[str, Any]) -> list[str]:
+    """plan_only findings: the plan's goal, steps (id + change) and acceptance criteria."""
+    lines = [f"Plan: {plan['goal']}"] if plan.get("goal") else []
+    steps = [s for s in plan.get("steps") or [] if isinstance(s, dict)]
+    if steps:
+        lines.append("Steps:")
+        lines.extend(f"- {s.get('id', i)}: {s.get('change', '')}" for i, s in enumerate(steps, 1))
+    acceptance = plan.get("acceptance") or []
+    if acceptance:
+        lines.append("Acceptance:")
+        lines.extend(f"- {item}" for item in acceptance)
+    return lines
+
+
+async def _in_daemon_thread(fn: Callable[[], Any]) -> Any:
+    """``fn()`` in a daemon thread, keeping the event loop free.
+
+    Not ``asyncio.to_thread``: on Ctrl-C a prompt blocked in readline() would
+    keep ``asyncio.run`` waiting for the default executor to shut down.
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[Any] = loop.create_future()
+
+    def settle(ok: bool, value: Any) -> None:
+        if not future.done():
+            future.set_result(value) if ok else future.set_exception(value)
+
+    def work() -> None:
+        try:
+            outcome: tuple[bool, Any] = (True, fn())
+        except BaseException as exc:  # noqa: BLE001 - handed to the awaiting task
+            outcome = (False, exc)
+        with contextlib.suppress(RuntimeError):  # the loop closed meanwhile
+            loop.call_soon_threadsafe(settle, *outcome)
+
+    threading.Thread(target=work, name="carcara-gate", daemon=True).start()
+    return await future
+
+
+def _really_cancelled() -> bool:
+    """Whether the current task was asked to cancel (vs a stray CancelledError).
+
+    Python 3.10 cannot tell them apart; treat every cancel as real there.
+    """
+    task = asyncio.current_task()
+    cancelling = getattr(task, "cancelling", None)
+    return cancelling is None or cancelling() > 0
+
+
+def _err_code(exc: BaseException) -> str:
+    return exc.code if isinstance(exc, UrutauError) else type(exc).__name__
+
+
+def _err_msg(exc: BaseException) -> str:
+    return exc.message if isinstance(exc, UrutauError) else str(exc)
+
+
+def _urutau_report_lines(state: dict[str, Any]) -> list[str]:
+    """Issue/estimate and Urutau reporting lines for --issue runs (never the token)."""
+    urutau = state.get("urutau") or {}
+    issue = state.get("issue")
+    if issue is None and not urutau.get("enabled"):
+        return []
+    lines = []
+    if issue is not None:
+        est = state.get("card_estimate")
+        estimate = (
+            f"{est.get('size') or '?'} ({est.get('confidence') or '?'})"
+            if isinstance(est, dict)
+            else "none"
+        )
+        repo = f" ({urutau['repo']})" if urutau.get("repo") else ""
+        lines.append(f"Issue: #{issue}{repo}; card estimate: {estimate}")
+    line = f"Urutau reporting: {'on' if urutau.get('enabled') else 'off'}"
+    last = urutau.get("last")
+    if last:
+        outcome = "ok" if last.get("ok") else (last.get("code") or "error")
+        held = last.get("claim_held")
+        line += (
+            f"; last record_run: {last.get('status')} {outcome}; claim held: "
+            f"{'?' if held is None else 'yes' if held else 'no'}"
+        )
+        open_ = last.get("unverified_open")
+        if isinstance(open_, dict):
+            line += "; unverifiedOpen: " + " ".join(
+                f"{k}={open_.get(k, 0)}" for k in ("external", "normative", "untested")
+            )
+    lines.append(line)
+    return lines
 
 
 __all__ = [

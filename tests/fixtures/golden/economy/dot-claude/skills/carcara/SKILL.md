@@ -35,6 +35,11 @@ heredoc (never in shell arguments):
     <the user's request verbatim, plus any clarified details>
     CARCARA_TASK
 
+When the request is a GitHub issue ("work on issue 42"), use
+`carcara run --allow-dirty --issue 42` instead: it takes the task from the
+issue (a heredoc, if given, is appended as extra instructions) and reports
+the run to Urutau when `URUTAU_MCP_TOKEN` is set.
+
 Never add `--yes`, `--accept-failures` or `--use-api-key` yourself. The first
 stderr line is `carcara: run <id> started (profile <name>)`; remember the id.
 Tell the user the run started; keep chatting if they want. You are notified

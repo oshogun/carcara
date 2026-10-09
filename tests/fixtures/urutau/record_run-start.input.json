@@ -1,0 +1,26 @@
+{
+  "repo": "acme/widgets",
+  "issue": 7,
+  "runId": "c-20261008-0001",
+  "status": "running",
+  "triageRange": "M-L",
+  "uncertaintyKind": "external",
+  "observedBy": "carcara/extent-1",
+  "unverified": [
+    {
+      "id": "U1",
+      "kind": "external",
+      "text": "GitHub sends x-ratelimit-reset in epoch seconds on 403 answers too."
+    },
+    {
+      "id": "U2",
+      "kind": "normative",
+      "text": "Closed cards should keep their hand order when reopened."
+    },
+    {
+      "id": "U3",
+      "kind": "untested",
+      "text": "Paging stops at page 10 without a request for page 11."
+    }
+  ]
+}

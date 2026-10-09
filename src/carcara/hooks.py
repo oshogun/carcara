@@ -82,6 +82,9 @@ _RUN_OPTS: dict[str, str | None] = {
     "--size": "size",
     "--resume": "value",
     "--feedback": "stdin",
+    "--issue": "num",
+    "--repo": "value",
+    "--no-urutau": None,
 }
 _STATUS_OPTS: dict[str, str | None] = {"--json": None, "--plan": None}
 _DIFF_OPTS: dict[str, str | None] = {"--stat": None}

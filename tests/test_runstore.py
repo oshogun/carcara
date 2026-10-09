@@ -45,6 +45,16 @@ def test_create_initialises_state_and_gitignore(tmp_path):
         "input_tokens": 0,
         "output_tokens": 0,
     }
+    assert state["triage_range"] is None and state["uncertainty_kind"] is None
+    assert state["issue"] is None and state["card_estimate"] is None
+    assert state["plan_rejected"] is False
+    assert state["urutau"] == {
+        "enabled": False,
+        "repo": None,
+        "issue": None,
+        "sent_items": {},
+        "last": None,
+    }
     (started,) = _events(run)
     assert started["event"] == "run_started"
     assert started["task"] == "do it" and started["base_sha"] == "abc123"

@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -105,6 +106,21 @@ def _add_run_parser(sub: Any) -> None:
         help="cap the SDK's estimated cost (API prices; on a subscription this "
         "counts toward plan usage limits, not billed)",
     )
+    run.add_argument(
+        "--issue",
+        type=_issue_number,
+        default=None,
+        metavar="N",
+        help="take the task from GitHub issue N (TASK, if given, adds instructions) and "
+        "report the run to Urutau when URUTAU_MCP_TOKEN is set",
+    )
+    run.add_argument(
+        "--repo",
+        default=None,
+        metavar="OWNER/NAME",
+        help="with --issue: the issue's repo (default: the git origin remote)",
+    )
+    run.add_argument("--no-urutau", action="store_true", help="do not report this run to Urutau")
     run.add_argument("--resume", metavar="RUN_ID", help="resume a stored run")
     run.add_argument(
         "--reject",
@@ -177,6 +193,96 @@ def _err(msg: str) -> None:
     sys.stderr.write(f"carcara: {msg}\n")
 
 
+class IssueError(Exception):
+    """The GitHub issue or its repo cannot be resolved."""
+
+
+def _issue_number(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        n = 0
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"invalid issue number: {value!r}")
+    return n
+
+
+_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_ORIGIN_RE = re.compile(
+    r"^(?:git@github\.com:|https://github\.com/|ssh://git@github\.com/)"
+    r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
+)
+
+
+def _origin_repo(cwd: str = ".") -> str:
+    """``owner/name`` parsed from ``git remote get-url origin``."""
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["git", "remote", "get-url", "origin"], cwd=cwd, capture_output=True, text=True
+        )
+    except OSError as exc:
+        raise IssueError(f"cannot run git ({exc}); pass --repo owner/name") from exc
+    match = _ORIGIN_RE.match(proc.stdout.strip()) if proc.returncode == 0 else None
+    if match is None:
+        raise IssueError(
+            "cannot tell the GitHub repo from the origin remote; pass --repo owner/name"
+        )
+    return match.group(1)
+
+
+def _gh_issue(repo: str, n: int) -> tuple[str, str]:
+    """(title, body) of GitHub issue ``n`` in ``repo`` via the gh CLI."""
+    import subprocess
+
+    if shutil.which("gh") is None:
+        raise IssueError(
+            "GitHub CLI `gh` not found; install it (https://cli.github.com) and log in"
+        )
+    cmd = ["gh", "issue", "view", str(n), "-R", repo, "--json", "title,body"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        raise IssueError(f"cannot run gh: {exc}") from exc
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or f"exit code {proc.returncode}"
+        raise IssueError(f"cannot read issue #{n} of {repo}: {detail}")
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError as exc:
+        raise IssueError(f"unexpected gh output for issue #{n} of {repo}") from exc
+    return str(data.get("title") or ""), str(data.get("body") or "")
+
+
+def _issue_repo(ns: argparse.Namespace, cwd: str) -> str:
+    if ns.repo:
+        if not _REPO_RE.match(ns.repo):
+            raise IssueError(f"invalid --repo {ns.repo!r}; expected owner/name")
+        return ns.repo
+    return _origin_repo(cwd)
+
+
+def _issue_task(ns: argparse.Namespace, repo: str) -> str:
+    """The task for --issue: the issue title/body, plus TASK (or stdin) as extra instructions."""
+    title, body = _gh_issue(repo, ns.issue)
+    task = f"GitHub issue #{ns.issue}: {title}\n\n{body}".rstrip()
+    extra = sys.stdin.read() if ns.task == "-" else ns.task
+    extra = (extra or "").strip()
+    if extra:
+        task += "\n\nAdditional instructions:\n" + extra
+    return task
+
+
+def _urutau_config(ns: argparse.Namespace) -> Any:
+    """The Urutau config when reporting is on (--issue/resume, a token, no --no-urutau)."""
+    if ns.no_urutau:
+        return None
+    from carcara.urutau import load_config
+
+    return load_config()
+
+
 def _dry_run_stages(size: str, review_small: bool) -> list[tuple[str, str | None]]:
     """(stage, role) rows mirroring the orchestrator's pipelines."""
     if size == "S":
@@ -230,6 +336,13 @@ def _dry_run(profile: Any, ns: argparse.Namespace, cwd: str, origin: str) -> str
     from carcara.roles import get_role
 
     out = [f"carcara run --dry-run (profile {profile.name}, {origin}; no backend calls)"]
+    if ns.issue is not None:
+        try:
+            repo = _issue_repo(ns, cwd)
+        except IssueError:
+            repo = "? (pass --repo owner/name)"
+        on = "on" if _urutau_config(ns) is not None else "off"
+        out.append(f"issue #{ns.issue} ({repo}); Urutau reporting: {on}")
     for size in (ns.size,) if ns.size else SIZES:
         out.append(f"\nsize {size}:")
         rows: list[tuple[str, str | None]] = [] if ns.size else [("triage", None)]
@@ -469,7 +582,24 @@ def _verifiability_lines(state: dict[str, Any]) -> list[str]:
         )
         lines.append(f"unverified: {len(open_items)} open ({counts})")
         lines.extend(f"  - {i['id']} [{i['kind']}] {i['text']}" for i in open_items)
-    return lines
+    return lines + _issue_lines(state)
+
+
+def _issue_lines(state: dict[str, Any]) -> list[str]:
+    """Triage range/uncertainty and the --issue/Urutau lines (never the token)."""
+    from carcara.orchestrator import _urutau_report_lines
+
+    lines = []
+    if state.get("triage_range") is not None or state.get("uncertainty_kind") is not None:
+        lines.append(
+            f"Triage range: {state.get('triage_range') or '?'}; "
+            f"uncertainty: {state.get('uncertainty_kind') or '?'}"
+        )
+    elif (state.get("issue") is not None or (state.get("urutau") or {}).get("enabled")) and (
+        state.get("size") and not any(e.get("stage") == "triage" for e in state.get("stages", []))
+    ):
+        lines.append("Triage range: n/a (size forced)")
+    return lines + _urutau_report_lines(state)
 
 
 def status_main(ns: argparse.Namespace) -> int:
@@ -488,6 +618,7 @@ def status_main(ns: argparse.Namespace) -> int:
     report = run.read_report()
     attempts = state.get("failed_attempts") or []
     uncounted = [a.get("key") for a in attempts if not a.get("counted")]
+    urutau = state.get("urutau") or {}
     if ns.json:
         data = {
             "run_id": run.id,
@@ -508,6 +639,16 @@ def status_main(ns: argparse.Namespace) -> int:
             "unverified": state.get("unverified") or [],
             "probe_results": state.get("probe_results") or {},
             "extent": state.get("extent"),
+            "triage_range": state.get("triage_range"),
+            "uncertainty_kind": state.get("uncertainty_kind"),
+            "issue": state.get("issue"),
+            "card_estimate": state.get("card_estimate"),
+            "urutau": {
+                "enabled": bool(urutau.get("enabled")),
+                "repo": urutau.get("repo"),
+                "issue": urutau.get("issue"),
+                "last": urutau.get("last"),
+            },
         }
         sys.stdout.write(json.dumps(data, indent=2) + "\n")
         return 0
@@ -582,6 +723,18 @@ def _check_resume_flags(ns: argparse.Namespace) -> str | None:
     return None
 
 
+async def _with_client(coro: Any, client: Any) -> Any:
+    """Await ``coro`` and close the Urutau client in the same task (anyio scopes)."""
+    try:
+        return await coro
+    finally:
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception as exc:  # never lose the run's result over a close
+                _err(f"warning: closing the Urutau connection failed ({type(exc).__name__})")
+
+
 def run_main(ns: argparse.Namespace) -> int:
     with _sigterm_as_interrupt():
         return _run_main(ns)
@@ -599,6 +752,7 @@ def _run_main(ns: argparse.Namespace) -> int:
     from carcara.profiles import ProfileError
     from carcara.roles import RoleError
     from carcara.runstore import RunBusy, RunStore, RunStoreError
+    from carcara.urutau import UrutauClient, UrutauError
 
     if os.environ.get(STAGE_ENV_VAR):
         _err("nested carcara run inside a carcara stage is not allowed")
@@ -606,6 +760,12 @@ def _run_main(ns: argparse.Namespace) -> int:
     flag_error = _check_resume_flags(ns)
     if flag_error:
         _err(flag_error)
+        return 1
+    if ns.issue is not None and ns.resume:
+        _err("--issue cannot be combined with --resume (the run keeps its issue)")
+        return 1
+    if ns.repo and ns.issue is None:
+        _err("--repo requires --issue N")
         return 1
     cwd = os.path.abspath(ns.cwd)
     if not os.path.isdir(cwd):
@@ -616,6 +776,8 @@ def _run_main(ns: argparse.Namespace) -> int:
         return 0
 
     orch: Orchestrator | None = None
+    client: UrutauClient | None = None
+    repo: str | None = None
     try:
         if ns.dry_run:
             profile, origin = _select_profile(ns, cwd)
@@ -634,8 +796,19 @@ def _run_main(ns: argparse.Namespace) -> int:
                 return 1
             profile = _resume_profile(state, ns.profile)
             use_api_key = ns.use_api_key or bool(state.get("use_api_key"))
+            stored = state.get("urutau") or {}
+            if stored.get("enabled") and stored.get("repo") and stored.get("issue") is not None:
+                cfg = _urutau_config(ns)
+                if cfg is not None:
+                    client = UrutauClient(cfg, str(stored["repo"]), int(stored["issue"]))
         else:
-            if ns.task == "-":
+            if ns.issue is not None:
+                repo = _issue_repo(ns, cwd)
+                ns.task = _issue_task(ns, repo)
+                cfg = _urutau_config(ns)
+                if cfg is not None:
+                    client = UrutauClient(cfg, repo, ns.issue)
+            elif ns.task == "-":
                 ns.task = sys.stdin.read().strip()
                 if not ns.task:
                     _err("empty task on stdin")
@@ -656,6 +829,8 @@ def _run_main(ns: argparse.Namespace) -> int:
             project_settings=ns.project_settings,
             use_api_key=use_api_key,
             unrestricted_bash=ns.unrestricted_bash,
+            issue=ns.issue,
+            repo=repo,
         )
         if ns.unrestricted_bash:
             _err(
@@ -671,6 +846,7 @@ def _run_main(ns: argparse.Namespace) -> int:
             _make_gate(ns.yes),
             options,
             on_start=lambda run_id, resumed: _announce(run_id, resumed, name),
+            urutau=client,
         )
         coro = (
             orch.resume(
@@ -682,7 +858,7 @@ def _run_main(ns: argparse.Namespace) -> int:
             if ns.resume
             else orch.run(ns.task)
         )
-        outcome = asyncio.run(coro)
+        outcome = asyncio.run(_with_client(coro, client))
     except KeyboardInterrupt:
         run = orch.run_state if orch is not None else None
         if run is not None:
@@ -701,6 +877,8 @@ def _run_main(ns: argparse.Namespace) -> int:
         ProfileError,
         RoleError,
         RunStoreError,
+        UrutauError,
+        IssueError,
         OSError,
         ValueError,
     ) as exc:

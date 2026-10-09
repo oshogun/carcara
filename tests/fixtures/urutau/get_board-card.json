@@ -1,0 +1,35 @@
+{
+  "number": 7,
+  "title": "Crash on save",
+  "state": "open",
+  "labels": [
+    "bug"
+  ],
+  "assignees": [
+    "octocat"
+  ],
+  "milestone": "v1.0",
+  "comments": 3,
+  "updatedAt": "2026-09-30T00:00:00Z",
+  "estimate": {
+    "size": "S",
+    "confidence": "unsure",
+    "by": "ada",
+    "at": "2026-10-07T09:00:00.000Z"
+  },
+  "lastRun": {
+    "status": "awaiting_approval",
+    "triageRange": "M-L",
+    "unverifiedOpen": {
+      "external": 1,
+      "normative": 1,
+      "untested": 0
+    },
+    "runId": "c-20261008-0001"
+  },
+  "claim": {
+    "runId": "c-20261008-0001",
+    "status": "awaiting_approval",
+    "since": "2026-10-08T12:05:00.000Z"
+  }
+}

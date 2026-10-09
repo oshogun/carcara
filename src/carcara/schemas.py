@@ -32,6 +32,9 @@ UNVERIFIED_KINDS = ("external", "normative", "untested")
 MAX_UNVERIFIED = 20
 MAX_UNVERIFIED_TEXT = 200
 
+TRIAGE_RANGES = ("S", "M", "L", "S-M", "M-L", "S-L")
+UNCERTAINTY_KINDS = ("external", "normative", "untested", "none")
+
 _UNVERIFIED: dict[str, Any] = {
     "type": "array",
     "maxItems": MAX_UNVERIFIED,
@@ -53,7 +56,14 @@ _UNVERIFIED: dict[str, Any] = {
 }
 
 SCHEMAS: dict[str, dict[str, Any]] = {
-    "triage": _obj({"size": {"type": "string", "enum": ["S", "M", "L"]}, "rationale": _STR}),
+    "triage": _obj(
+        {
+            "size": {"type": "string", "enum": ["S", "M", "L"]},
+            "rationale": _STR,
+            "triageRange": {"type": "string", "enum": list(TRIAGE_RANGES)},
+            "uncertaintyKind": {"type": "string", "enum": list(UNCERTAINTY_KINDS)},
+        }
+    ),
     "explore": _obj(
         {
             "summary": _STR,

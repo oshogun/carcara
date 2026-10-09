@@ -1,0 +1,28 @@
+{
+  "repo": "acme/widgets",
+  "issue": 7,
+  "runId": "c-20261008-0001",
+  "status": "done",
+  "mergeShas": [
+    "0f3c2a9e1b7d4c6a8e2f0b1c3d5e7f9a1b2c3d4e"
+  ],
+  "files": [
+    "src/github/paging.ts",
+    ".github/workflows/ci.yml"
+  ],
+  "areas": [
+    "src/github"
+  ],
+  "fixRounds": 1,
+  "costUsd": 0.84,
+  "probes": [
+    {
+      "item": "U1",
+      "note": "Checked against a recorded 403 answer in the test fixtures."
+    }
+  ],
+  "withdrawn": [
+    "U3"
+  ],
+  "filesOmitted": 2
+}
