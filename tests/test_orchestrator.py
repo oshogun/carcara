@@ -848,6 +848,28 @@ def test_reject_with_feedback_replans_then_approve(repo, size):
     if size == "L":
         assert "implement:step-r1" in keys(orch3)
     assert '"step-r1"' in backend3.requests[0].prompt
+    # The plan feedback also reaches the implement prompt.
+    assert backend3.requests[0].stage == "implement"
+    assert "Reviewer feedback on the plan" in backend3.requests[0].prompt
+    assert "- use c.py instead" in backend3.requests[0].prompt
+
+
+@pytest.mark.parametrize("size", ["L", "M"])
+def test_implement_prompt_without_plan_feedback_is_unchanged(repo, size):
+    orch, backend, _ = make(
+        repo,
+        {
+            "explore": [EXPLORE],
+            "plan": [PLAN],
+            "implement": [impl("a.py"), impl("b.py")] if size == "L" else [impl()],
+            "test": [TEST_OK],
+            "review": [REVIEW_OK],
+        },
+        size=size,
+    )
+    assert go(orch).status == "done"
+    prompts = [r.prompt for r in backend.requests if r.stage == "implement"]
+    assert prompts and all("Reviewer feedback" not in p for p in prompts)
 
 
 def test_reject_without_feedback_fails(repo):

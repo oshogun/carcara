@@ -1231,6 +1231,7 @@ class Orchestrator:
                         lambda: (
                             f"Task: {task}\n\nApproved plan (JSON):\n{_dumps(plan)}\n\n"
                             "Implement the plan, including its tests."
+                            f"{self._plan_feedback_note()}"
                         ),
                     )
                 )
@@ -1296,9 +1297,18 @@ class Orchestrator:
                 f"Task: {task}\n\nApproved plan (JSON):\n{_dumps(plan)}\n\n"
                 f"Implement ONLY step {step['id']} now (JSON):\n{_dumps(step)}\n"
                 "Earlier steps are already applied in the working tree."
+                f"{self._plan_feedback_note()}"
             )
 
         return build
+
+    def _plan_feedback_note(self) -> str:
+        run = self.run_state
+        feedback = run.state.get("plan_feedback", []) if run else []
+        if not feedback:
+            return ""
+        entries = "\n".join(f"- {entry}" for entry in feedback)
+        return f"\n\nReviewer feedback on the plan (apply it, latest last):\n{entries}"
 
     async def _gate(
         self,

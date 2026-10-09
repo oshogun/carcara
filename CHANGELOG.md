@@ -12,6 +12,9 @@
   it still hits the limit it is retried once and told to report what it has.
   A second time stops the run as `needs_human`, not `failed`. Other stages
   are unchanged.
+- Feedback given with `carcara resume --reject --feedback` now also reaches
+  the implement prompts (each L step and the M implement), not only the
+  revised plan (#20). All feedback entries are included, latest last.
 
 ### Added
 - `carcara uninstall [target] [-n] [-f] [--purge]` removes carcara's agents,
