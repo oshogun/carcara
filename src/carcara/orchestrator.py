@@ -8,6 +8,11 @@ Pipelines (size from TRIAGE unless given):
 - L: EXPLORE -> ARCHITECT -> GATE -> IMPLEMENT per plan step -> TEST -> REVIEW
   -> DOCS (if any implement output is a user-facing change)
 
+Low-verifiability paths (``.carcara/config.json`` ``verifiability_paths``) also
+gate: M/L before IMPLEMENT when plan step files match; otherwise (always for S,
+which has no plan) after IMPLEMENT and before TEST when changed files match.
+The post-implement gate leaves the changes in the working tree.
+
 Failing tests or blocker/major review findings trigger at most two fix
 iterations (implementer with only the failing items -> test -> review), then
 ``needs_human``. Every completed stage is stored under a deterministic key, so
@@ -32,9 +37,18 @@ from carcara.backend import (
     StageResult,
     build_request,
 )
+from carcara.probes import run_probes
 from carcara.profiles import Profile
+from carcara.project_config import (
+    ProjectConfig,
+    ProjectConfigError,
+    load_project_config,
+    match_paths,
+    parse_project_config,
+)
 from carcara.roles import Role, get_role
 from carcara.runstore import Run, RunBusy, RunStore
+from carcara.schemas import MAX_UNVERIFIED, UNVERIFIED_KINDS
 
 EXIT_CODES = {
     "done": 0,
@@ -60,6 +74,36 @@ DEFAULT_MAX_TURNS: dict[str, int] = {
 
 MAX_FIX_ITERATIONS = 2
 DIFF_CAP = 20_000
+# Version of the rule that derives state['extent'] from the stage outputs.
+EXTENT_RULE_VERSION = "carcara/extent-1"
+MAX_EXTENT_AREAS = 10
+
+# Path-specific questions the reviewer must answer in `unverified` when changed
+# files match both the project's verifiability_paths and the row's patterns.
+_PATH_QUESTIONS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        (".github/**",),
+        "Which external accounts, package names, environments or secrets does this assume?",
+    ),
+    (
+        ("**/migrations/**",),
+        "What are the reversibility, data volume and deploy ordering assumptions?",
+    ),
+    (
+        ("**/auth/**", "**/policy*", "**/policy/**"),
+        "Which principals, permissions and threat assumptions are untested?",
+    ),
+)
+_GENERIC_PATH_QUESTION = "Which assumptions about these paths do the tests not exercise?"
+
+_UNVERIFIED_INSTRUCTIONS = (
+    "Assumptions inventory: fill `unverified` with every claim the change relies on "
+    "about systems outside the repository (kind external, e.g. a package name being "
+    "available, an external account or secret being configured), every interpretation "
+    "of what was wanted that the change depends on (kind normative), and behaviour no "
+    "test exercises (kind untested). Use ids U1, U2, ...; at most 20 items, each text "
+    "at most 200 characters. Use [] only if there is truly nothing to list."
+)
 
 # Appended to a stage's prompt when retrying after it returned no structured output.
 _STRUCTURED_OUTPUT_NUDGE = (
@@ -256,6 +300,39 @@ def _failing_items(test: dict[str, Any], review: dict[str, Any] | None) -> dict[
     return {}
 
 
+def _norm_text(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _implement_paths(run: Run) -> list[str]:
+    """Unique changed paths across all implement stages, in order."""
+    paths: list[str] = []
+    for entry in run.state["stages"]:
+        if entry["stage"] == "implement":
+            for change in entry["output"].get("changed", []):
+                if change["path"] not in paths:
+                    paths.append(change["path"])
+    return paths
+
+
+def _extent(run: Run) -> dict[str, Any] | None:
+    """Raw extent facts of the implement stages, or None if none ran."""
+    implements = [e for e in run.state["stages"] if e["stage"] == "implement"]
+    if not implements:
+        return None
+    paths = run.state.get("changed_paths")
+    areas = sorted({p.removeprefix("./").split("/", 1)[0] for p in paths})
+    return {
+        "rule": EXTENT_RULE_VERSION,
+        "files_changed": len(paths),
+        "areas": areas[:MAX_EXTENT_AREAS],
+        "areas_truncated": len(areas) > MAX_EXTENT_AREAS,
+        "fix_rounds": sum(
+            1 for e in implements if "fix-" in e["key"] or "guided-implement" in e["key"]
+        ),
+    }
+
+
 def _last_failing(run: Run) -> dict[str, Any]:
     """Failing items of the latest test stage (and the review that followed it)."""
     stages = run.state["stages"]
@@ -267,9 +344,17 @@ def _last_failing(run: Run) -> dict[str, Any]:
 
 
 def _check_resume_flags(
-    status: str, reject: bool, feedback: str | None, accept_failures: bool
+    status: str,
+    reject: bool,
+    feedback: str | None,
+    accept_failures: bool,
+    gate: dict[str, Any] | None = None,
 ) -> None:
     """Validate --reject/--feedback/--accept-failures against the run status."""
+    if feedback and status == "awaiting_approval" and (gate or {}).get("stage") == "post-implement":
+        raise OrchestratorError(
+            "--feedback cannot revise implemented changes awaiting approval; use --yes or --reject"
+        )
     if reject and status != "awaiting_approval":
         raise OrchestratorError(f"--reject needs a run awaiting approval (run is {status})")
     if feedback and status not in ("awaiting_approval", "needs_human"):
@@ -303,10 +388,22 @@ class Orchestrator:
         # Called as on_start(run_id, resumed) once the run holds the lock.
         self.on_start = on_start
         self._roles: dict[str, Role] = {}
+        # An invalid on-disk config only fails new runs (and resumes of runs
+        # without a snapshot); a resume uses the run's snapshotted config.
+        self._config_error: ProjectConfigError | None = None
+        try:
+            self.config = load_project_config(self.cwd)
+        except ProjectConfigError as exc:
+            self._config_error = exc
+            self.config = ProjectConfig()
+        # urlopen-compatible callable for probes; None uses urllib (tests inject a fake).
+        self.probe_opener: Callable[..., Any] | None = None
 
     # -- public entry points -------------------------------------------------
 
     async def run(self, task: str) -> RunOutcome:
+        if self._config_error is not None:
+            raise OrchestratorError(str(self._config_error)) from self._config_error
         proc = _git(self.cwd, "rev-parse", "--verify", "HEAD")
         if proc.returncode != 0:
             raise OrchestratorError(
@@ -339,6 +436,8 @@ class Orchestrator:
             run.state["use_api_key"] = self.options.use_api_key
             # Persisted so a resume keeps the cap unless --max-budget-usd is given again.
             run.state["max_budget_usd"] = self.options.max_budget_usd
+            # Snapshot: a resume uses this, not a re-read of .carcara/config.json.
+            run.state["project_config"] = self.config.to_dict()
             try:
                 self._pin_base(run, snapshot=self.options.allow_dirty)
             except OrchestratorError as exc:
@@ -359,7 +458,7 @@ class Orchestrator:
         require_toplevel(self.cwd)
         run = self._load(run_id)
         status = run.state["status"]
-        _check_resume_flags(status, reject, feedback, accept_failures)
+        _check_resume_flags(status, reject, feedback, accept_failures, run.state.get("gate"))
         if status == "done":
             report = run.read_report() or self._report(run)
             return RunOutcome("done", 0, report, run.id)
@@ -367,8 +466,9 @@ class Orchestrator:
         try:
             # Another process may have driven the run before we got the lock.
             run = self._load(run_id)
+            self._restore_config(run)
             status = run.state["status"]
-            _check_resume_flags(status, reject, feedback, accept_failures)
+            _check_resume_flags(status, reject, feedback, accept_failures, run.state.get("gate"))
             if status == "done":
                 report = run.read_report() or self._report(run)
                 return RunOutcome("done", 0, report, run.id)
@@ -387,6 +487,13 @@ class Orchestrator:
                 run.save()
             if reject and not feedback:
                 run.event("plan_rejected")
+                if (run.state.get("gate") or {}).get("stage") == "post-implement":
+                    return self._finish(
+                        run,
+                        "failed",
+                        "changes rejected by user; they remain in the working tree "
+                        f"(see carcara diff {run.id})",
+                    )
                 return self._finish(run, "failed", "plan rejected by user")
             if accept_failures:
                 run.state["accepted_failures"] = True
@@ -431,6 +538,19 @@ class Orchestrator:
             return self.store.load(run_id)
         except Exception as exc:
             raise OrchestratorError(str(exc)) from exc
+
+    def _restore_config(self, run: Run) -> None:
+        """Use the project config snapshotted at run start (runs from before
+        snapshots keep the config read from disk)."""
+        snapshot = run.state.get("project_config")
+        if snapshot is None:
+            if self._config_error is not None:
+                raise OrchestratorError(str(self._config_error)) from self._config_error
+            return
+        try:
+            self.config = parse_project_config(snapshot)
+        except ProjectConfigError as exc:
+            raise OrchestratorError(f"run {run.id} project_config: {exc}") from exc
 
     def _pin_base(self, run: Run, *, snapshot: bool) -> None:
         """Set the run's diff base and pin it at refs/carcara/<run_id>.
@@ -478,6 +598,11 @@ class Orchestrator:
     # -- driver --------------------------------------------------------------
 
     def _finish(self, run: Run, status: str, message: str | None) -> RunOutcome:
+        if any(e["stage"] == "implement" for e in run.state["stages"]):
+            self._changed_paths(run)
+        extent = _extent(run)
+        if extent is not None:
+            run.state["extent"] = extent
         run.set_status(status, message)
         report = self._report(run)
         run.write_report(report)
@@ -658,6 +783,27 @@ class Orchestrator:
             f"### git diff\n{diff or '(no diff)'}\n"
         )
 
+    def _changed_paths(self, run: Run) -> list[str]:
+        """Files changed since the run base per git, plus any implementer-reported
+        paths (cwd-relative). Stored in ``state['changed_paths']``."""
+        paths: list[str] = []
+        base = run.state.get("base_sha")
+        if base:
+            try:
+                names = _safe_diff(
+                    self.cwd, base, _snapshot_tree(self.cwd), "--name-only", check=False
+                )
+            except OrchestratorError:
+                names = ""
+            paths = sorted({line for line in names.splitlines() if line.strip()})
+        for path in match_paths(_implement_paths(run), ("**",), self.cwd):
+            if path not in paths and not os.path.isabs(path):
+                paths.append(path)
+        if run.state.get("changed_paths") != paths:
+            run.state["changed_paths"] = paths
+            run.save()
+        return paths
+
     # -- pipeline ------------------------------------------------------------
 
     async def _pipeline(self, run: Run) -> tuple[str, str | None]:
@@ -711,8 +857,24 @@ class Orchestrator:
             if self.options.plan_only:
                 return "plan_only", None
             # Revised plans always go back to the gate (approve_plan is not persisted).
-            if size == "L" or self.options.approve_plan or run.state.get("plan_revision"):
-                self._gate(run, plan)
+            plan_paths = match_paths(
+                (f for step in plan["steps"] for f in step["files"]),
+                self.config.verifiability_paths,
+                self.cwd,
+            )
+            trigger = (
+                "size"
+                if size == "L"
+                else "revision"
+                if run.state.get("plan_revision")
+                else "flag"
+                if self.options.approve_plan
+                else "verifiability"
+                if plan_paths
+                else None
+            )
+            if trigger:
+                self._gate(run, plan, trigger, plan_paths if trigger == "verifiability" else ())
             steps = plan["steps"] if size == "L" else []
             if steps:
                 seen: set[str] = set()
@@ -744,6 +906,7 @@ class Orchestrator:
                     )
                 )
 
+        self._post_implement_gate(run)
         message, fixes = await self._verify(run, task, review_on)
         implements.extend(fixes)
 
@@ -808,11 +971,27 @@ class Orchestrator:
 
         return build
 
-    def _gate(self, run: Run, plan: dict[str, Any]) -> None:
+    def _gate(
+        self,
+        run: Run,
+        plan: dict[str, Any],
+        trigger: str,
+        paths: list[str] | tuple[str, ...] = (),
+        *,
+        stage: str = "plan",
+    ) -> None:
         if run.state.get("plan_approved"):
             return
-        decision = self.gate.approve_plan(plan)
-        run.event("gate", decision=decision)
+        paths = list(paths)[:20]
+        run.state["gate"] = {"trigger": trigger, "paths": paths, "stage": stage}
+        run.save()
+        reason = {
+            "size": "size L",
+            "flag": "--approve-plan",
+            "revision": "revised plan",
+        }.get(trigger) or "low-verifiability paths: " + ", ".join(paths)
+        decision = self.gate.approve_plan({**plan, "gate_reason": reason})
+        run.event("gate", decision=decision, trigger=trigger)
         if decision == "approve":
             run.state["plan_approved"] = True
             run.save()
@@ -822,7 +1001,146 @@ class Orchestrator:
                 "awaiting_approval",
                 f"plan awaits approval; resume with: carcara run --resume {run.id} --yes",
             )
+        if stage == "post-implement":
+            raise _Stop(
+                "failed",
+                f"changes rejected; they remain in the working tree (see carcara diff {run.id})",
+            )
         raise _Stop("failed", "plan rejected")
+
+    def _post_implement_gate(self, run: Run) -> None:
+        """Gate before TEST when ungated implement changes touch low-verifiability paths."""
+        if run.state.get("plan_approved"):
+            return
+        # Git is authoritative: an omitted or oddly spelled path still gates.
+        changed = match_paths(
+            self._changed_paths(run), self.config.verifiability_paths, self.cwd
+        )
+        if not changed:
+            return
+        plan = {
+            "goal": "Review changes to low-verifiability paths before test/review",
+            "steps": [
+                {
+                    "id": "changed",
+                    "files": changed,
+                    "change": f"implementer changes (uncommitted; see carcara diff {run.id})",
+                }
+            ],
+            "tests": [],
+            "acceptance": [],
+            "risks": [
+                "These paths are hard to verify by tests (CI, migrations, auth/policy); "
+                "rejecting does not revert the working tree."
+            ],
+        }
+        self._gate(run, plan, "verifiability", changed, stage="post-implement")
+
+    def _inventory_prompt(self, run: Run) -> str:
+        """Reviewer instructions for the `unverified` assumptions inventory."""
+        parts = [_UNVERIFIED_INSTRUCTIONS]
+        probes = self.config.probes
+        if probes:
+            parts.append(
+                "Allow-listed probes (unauthenticated HTTP GET run by carcara after review): "
+                + ", ".join(sorted(probes))
+                + ". An external item may set probe {name, arg, expect} where expect is "
+                "'exists' or 'absent' for the resource the probe URL names with {arg}."
+            )
+        flagged = match_paths(
+            self._changed_paths(run), self.config.verifiability_paths, self.cwd
+        )
+        if flagged:
+            questions = [q for pats, q in _PATH_QUESTIONS if match_paths(flagged, pats)]
+            parts.append(
+                "The change touches low-verifiability paths ("
+                + ", ".join(flagged[:10])
+                + "). Answer these in `unverified` (required):\n"
+                + "\n".join(f"- {q}" for q in questions or [_GENERIC_PATH_QUESTION])
+            )
+        prior = run.state.get("unverified") or []
+        if prior:
+            listed = [{"id": i["id"], "kind": i["kind"], "text": i["text"]} for i in prior]
+            parts.append(
+                "Prior inventory (JSON); reuse an item's id when it is unchanged, "
+                f"drop items that no longer apply:\n{_dumps(listed)}"
+            )
+        return "\n\n".join(parts)
+
+    def _record_unverified(self, run: Run, key: str, review: dict[str, Any]) -> None:
+        """Assign stable ids to the review's `unverified` items and run probes.
+
+        Ids are orchestrator-owned: an agent id is kept only if it already exists
+        with the same kind and normalised text; else an item matches a prior one
+        by (kind, text); else it gets U{next}. Probe results record the probe
+        {name, arg, expect} they answered and are re-run when it changes; an item
+        is resolved only by a confirmed result for its current probe.
+        Idempotent per review stage key (replays skip).
+        """
+        state = run.state
+        done = state.setdefault("unverified_reviews", [])
+        if key in done:
+            return
+        prior = {i["id"]: i for i in state.get("unverified") or []}
+        items = [dict(i) for i in review.get("unverified", [])]
+        ids: list[str | None] = [None] * len(items)
+        used: set[str] = set()
+        for n, item in enumerate(items):
+            old = prior.get(item.get("id"))
+            if (
+                old is not None
+                and old["kind"] == item["kind"]
+                and _norm_text(old["text"]) == _norm_text(item["text"])
+                and old.get("probe") == item.get("probe")
+                and old["id"] not in used
+            ):
+                ids[n] = old["id"]
+                used.add(old["id"])
+        by_text = {(i["kind"], _norm_text(i["text"])): i["id"] for i in prior.values()}
+        for n, item in enumerate(items):
+            if ids[n] is None:
+                match = by_text.get((item["kind"], _norm_text(item["text"])))
+                if match is not None and match not in used:
+                    ids[n] = match
+                    used.add(match)
+        counter = int(state.get("unverified_next", 1))
+        recorded: list[dict[str, Any]] = []
+        for n, item in enumerate(items):
+            if ids[n] is None:
+                ids[n] = f"U{counter}"
+                counter += 1
+            entry = {"id": ids[n], "kind": item["kind"], "text": item["text"]}
+            if item.get("probe"):
+                entry["probe"] = item["probe"]
+            recorded.append(entry)
+        state["unverified_next"] = counter
+        state["unverified"] = recorded
+
+        signatures = {
+            e["id"]: {k: e["probe"].get(k) for k in ("name", "arg", "expect")}
+            for e in recorded
+            if e["kind"] == "external" and isinstance(e.get("probe"), dict)
+        }
+        results = state.setdefault("probe_results", {})
+        for rid in list(results):
+            # Drop results for items that are gone or whose probe changed.
+            if results[rid].get("probe") != signatures.get(rid):
+                del results[rid]
+        if self.config.probes:
+            pending = [e for e in recorded if e["id"] in signatures and e["id"] not in results]
+            for res in run_probes(pending, self.config.probes, opener=self.probe_opener):
+                results[res["id"]] = {
+                    "probe": signatures[res["id"]],
+                    "outcome": res["outcome"],
+                    "result": res["result"],
+                }
+                run.event("probe", id=res["id"], **results[res["id"]])
+        for entry in recorded:
+            res = results.get(entry["id"])
+            if res and res["outcome"] == "confirmed" and res["probe"] == signatures[entry["id"]]:
+                entry["resolved"] = True
+        done.append(key)
+        run.save()
 
     async def _verify(
         self, run: Run, task: str, review_on: bool
@@ -841,7 +1159,8 @@ class Orchestrator:
         def review_prompt() -> str:
             return (
                 f"Task: {task}\n\nReview this change for correctness, security and "
-                f"missing tests. Report only real issues.\n\n{self._diff_context()}"
+                f"missing tests. Report only real issues.\n\n"
+                f"{self._inventory_prompt(run)}\n\n{self._diff_context()}"
             )
 
         async def check(stage_prefix: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -850,9 +1169,9 @@ class Orchestrator:
             )
             review = None
             if review_on and test["passed"]:
-                review = await self._stage(
-                    f"{stage_prefix}review", "review", "reviewer", "review", review_prompt
-                )
+                key = f"{stage_prefix}review"
+                review = await self._stage(key, "review", "reviewer", "review", review_prompt)
+                self._record_unverified(run, key, review)
             return test, review
 
         guidance = run.state.get("retry_feedback", {}).get(str(rnd)) if rnd else None
@@ -968,6 +1287,30 @@ class Orchestrator:
         ]
         if state.get("base_kind"):
             lines.append(f"carcara changes: carcara diff {run.id}")
+        extent = state.get("extent")
+        if extent:
+            areas = ", ".join(extent["areas"]) or "none"
+            more = " (+)" if extent.get("areas_truncated") else ""
+            lines.append(
+                f"extent: {extent['files_changed']} files, areas {areas}{more}, "
+                f"fix rounds {extent['fix_rounds']} [{extent['rule']}]"
+            )
+        gate = state.get("gate")
+        if gate:
+            paths = f" (paths: {', '.join(gate['paths'])})" if gate.get("paths") else ""
+            lines.append(f"gate: {gate['trigger']}{paths}")
+        open_items = [i for i in state.get("unverified") or [] if not i.get("resolved")]
+        if open_items:
+            counts = ", ".join(
+                f"{kind} {sum(1 for i in open_items if i['kind'] == kind)}"
+                for kind in UNVERIFIED_KINDS
+            )
+            lines.append(f"unverified: {len(open_items)} open ({counts})")
+            probes = state.get("probe_results") or {}
+            for item in open_items[:MAX_UNVERIFIED]:
+                res = probes.get(item["id"])
+                probe = f" (probe: {res['outcome']} {res['result']})" if res else ""
+                lines.append(f"  - {item['id']} [{item['kind']}] {item['text']}{probe}")
         if state.get("accepted_failures"):
             lines.append("accepted failures: yes (unresolved failures accepted by user)")
         if state.get("message"):

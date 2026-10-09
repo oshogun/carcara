@@ -274,6 +274,8 @@ def test_can_use_tool_callback():
         "sub/.git/config",
         "/repo/.git/config",
         ".carcara/runs/x/state.json",
+        ".carcara/config.json",
+        "/repo/.carcara/config.json",
         "",
     ],
 )
@@ -281,6 +283,11 @@ def test_can_use_tool_callback():
 def test_write_outside_cwd_or_into_git_denied(tool, path):
     assert not allowed("implementer", tool, {"file_path": path})
     assert not allowed("doc-writer", tool, {"file_path": path})
+
+
+@pytest.mark.parametrize("path", ["foo.carcara/x/myconfig.json", "src/.carcara.d/appconfig.json"])
+def test_write_carcara_lookalike_paths_allowed(path):
+    assert allowed("implementer", "Write", {"file_path": path})
 
 
 def test_notebook_and_multiedit_paths_confined():
@@ -456,6 +463,10 @@ def test_implementer_bash_reads_unconfined():
         "cp -t /usr/local/bin a.txt",
         "echo x > .git/config",
         "touch .carcara/unrestricted-bash",
+        "echo '{}' > .carcara/config.json",
+        "tee .carcara/config.json < x",
+        "cp x.json .carcara/config.json",
+        "mv x.json ./.carcara/config.json",
         "mv foo ../bar",
         "echo 'unbalanced",
         "nice -n 5 git push",
@@ -594,3 +605,12 @@ def test_secret_matching_globs_denied(glob):
 @pytest.mark.parametrize("glob", ["*", "**/*", "*.py", "**/environment*.py", ".github/*"])
 def test_ordinary_globs_allowed(glob):
     assert allowed("explorer", "Glob", {"pattern": glob})
+
+
+@pytest.mark.parametrize("role", sorted(ROLES))
+def test_project_config_not_writable_by_any_role(role):
+    target = ".carcara/config.json"
+    for tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        assert not allowed(role, tool, {"file_path": target, "notebook_path": target}), tool
+    for command in (f"echo x > {target}", f"tee {target}", f"cp a {target}"):
+        assert not allowed(role, "Bash", {"command": command}), command

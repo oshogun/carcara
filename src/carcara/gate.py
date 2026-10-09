@@ -7,7 +7,8 @@ from typing import Any, TextIO
 
 
 def render_plan(plan: dict[str, Any]) -> str:
-    lines = [f"Plan: {plan.get('goal', '')}", "Steps:"]
+    lines = [f"Gate: {plan['gate_reason']}"] if plan.get("gate_reason") else []
+    lines += [f"Plan: {plan.get('goal', '')}", "Steps:"]
     for index, step in enumerate(plan.get("steps", []), 1):
         files = ", ".join(step.get("files", [])) or "-"
         lines.append(f"  {index}. [{step.get('id', index)}] {step.get('change', '')}")

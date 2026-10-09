@@ -3,7 +3,7 @@ import pytest
 from carcara.profiles import load_profile
 from carcara.resources import templates_root
 from carcara.roles import Role, RoleError, load_roles, model_for, parse_role, to_agent_definition
-from carcara.schemas import SCHEMAS, validate
+from carcara.schemas import MAX_UNVERIFIED, MAX_UNVERIFIED_TEXT, SCHEMAS, validate
 
 EXPECTED_TOOLS = {
     "architect": ("Read", "Grep", "Glob"),
@@ -85,6 +85,7 @@ def test_validate():
     ok_review = {
         "verdict": "request_changes",
         "findings": [{"severity": "major", "path": "a.py", "issue": "i", "fix": "f"}],
+        "unverified": [],
     }
     assert validate("review", ok_review) == []
     ok_review["findings"][0]["line"] = True
@@ -92,6 +93,44 @@ def test_validate():
     assert validate("test", {"passed": "yes", "commands": [], "failures": []})
     assert validate("docs", {"changed": ["README.md"]}) == []
     assert validate("docs", {"changed": [1]})
+
+
+def _review(*items):
+    return {"verdict": "approve", "findings": [], "unverified": list(items)}
+
+
+def test_review_unverified_items():
+    assert validate("review", {"verdict": "approve", "findings": []})
+    for kind in ("external", "normative", "untested"):
+        assert validate("review", _review({"id": "U1", "kind": kind, "text": "t"})) == []
+    assert validate("review", _review({"id": "U1", "kind": "guess", "text": "t"}))
+    assert validate("review", _review({"id": "U1", "kind": "external"}))
+    item = {"id": "U1", "kind": "untested", "text": "t"}
+    assert validate("review", _review(*[item] * MAX_UNVERIFIED)) == []
+    assert validate("review", _review(*[item] * (MAX_UNVERIFIED + 1)))
+    long_item = {**item, "text": "x" * (MAX_UNVERIFIED_TEXT + 1)}
+    assert validate("review", _review(long_item))
+    assert validate("review", _review({**item, "text": "x" * MAX_UNVERIFIED_TEXT})) == []
+
+
+def test_review_unverified_probe():
+    probe = {"name": "pypi-name", "arg": "carcara-sdlc", "expect": "absent"}
+    item = {"id": "U1", "kind": "external", "text": "name is free", "probe": probe}
+    assert validate("review", _review(item)) == []
+    assert validate("review", _review({**item, "probe": {**probe, "expect": "maybe"}}))
+    assert validate("review", _review({**item, "probe": {**probe, "url": "http://x"}}))
+    assert validate("review", _review({**item, "probe": {"name": "pypi-name"}}))
+    assert validate("review", _review({**item, "probe": {**probe, "arg": "x" * 201}}))
+
+
+def test_validate_max_items_and_length():
+    schema = {"type": "array", "maxItems": 2, "items": {"type": "string", "maxLength": 3}}
+    assert validate(schema, ["abc", "de"]) == []
+    errors = validate(schema, ["a", "b", "c"])
+    assert errors == ["$: more than 2 items"]
+    assert validate(schema, ["abcd"]) == ["$[0]: longer than 3 characters"]
+    assert validate({"type": "array", "maxItems": 1}, [1]) == []
+    assert validate({"type": "array", "maxItems": 1}, [1, 2])
 
 
 def test_role_model_key():

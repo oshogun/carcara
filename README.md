@@ -213,14 +213,64 @@ Stages per size (triage picks the size unless `--size S|M|L` is given):
 
 | Size | Stages |
 |---|---|
-| S | implement → test (→ review with `--review`) |
-| M | explore → plan → implement → test → review |
+| S | implement (→ **approval** if low-verifiability paths changed) → test (→ review with `--review`) |
+| M | explore → plan (→ **approval** with `--approve-plan` or low-verifiability paths) → implement → test → review |
 | L | explore → plan (architect) → **approval** → implement per plan step → test → review → docs |
 
-**Approval gate.** L plans (and M plans with `--approve-plan`) wait for you. On
-a TTY you are prompted; `--yes` auto-approves; without a TTY the run stops with
+**Approval gate.** The run waits for you when one of these triggers fires:
+
+| Trigger | When |
+|---|---|
+| `size` | every L plan |
+| `flag` | M plans with `--approve-plan` |
+| `revision` | a plan re-made from `--feedback` |
+| `verifiability` | an M/L plan step's files, or (for S) the files changed since the run base, match a low-verifiability path pattern |
+
+The default patterns are `.github/**`, `**/migrations/**`, `**/auth/**`,
+`**/policy*` and `**/policy/**`. To change them, see [Project config](#project-config-carcaraconfigjson).
+S runs have no plan, so the verifiability gate runs after implement and before
+test/review. It checks the files git shows as changed since the run base, plus
+any the implementer reported, so an omitted file still gates. The changes are
+then already in the working tree (uncommitted;
+inspect them with `carcara diff <id>`). Approving continues with test and
+review. Rejecting fails the run but does not revert the changes. `--feedback`
+is refused at this gate. The same post-implement check also catches M/L
+changes that touch a pattern even though no plan step listed it. The gate
+prompt starts with `Gate: <reason>`, and `state.json` records
+`gate: {trigger, paths, stage}`, where `stage` is `plan` or `post-implement`.
+
+On a TTY you are prompted; `--yes` auto-approves; without a TTY the run stops with
 exit code 3 and is continued later with `--resume <id> --yes`. If tests still
 fail, the fix loop runs at most 2 iterations, then exits with code 4.
+
+**Unverified assumptions.** The reviewer must list in `unverified` what its
+verdict relies on but cannot check: claims about systems outside the repo
+(`external`, e.g. a package name being free or a secret being configured),
+interpretations of the request (`normative`), and behaviour no test exercises
+(`untested`). The list has at most 20 items of at most 200 characters each.
+When the changed files match a low-verifiability pattern, the prompt adds
+path-specific questions. For `.github/**`, for example, it asks which accounts,
+package names, environments or secrets the change assumes. carcara assigns the
+ids (`U1`, `U2`, ...), and they stay stable across fix rounds; an item whose
+text changes gets a new id. When
+[probes](#project-config-carcaraconfigjson) are configured, an `external` item
+may name one. carcara runs it after the review and runs it again when the
+item's probe (name, arg or expect) changes. An item whose current probe result
+confirms the expectation is marked resolved.
+
+**Report fields.** Besides files, tests, review and cost, `report.md` and
+`carcara status` show:
+
+- `extent: N files, areas a, b, fix rounds K [carcara/extent-1]`: the raw
+  extent facts. `areas` lists the first path components, capped at 10, with
+  `(+)` when truncated. The bracketed rule version tells you how the facts were
+  computed. No "observed size" is derived from them.
+- `gate: <trigger> (paths: ...)`: shown when the run was gated.
+- `unverified: N open (external x, normative y, untested z)`: followed by one
+  line per open item, `- U1 [external] text (probe: <outcome> <result>)`.
+
+`carcara status --json` includes the raw `gate`, `unverified`, `probe_results`
+and `extent` values.
 
 | Option | Description |
 |---|---|
@@ -299,6 +349,14 @@ their option values. To turn the deny-list off, pass
 resume needs it again), prints a warning on stderr and is recorded in the
 run's events.
 
+Probes (see [Project config](#project-config-carcaraconfigjson)) are not agent
+tools. carcara itself runs them after the review, and they never go through
+agent Bash. They are unauthenticated HTTP GETs to URL templates from the
+project's allow-list, sent with a 5 s timeout and with no credentials or
+cookies. Only the `{arg}` path segment comes from the reviewer, and it is
+URL-quoted. Only the status code is read, and the run records just the item
+id and a short result. The agent Bash policy above is unchanged.
+
 Known risks:
 
 - implementer and test-runner Bash is guarded only by a best-effort deny-list.
@@ -341,6 +399,35 @@ the recorded profile can't be loaded (e.g. the `.env` file moved), the run
 warns on stderr and uses `balanced`. `--resume` always keeps the profile the
 run started with. The run's first stderr line shows the profile:
 `carcara: run <id> started (profile quality)`.
+
+## Project config (`.carcara/config.json`)
+
+This file is optional, separate from profiles, and read by `carcara run` from
+the project directory. Unknown keys are an error. A run snapshots it at start
+(`project_config` in `state.json`), and `--resume` uses the snapshot, so editing
+the file mid-run has no effect on that run. Agents cannot write it.
+
+```json
+{
+  "verifiability_paths": [".github/**", "**/migrations/**", "**/auth/**", "**/policy*", "**/policy/**"],
+  "probes": {"pypi-name": "https://pypi.org/pypi/{arg}/json"}
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `verifiability_paths` | glob patterns (posix paths; `**/` matches any number of directories, `*` matches within one component) that trigger the [approval gate](#carcara-run). A list replaces the defaults shown above; `[]` turns the trigger off. |
+| `probes` | named, read-only checks the reviewer may reference from `external` unverified items. Each value is an `http`/`https` URL with exactly one `{arg}` placeholder and no `user:pass@`. Without probes, nothing is fetched. |
+
+A probe result counts as `exists` for a 2xx status and `absent` for 404/410.
+It is `confirmed` or `contradicted` against the item's expectation, and any
+other status, or an error, counts as `inconclusive`. Probes do not follow
+redirects (a 3xx is `inconclusive` with result `redirect`) and ignore proxy
+environment variables.
+
+`pyproject.toml` is not gated by default. Only its version/publish sections
+matter for releases, and patterns match whole paths. If you want every change
+to it gated, add `"pyproject.toml"` to the list.
 
 ## Development
 

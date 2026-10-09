@@ -30,7 +30,7 @@ PLAN = {
     "acceptance": ["works"],
     "risks": ["none"],
 }
-REVIEW_OK = {"verdict": "approve", "findings": []}
+REVIEW_OK = {"verdict": "approve", "findings": [], "unverified": []}
 
 
 @pytest.fixture(autouse=True)

@@ -24,6 +24,33 @@
   `nice -n`, `env -u`/`-C`, `timeout -s`/`-k`, `xargs -n`/`-I`, ...) and
   splits `env -S` strings, so commands like `sudo -u root git push` or
   `nice -n 5 git push` no longer get past it.
+- Verifiability gate: `carcara run` stops at the approval gate when an M/L
+  plan's step files, or an S run's changed files, match a low-verifiability
+  pattern. The defaults are `.github/**`, `**/migrations/**`, `**/auth/**`,
+  `**/policy*` and `**/policy/**`. S runs are gated after implement and before
+  test/review, on the files git shows as changed since the run base (plus any
+  the implementer reported).
+  `state.json` records `gate: {trigger, paths, stage}`, where the trigger is
+  `size`, `flag`, `revision` or `verifiability`.
+- Optional project config `.carcara/config.json` with `verifiability_paths`
+  (replaces the defaults; `[]` turns the trigger off) and `probes`. A run
+  snapshots it at start and `--resume` uses the snapshot; agents cannot write
+  it.
+- The reviewer's structured output now requires an `unverified` list with at
+  most 20 items. Each item is `{id, kind, text}`: kind is `external`,
+  `normative` or `untested`, and text is at most 200 characters. carcara
+  assigns stable ids (`U1`, `U2`, ...) within a run; an item whose text
+  changes gets a new id. Open items, with counts
+  by kind, are shown in the report and `carcara status`.
+- Probes: allow-listed, unauthenticated HTTP GET checks such as
+  `"pypi-name": "https://pypi.org/pypi/{arg}/json"`. carcara runs them after
+  the review for the `external` items that reference them (5 s timeout) and
+  records the item id, the probe `{name, arg, expect}` and a short result,
+  re-running the probe when it changes. Redirects are not followed and proxy
+  environment variables are ignored. The agent Bash policy is unchanged.
+- Extent facts in the state, the report and `carcara status`: files changed,
+  top-level areas (at most 10) and fix rounds, tagged with the rule version
+  `carcara/extent-1`.
 
 ### Fixed
 - `carcara run` now defaults to the profile chosen at `carcara install`

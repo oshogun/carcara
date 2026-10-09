@@ -73,6 +73,7 @@ INSTALL_MANIFEST_REL = ".carcara/install.json"
 ROUTING_OFF_REL = ".carcara/routing-off"  # written by `carcara routing off`
 RUNS_REL = ".carcara/runs"
 ACTIVE_RUN_REL = ".carcara/active.json"
+PROJECT_CONFIG_REL = ".carcara/config.json"  # optional, see project_config.py
 ROUTING_PLACEHOLDER = "{{ROUTING}}"
 ROUTING_ON_TEXT = """- Code changes in this repo are routed to the carcara orchestrator: use the
   `carcara` skill (it runs `carcara run`); don't edit project files directly.

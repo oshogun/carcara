@@ -30,7 +30,7 @@ IMPL = {
 }
 TEST_OK = {"passed": True, "commands": ["pytest"], "failures": []}
 TEST_FAIL = {"passed": False, "commands": ["pytest"], "failures": [{"name": "t1", "detail": "x"}]}
-REVIEW_OK = {"verdict": "approve", "findings": []}
+REVIEW_OK = {"verdict": "approve", "findings": [], "unverified": []}
 
 
 @pytest.fixture(autouse=True)
@@ -193,6 +193,10 @@ def test_tty_gate():
     rendered = out.getvalue()
     assert "Plan: do the thing" in rendered and "files: a.py" in rendered
     assert "Risks:" in rendered and "Approve plan? [y/N/d(efer)]" in rendered
+    assert rendered.startswith("Plan: do the thing")
+    out = io.StringIO()
+    TtyGate(io.StringIO("y\n"), out).approve_plan({**PLAN, "gate_reason": "size L"})
+    assert out.getvalue().startswith("Gate: size L\nPlan: do the thing\n")
     assert TtyGate(io.StringIO("d\n"), io.StringIO()).approve_plan(PLAN) == "defer"
     assert TtyGate(io.StringIO(""), io.StringIO()).approve_plan(PLAN) == "reject"
     assert TtyGate(io.StringIO("y\n"), io.StringIO()).ask_continue("s") is True
@@ -564,6 +568,10 @@ STATUS_KEYS = {
     "cost_usd",
     "failed_attempts",
     "uncounted_stages",
+    "gate",
+    "unverified",
+    "probe_results",
+    "extent",
 }
 
 
@@ -585,6 +593,8 @@ def test_status_awaiting_approval_json_and_plan(repo, fake, capsys):
     assert data["plan"] == PLAN and data["failing"] == []
     assert data["report"].startswith(f"carcara run {run_id}: awaiting_approval")
     assert data["resume_cmd"] == f"carcara run --resume {run_id} --cwd {repo} --yes"
+    assert data["gate"] == {"trigger": "size", "paths": [], "stage": "plan"}
+    assert data["unverified"] == [] and data["probe_results"] == {}
 
     assert status(repo, "--plan") == 0
     assert capsys.readouterr().out.startswith("Plan: do the thing\n")
@@ -634,6 +644,34 @@ def test_status_json_old_state_defaults(repo, capsys):
     data = _status_json(repo, capsys)
     assert data["cost_usd"] == 0.0
     assert data["failed_attempts"] == 0 and data["uncounted_stages"] == []
+
+
+def test_status_verifiability_fields(repo, capsys):
+    run_ = RunStore(repo).create("t", "balanced", "sha", size="S")
+    gate = {"trigger": "verifiability", "paths": [".github/x.yml"], "stage": "post-implement"}
+    extent = {
+        "rule": "carcara/extent-1",
+        "files_changed": 1,
+        "areas": [".github"],
+        "areas_truncated": False,
+        "fix_rounds": 0,
+    }
+    items = [
+        {"id": "U1", "kind": "external", "text": "pypi name free"},
+        {"id": "U2", "kind": "normative", "text": "done", "resolved": True},
+    ]
+    run_.state.update(gate=gate, extent=extent, unverified=items)
+    run_.save()
+    data = _status_json(repo, capsys)
+    assert data["gate"] == gate and data["extent"] == extent
+    assert data["unverified"] == items and data["probe_results"] == {}
+
+    assert status(repo) == 0
+    out = capsys.readouterr().out
+    assert "gate: verifiability (paths: .github/x.yml)\n" in out
+    assert "extent: 1 files, areas .github, fix rounds 0 [carcara/extent-1]\n" in out
+    assert "unverified: 1 open (external 1, normative 0, untested 0)\n" in out
+    assert "  - U1 [external] pypi name free\n" in out and "U2" not in out
 
 
 def test_status_review_findings_and_done(repo):

@@ -16,7 +16,7 @@
       ".claude/agents/doc-writer.md": "bf7cda99dd7fe506530b9280941f03bad3d2c54d5f82b11130272592d699c26d",
       ".claude/agents/explorer.md": "10124cc7f603e56d4e5e3e461039de78c983e2bfb1b151ea877d9c10ee82e7f4",
       ".claude/agents/implementer.md": "b92e1edd11df9c2b72234852db3de1a99e7c79a6edb7bb84f7a5588965139ae8",
-      ".claude/agents/reviewer.md": "aeface5d0996e925e50abd1b268c88ce8bcfda6604a1af62a9fb9b3b5a60cb2f",
+      ".claude/agents/reviewer.md": "185b5705d55c370433efcdb619c3d69cb97bde4fd2716aefe99ae1b4a0c4bb07",
       ".claude/agents/test-runner.md": "6a0a96c62fd5a3a8cfe108f7a070f7334fe2a3d21733c393807db19f38b64329",
       ".claude/commands/sdlc-build.md": "be35ac6aeca99d0d94293769820dd7e781aae81efb95fcfc00b31aafbebe6803",
       ".claude/commands/sdlc-plan.md": "452e242ebc22327bd5bdd9db48535f1e22a11d925adc1ae465b4152e385713a4",
@@ -24,7 +24,7 @@
       ".claude/commands/sdlc-test.md": "cc679efcbcb1b27633e1c87f4e0b44b14969db35389d959cf8ac6a7742b3dc50",
       ".claude/commands/sdlc.md": "1c7b6bb01b3b015308ce789ea4022d59fc9439eeaa54286fcdb735a48598f8a4",
       ".claude/settings.json": "49780075437b102d22c57d44b1ad7d1b4ddad345c377f6d64aea7b540e5da0c5",
-      ".claude/skills/carcara/SKILL.md": "7ad315b8e4d56ca44c251f3d1ab6f0f269b4c4d007f2cfd4262fcfa94518c73d",
+      ".claude/skills/carcara/SKILL.md": "1a8166324b80de58a06fda951606747c45deba7d6614249b0c7dda24b24cca2a",
       "CLAUDE.md": "7fc0e65068d76a959dbe98fab22da5192a4b2a73d78c8750dfc40e39185dda61"
     }
   },
@@ -47,7 +47,7 @@
       ".claude/agents/doc-writer.md": "357067a1aae62aaf5fda5665a68f10c978a79c8176d52270af042b2f36ae7b9b",
       ".claude/agents/explorer.md": "d0185f2b119c1acc3fe581b080860e02050e2ea4c6f970c7123f9c480f921858",
       ".claude/agents/implementer.md": "1d8e87c9711f6a4fc789b3bf54511741af27b1da550c0d9fb62b42fbc88189fb",
-      ".claude/agents/reviewer.md": "9ff9703b368a91374d0a729a4bdb00145531612c76ca2e391d908fd963f2eca7",
+      ".claude/agents/reviewer.md": "26c5e2dde45db6f33f49af6402ba2e310139c31b5c47800e24f38b16bba7893f",
       ".claude/agents/test-runner.md": "6a0a96c62fd5a3a8cfe108f7a070f7334fe2a3d21733c393807db19f38b64329",
       ".claude/commands/sdlc-build.md": "be35ac6aeca99d0d94293769820dd7e781aae81efb95fcfc00b31aafbebe6803",
       ".claude/commands/sdlc-plan.md": "452e242ebc22327bd5bdd9db48535f1e22a11d925adc1ae465b4152e385713a4",
@@ -55,7 +55,7 @@
       ".claude/commands/sdlc-test.md": "cc679efcbcb1b27633e1c87f4e0b44b14969db35389d959cf8ac6a7742b3dc50",
       ".claude/commands/sdlc.md": "1c7b6bb01b3b015308ce789ea4022d59fc9439eeaa54286fcdb735a48598f8a4",
       ".claude/settings.json": "64da077bc0e6aff00e0c65f267d79e78bde0cdd5e973479d6d3987447c74d29d",
-      ".claude/skills/carcara/SKILL.md": "7ad315b8e4d56ca44c251f3d1ab6f0f269b4c4d007f2cfd4262fcfa94518c73d",
+      ".claude/skills/carcara/SKILL.md": "1a8166324b80de58a06fda951606747c45deba7d6614249b0c7dda24b24cca2a",
       "CLAUDE.md": "dce2cdc06e9e6ff9cc1bc5ffcb99f71511ca1a24110f89691a972382d859f797"
     }
   },
@@ -84,7 +84,7 @@
       ".claude/commands/sdlc-test.md": "cc679efcbcb1b27633e1c87f4e0b44b14969db35389d959cf8ac6a7742b3dc50",
       ".claude/commands/sdlc.md": "1c7b6bb01b3b015308ce789ea4022d59fc9439eeaa54286fcdb735a48598f8a4",
       ".claude/settings.json": "49780075437b102d22c57d44b1ad7d1b4ddad345c377f6d64aea7b540e5da0c5",
-      ".claude/skills/carcara/SKILL.md": "7ad315b8e4d56ca44c251f3d1ab6f0f269b4c4d007f2cfd4262fcfa94518c73d",
+      ".claude/skills/carcara/SKILL.md": "1a8166324b80de58a06fda951606747c45deba7d6614249b0c7dda24b24cca2a",
       "CLAUDE.md": "277bb27964e7fda2f19344d4d96d1228576bf62e32e054709dcc554be163ce36"
     }
   },
@@ -122,7 +122,7 @@
       ".claude/agents/doc-writer.md": "bf7cda99dd7fe506530b9280941f03bad3d2c54d5f82b11130272592d699c26d",
       ".claude/agents/explorer.md": "10124cc7f603e56d4e5e3e461039de78c983e2bfb1b151ea877d9c10ee82e7f4",
       ".claude/agents/implementer.md": "b92e1edd11df9c2b72234852db3de1a99e7c79a6edb7bb84f7a5588965139ae8",
-      ".claude/agents/reviewer.md": "aeface5d0996e925e50abd1b268c88ce8bcfda6604a1af62a9fb9b3b5a60cb2f",
+      ".claude/agents/reviewer.md": "185b5705d55c370433efcdb619c3d69cb97bde4fd2716aefe99ae1b4a0c4bb07",
       ".claude/agents/test-runner.md": "6a0a96c62fd5a3a8cfe108f7a070f7334fe2a3d21733c393807db19f38b64329",
       ".claude/commands/sdlc-build.md": "be35ac6aeca99d0d94293769820dd7e781aae81efb95fcfc00b31aafbebe6803",
       ".claude/commands/sdlc-plan.md": "452e242ebc22327bd5bdd9db48535f1e22a11d925adc1ae465b4152e385713a4",
@@ -130,7 +130,7 @@
       ".claude/commands/sdlc-test.md": "cc679efcbcb1b27633e1c87f4e0b44b14969db35389d959cf8ac6a7742b3dc50",
       ".claude/commands/sdlc.md": "1c7b6bb01b3b015308ce789ea4022d59fc9439eeaa54286fcdb735a48598f8a4",
       ".claude/settings.json": "49780075437b102d22c57d44b1ad7d1b4ddad345c377f6d64aea7b540e5da0c5",
-      ".claude/skills/carcara/SKILL.md": "7ad315b8e4d56ca44c251f3d1ab6f0f269b4c4d007f2cfd4262fcfa94518c73d",
+      ".claude/skills/carcara/SKILL.md": "1a8166324b80de58a06fda951606747c45deba7d6614249b0c7dda24b24cca2a",
       "CLAUDE.md": "277bb27964e7fda2f19344d4d96d1228576bf62e32e054709dcc554be163ce36"
     }
   },

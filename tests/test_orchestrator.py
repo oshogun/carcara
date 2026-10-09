@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import tempfile
+import types
 
 import pytest
 
@@ -15,6 +16,7 @@ from carcara.orchestrator import (
 )
 from carcara.policy import WRITE_TOOLS
 from carcara.profiles import load_profile
+from carcara.project_config import DEFAULT_VERIFIABILITY_PATHS, parse_project_config
 from carcara.roles import model_for
 from carcara.runstore import RunStore
 
@@ -50,13 +52,14 @@ TEST_FAIL = {
     "commands": ["pytest"],
     "failures": [{"name": "t1", "detail": "boom"}],
 }
-REVIEW_OK = {"verdict": "approve", "findings": []}
+REVIEW_OK = {"verdict": "approve", "findings": [], "unverified": []}
 REVIEW_MAJOR = {
     "verdict": "request_changes",
     "findings": [
         {"severity": "major", "path": "a.py", "issue": "bug", "fix": "fix it"},
         {"severity": "nit", "path": "a.py", "issue": "style", "fix": "meh"},
     ],
+    "unverified": [],
 }
 
 
@@ -205,7 +208,7 @@ def test_large_sequence_with_docs(repo):
         "review",
         "docs",
     ]
-    assert gate.plans == [PLAN]
+    assert gate.plans == [{**PLAN, "gate_reason": "size L"}]
     assert "step step-2" in backend.requests[3].prompt
     assert "a.py, b.py" in out.report_text
     check_requests(backend, cwd=str(repo))
@@ -247,7 +250,7 @@ def test_medium_approve_plan_gate(repo):
         approve_plan=True,
     )
     assert go(orch).exit_code == 3
-    assert gate.plans == [PLAN]
+    assert gate.plans == [{**PLAN, "gate_reason": "--approve-plan"}]
 
 
 def test_defer_then_resume_does_not_rerun_explore_or_architect(repo):
@@ -270,7 +273,7 @@ def test_defer_then_resume_does_not_rerun_explore_or_architect(repo):
     out2 = asyncio.run(orch2.resume(run_id))
     assert (out2.status, out2.exit_code) == ("done", 0)
     assert [s for s, _ in seq(backend2)] == ["implement", "implement", "test", "review"]
-    assert gate2.plans == [PLAN]
+    assert gate2.plans == [{**PLAN, "gate_reason": "size L"}]
 
     # Resuming a finished run is a no-op.
     orch3, backend3, _ = make(repo, {})
@@ -784,7 +787,8 @@ def test_reject_with_feedback_replans_then_approve(repo, size):
     prompt = backend2.requests[0].prompt
     assert "use c.py instead" in prompt and '"change":"one"' in prompt
     assert keys(orch2) == ["explore", base, f"{base}:r1"]
-    assert gate2.plans == [PLAN_R1]
+    reason = "size L" if size == "L" else "revised plan"
+    assert gate2.plans == [{**PLAN_R1, "gate_reason": reason}]
     state = orch2.run_state.state
     assert (state["plan_revision"], state["plan_feedback"]) == (1, ["use c.py instead"])
 
@@ -793,7 +797,7 @@ def test_reject_with_feedback_replans_then_approve(repo, size):
         repo, {"implement": [impl("c.py")], "test": [TEST_OK], "review": [REVIEW_OK]}
     )
     assert asyncio.run(orch3.resume(run_id)).status == "done"
-    assert gate3.plans == [PLAN_R1]
+    assert gate3.plans == [{**PLAN_R1, "gate_reason": reason}]
     assert [s for s, _ in seq(backend3)] == ["implement", "test", "review"]
     if size == "L":
         assert "implement:step-r1" in keys(orch3)
@@ -1134,3 +1138,446 @@ def test_unrestricted_bash_option_reaches_requests(repo, flag):
     assert bool(warned) is flag
     if flag:
         assert "--unrestricted-bash" in warned[0]["message"]
+
+
+def test_small_verifiability_gate_after_implement_then_approve(repo):
+    orch, backend, gate = make(
+        repo,
+        {"implement": [impl(".github/workflows/x.yml")]},
+        gate=AutoGate(decision="defer"),
+        size="S",
+    )
+    out = go(orch)
+    assert (out.status, out.exit_code) == ("awaiting_approval", 3)
+    assert seq(backend) == [("implement", "implementer")]
+    state = json.loads((orch.run_state.dir / "state.json").read_text())
+    assert state["gate"] == {
+        "trigger": "verifiability",
+        "paths": [".github/workflows/x.yml"],
+        "stage": "post-implement",
+    }
+    assert "gate: verifiability (paths: .github/workflows/x.yml)" in out.report_text
+    assert state["extent"]["areas"] == [".github"]
+    assert gate.plans[0]["steps"][0]["files"] == [".github/workflows/x.yml"]
+    assert gate.plans[0]["gate_reason"] == "low-verifiability paths: .github/workflows/x.yml"
+    events = [json.loads(e) for e in (orch.run_state.dir / "events.jsonl").read_text().splitlines()]
+    assert any(e["event"] == "gate" and e.get("trigger") == "verifiability" for e in events)
+
+    # --feedback cannot revise implemented changes.
+    orch2, _, _ = make(repo, {})
+    with pytest.raises(OrchestratorError, match="--feedback"):
+        asyncio.run(orch2.resume(out.run_id, feedback="other"))
+
+    # Approving replays the memoised implement stage and continues to test.
+    orch3, backend3, gate3 = make(repo, {"test": [TEST_OK]})
+    out3 = asyncio.run(orch3.resume(out.run_id))
+    assert out3.status == "done"
+    assert seq(backend3) == [("test", "test-runner")]
+    assert len(gate3.plans) == 1
+
+
+def test_small_verifiability_gate_reject_points_to_diff(repo):
+    orch, _, _ = make(
+        repo,
+        {"implement": [impl("db/migrations/1.sql")]},
+        gate=AutoGate(decision="defer"),
+        size="S",
+    )
+    run_id = go(orch).run_id
+    orch2, _, _ = make(repo, {})
+    out = asyncio.run(orch2.resume(run_id, reject=True))
+    assert out.status == "failed"
+    assert f"carcara diff {run_id}" in out.report_text
+
+
+@pytest.mark.parametrize("reported", ["none", "absolute"])
+def test_small_verifiability_gate_uses_git_changes(repo, reported):
+    (repo / ".github" / "workflows").mkdir(parents=True)
+    out = impl()
+    if reported == "none":
+        out["changed"] = []
+    else:
+        out["changed"] = [{"path": str(repo / ".github/workflows/x.yml"), "summary": "s"}]
+    orch, _ = make_editing(
+        repo,
+        {"implement": [out]},
+        [{".github/workflows/x.yml": "on: push\n"}],
+        gate=AutoGate(decision="defer"),
+        size="S",
+    )
+    assert go(orch).status == "awaiting_approval"
+    state = orch.run_state.state
+    assert state["gate"]["paths"] == [".github/workflows/x.yml"]
+    assert state["changed_paths"] == [".github/workflows/x.yml"]
+    assert state["extent"]["areas"] == [".github"]
+    assert state["extent"]["files_changed"] == 1
+
+
+def test_project_config_snapshot_used_on_resume(repo):
+    (repo / ".carcara").mkdir()
+    config = repo / ".carcara" / "config.json"
+    config.write_text('{"verifiability_paths": ["db/**"]}')
+    orch, _, _ = make(
+        repo,
+        {"implement": [impl("db/x.sql")]},
+        gate=AutoGate(decision="defer"),
+        size="S",
+    )
+    out = go(orch)
+    assert out.status == "awaiting_approval"
+    snapshot = {"verifiability_paths": ["db/**"], "probes": {}}
+    assert orch.run_state.state["project_config"] == snapshot
+    # A mid-run edit (e.g. adding a probe host) has no effect on the resumed run.
+    config.write_text('{"verifiability_paths": [], "probes": {"p": "https://evil/{arg}"}}')
+    orch2, _, _ = make(repo, {"test": [TEST_OK]})
+    assert orch2.config.probes
+    assert asyncio.run(orch2.resume(out.run_id)).status == "done"
+    assert orch2.config.verifiability_paths == ["db/**"] and orch2.config.probes == {}
+    assert orch2.run_state.state["project_config"] == snapshot
+
+
+def test_resume_without_config_snapshot_reads_file(repo):
+    orch, _, _ = make(
+        repo, {"implement": [impl("db/x.sql")]}, gate=AutoGate(decision="defer"), size="S"
+    )
+    orch.config = parse_project_config({"verifiability_paths": ["db/**"]})
+    out = go(orch)
+    run = orch.run_state
+    del run.state["project_config"]
+    run.save()
+    orch2, _, _ = make(repo, {"test": [TEST_OK]})
+    assert asyncio.run(orch2.resume(out.run_id)).status == "done"
+    assert orch2.config.verifiability_paths == list(DEFAULT_VERIFIABILITY_PATHS)
+
+
+def test_small_ordinary_path_no_gate(repo):
+    orch, backend, gate = make(repo, {"implement": [impl("src/a.py")], "test": [TEST_OK]}, size="S")
+    assert go(orch).status == "done"
+    assert gate.plans == []
+    assert "gate" not in orch.run_state.state
+    assert [s for s, _ in seq(backend)] == ["implement", "test"]
+
+
+def test_small_verifiability_paths_config_disables(repo):
+    (repo / ".carcara").mkdir()
+    (repo / ".carcara" / "config.json").write_text('{"verifiability_paths": []}')
+    orch, _, gate = make(repo, {"implement": [impl(".github/x.yml")], "test": [TEST_OK]}, size="S")
+    assert go(orch).status == "done"
+    assert gate.plans == []
+
+
+def test_invalid_project_config_is_orchestrator_error(repo):
+    (repo / ".carcara").mkdir()
+    (repo / ".carcara" / "config.json").write_text('{"nope": 1}')
+    orch, _, _ = make(repo, {})
+    with pytest.raises(OrchestratorError, match="unknown config keys"):
+        go(orch)
+
+
+def test_resume_uses_snapshot_when_disk_config_invalid(repo):
+    (repo / ".carcara").mkdir()
+    config = repo / ".carcara" / "config.json"
+    config.write_text('{"verifiability_paths": ["db/**"]}')
+    orch, _, _ = make(
+        repo, {"implement": [impl("db/x.sql")]}, gate=AutoGate(decision="defer"), size="S"
+    )
+    out = go(orch)
+    assert out.status == "awaiting_approval"
+    config.write_text('{"nope": 1}')
+    orch2, _, _ = make(repo, {"test": [TEST_OK]})
+    assert asyncio.run(orch2.resume(out.run_id)).status == "done"
+    assert orch2.config.verifiability_paths == ["db/**"]
+
+
+def test_resume_without_snapshot_and_invalid_disk_config_errors(repo):
+    orch, _, _ = make(
+        repo, {"implement": [impl("db/x.sql")]}, gate=AutoGate(decision="defer"), size="S"
+    )
+    orch.config = parse_project_config({"verifiability_paths": ["db/**"]})
+    out = go(orch)
+    run = orch.run_state
+    del run.state["project_config"]
+    run.save()
+    (repo / ".carcara" / "config.json").write_text('{"nope": 1}')
+    orch2, _, _ = make(repo, {"test": [TEST_OK]})
+    with pytest.raises(OrchestratorError, match="unknown config keys"):
+        asyncio.run(orch2.resume(out.run_id))
+
+
+def test_medium_plan_paths_gate_before_implement(repo):
+    plan = {**PLAN, "steps": [{"id": "s1", "files": ["db/migrations/1.sql"], "change": "x"}]}
+    orch, backend, gate = make(
+        repo, {"explore": [EXPLORE], "plan": [plan]}, gate=AutoGate(decision="defer"), size="M"
+    )
+    assert go(orch).status == "awaiting_approval"
+    assert [s for s, _ in seq(backend)] == ["explore", "plan"]
+    assert orch.run_state.state["gate"] == {
+        "trigger": "verifiability",
+        "paths": ["db/migrations/1.sql"],
+        "stage": "plan",
+    }
+    assert len(gate.plans) == 1
+
+
+@pytest.mark.parametrize(
+    ("size", "approve_plan", "trigger"), [("L", False, "size"), ("M", True, "flag")]
+)
+def test_gate_records_size_and_flag_triggers(repo, size, approve_plan, trigger):
+    orch, _, _ = make(
+        repo,
+        {"explore": [EXPLORE], "plan": [PLAN]},
+        gate=AutoGate(decision="defer"),
+        size=size,
+        approve_plan=approve_plan,
+    )
+    go(orch)
+    assert orch.run_state.state["gate"] == {"trigger": trigger, "paths": [], "stage": "plan"}
+
+
+def _review(verdict="approve", findings=(), unverified=()):
+    return {"verdict": verdict, "findings": list(findings), "unverified": list(unverified)}
+
+
+def test_unverified_ids_stable_across_fix_round(repo):
+    first = _review(
+        "request_changes",
+        REVIEW_MAJOR["findings"],
+        [
+            {"id": "U1", "kind": "external", "text": "PyPI name  is free"},
+            {"id": "A", "kind": "normative", "text": "keep CLI flags"},
+        ],
+    )
+    second = _review(
+        unverified=[
+            {"id": "U7", "kind": "external", "text": "pypi name is free"},  # text match
+            # id match but the text changed: a new id
+            {"id": "U2", "kind": "normative", "text": "keep CLI flags as they are"},
+            {"id": "U1", "kind": "untested", "text": "error path"},  # id clash, kind differs
+        ]
+    )
+    orch, backend, _ = make(
+        repo,
+        {"implement": [impl(), impl()], "test": [TEST_OK, TEST_OK], "review": [first, second]},
+        size="S",
+        review_small=True,
+    )
+    assert go(orch).status == "done"
+    state = orch.run_state.state
+    assert [(i["id"], i["kind"]) for i in state["unverified"]] == [
+        ("U1", "external"),
+        ("U3", "normative"),
+        ("U4", "untested"),
+    ]
+    assert state["unverified_next"] == 5
+    assert state["probe_results"] == {}
+    retry_review = [r for r in backend.requests if r.stage == "review"][1].prompt
+    assert "Prior inventory" in retry_review and '"id":"U1"' in retry_review
+    assert "Allow-listed probes" not in retry_review
+    report = (orch.run_state.dir / "report.md").read_text()
+    assert "unverified: 3 open (external 1, normative 1, untested 1)" in report
+    assert "  - U1 [external] pypi name is free" in report
+    assert "  - U4 [untested] error path" in report
+    assert "extent: 1 files, areas a.py, fix rounds 1 [carcara/extent-1]" in report
+    assert state["extent"] == {
+        "rule": "carcara/extent-1",
+        "files_changed": 1,
+        "areas": ["a.py"],
+        "areas_truncated": False,
+        "fix_rounds": 1,
+    }
+    assert "observed size" not in report
+
+
+def test_extent_facts_areas_capped(repo):
+    many = impl()
+    many["changed"] = [{"path": f"d{n:02}/x.py", "summary": "s"} for n in range(12)] + [
+        {"path": "./d00/y.py", "summary": "s"}
+    ]
+    orch, _, _ = make(repo, {"implement": [many], "test": [TEST_OK]}, size="S")
+    assert go(orch).status == "done"
+    extent = orch.run_state.state["extent"]
+    assert extent["files_changed"] == 13
+    assert extent["areas"] == [f"d{n:02}" for n in range(10)]
+    assert extent["areas_truncated"] is True
+    assert extent["fix_rounds"] == 0
+    report = (orch.run_state.dir / "report.md").read_text()
+    assert "extent: 13 files, areas d00, " in report and "d09 (+), fix rounds 0" in report
+    assert "unverified:" not in report and "gate:" not in report
+
+
+def test_no_extent_without_implement(repo):
+    orch, _, _ = make(repo, {"explore": [EXPLORE], "plan": [PLAN]}, size="L", plan_only=True)
+    assert go(orch).status == "plan_only"
+    assert "extent" not in orch.run_state.state
+    assert "extent:" not in (orch.run_state.dir / "report.md").read_text()
+
+
+def test_review_prompt_path_questions(repo):
+    orch, backend, _ = make(
+        repo,
+        {"implement": [impl(".github/workflows/x.yml")], "test": [TEST_OK], "review": [REVIEW_OK]},
+        size="S",
+        review_small=True,
+    )
+    assert go(orch).status == "done"
+    prompt = backend.requests[-1].prompt
+    assert "Assumptions inventory" in prompt
+    assert "external accounts, package names, environments or secrets" in prompt
+    assert "reversibility" not in prompt
+
+
+def test_review_prompt_policy_dir_question(repo):
+    orch, backend, _ = make(
+        repo,
+        {"implement": [impl("src/policy/x.py")], "test": [TEST_OK], "review": [REVIEW_OK]},
+        size="S",
+        review_small=True,
+    )
+    assert go(orch).status == "done"
+    assert orch.run_state.state["gate"]["paths"] == ["src/policy/x.py"]
+    assert "principals, permissions and threat assumptions" in backend.requests[-1].prompt
+
+
+def test_probes_run_for_allow_listed_external_items(repo):
+    import urllib.error
+
+    (repo / ".carcara").mkdir()
+    (repo / ".carcara" / "config.json").write_text(
+        json.dumps({"probes": {"pypi-name": "https://pypi.org/pypi/{arg}/json"}})
+    )
+    review = _review(
+        unverified=[
+            {"id": "U1", "kind": "external", "text": "name is free",
+             "probe": {"name": "pypi-name", "arg": "carcara-sdlc", "expect": "absent"}},
+            {"id": "U2", "kind": "external", "text": "other",
+             "probe": {"name": "not-configured", "arg": "x", "expect": "exists"}},
+            {"id": "U3", "kind": "normative", "text": "n"},
+        ]
+    )
+    orch, backend, _ = make(
+        repo,
+        {"implement": [impl()], "test": [TEST_OK], "review": [review]},
+        size="S",
+        review_small=True,
+    )
+    calls = []
+
+    def opener(req, timeout):
+        calls.append((req.get_method(), req.full_url, timeout))
+        raise urllib.error.HTTPError(req.full_url, 404, "nf", {}, None)
+
+    orch.probe_opener = opener
+    assert go(orch).status == "done"
+    assert calls == [("GET", "https://pypi.org/pypi/carcara-sdlc/json", 5.0)]
+    state = orch.run_state.state
+    assert state["probe_results"] == {
+        "U1": {
+            "probe": {"name": "pypi-name", "arg": "carcara-sdlc", "expect": "absent"},
+            "outcome": "confirmed",
+            "result": "HTTP 404",
+        }
+    }
+    assert state["unverified"][0]["resolved"] is True
+    assert "resolved" not in state["unverified"][1]
+    assert "Allow-listed probes" in backend.requests[-1].prompt
+    events = [json.loads(e) for e in (orch.run_state.dir / "events.jsonl").read_text().splitlines()]
+    assert [e["id"] for e in events if e["event"] == "probe"] == ["U1"]
+
+
+def _probe_item(uid, text, arg, expect="absent"):
+    return {
+        "id": uid,
+        "kind": "external",
+        "text": text,
+        "probe": {"name": "pypi-name", "arg": arg, "expect": expect},
+    }
+
+
+def _probe_run(repo, reviews):
+    import urllib.error
+
+    (repo / ".carcara").mkdir()
+    (repo / ".carcara" / "config.json").write_text(
+        json.dumps({"probes": {"pypi-name": "https://pypi.org/pypi/{arg}/json"}})
+    )
+    orch, _, _ = make(
+        repo,
+        {"implement": [impl()], "test": [TEST_OK], "review": [reviews[0]]},
+        size="S",
+        review_small=True,
+    )
+    calls = []
+
+    def opener(req, timeout):
+        calls.append(req.full_url)
+        if req.full_url.endswith("/taken/json"):
+            return types.SimpleNamespace(status=200, close=lambda: None)
+        raise urllib.error.HTTPError(req.full_url, 404, "nf", {}, None)
+
+    orch.probe_opener = opener
+    assert go(orch).status == "done"
+    run = orch.run_state
+    for n, review in enumerate(reviews[1:], 1):
+        orch._record_unverified(run, f"extra-{n}:review", review)
+    return run.state, calls
+
+
+def test_reused_id_with_changed_text_gets_new_id_and_probe(repo):
+    state, calls = _probe_run(
+        repo,
+        [
+            _review(unverified=[_probe_item("U1", "name A is free", "free")]),
+            _review(unverified=[_probe_item("U1", "name B is free", "taken")]),
+        ],
+    )
+    assert [i["id"] for i in state["unverified"]] == ["U2"]
+    assert "resolved" not in state["unverified"][0]
+    assert calls[-1].endswith("/taken/json") and len(calls) == 2
+    assert set(state["probe_results"]) == {"U2"}
+    assert state["probe_results"]["U2"]["outcome"] == "contradicted"
+
+
+def test_same_text_changed_probe_is_reprobed(repo):
+    state, calls = _probe_run(
+        repo,
+        [
+            _review(unverified=[_probe_item("U1", "name is free", "free")]),
+            _review(unverified=[_probe_item("U1", "name is free", "free")]),
+            _review(unverified=[_probe_item("U1", "name is free", "taken")]),
+        ],
+    )
+    # Unchanged probe reuses the stored result; the changed arg is re-probed.
+    assert len(calls) == 2 and calls[1].endswith("/taken/json")
+    assert [i["id"] for i in state["unverified"]] == ["U1"]
+    assert "resolved" not in state["unverified"][0]
+    assert state["probe_results"]["U1"]["probe"]["arg"] == "taken"
+    assert state["probe_results"]["U1"]["outcome"] == "contradicted"
+
+
+def test_unchanged_probe_keeps_confirmed_result(repo):
+    state, calls = _probe_run(
+        repo,
+        [
+            _review(unverified=[_probe_item("U1", "name is free", "free")]),
+            _review(unverified=[_probe_item("U9", "Name is  free", "free")]),
+        ],
+    )
+    assert len(calls) == 1
+    assert state["unverified"][0]["id"] == "U1" and state["unverified"][0]["resolved"] is True
+
+
+def test_record_unverified_tolerates_old_review_output(repo):
+    orch, _, _ = make(
+        repo,
+        {"implement": [impl()], "test": [TEST_OK], "review": [REVIEW_OK]},
+        size="S",
+        review_small=True,
+    )
+    go(orch)
+    run = orch.run_state
+    orch._record_unverified(run, "old:review", {"verdict": "approve", "findings": []})
+    assert run.state["unverified"] == []
+    # Replaying an already recorded review key changes nothing.
+    run.state["unverified"] = [{"id": "U9", "kind": "external", "text": "t"}]
+    orch._record_unverified(run, "old:review", REVIEW_OK)
+    assert run.state["unverified"][0]["id"] == "U9"

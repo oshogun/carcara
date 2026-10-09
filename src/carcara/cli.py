@@ -247,6 +247,10 @@ def _dry_run(profile: Any, ns: argparse.Namespace, cwd: str, origin: str) -> str
                 out.append(f"  {'gate':<10} {'human':<12} {'-':<24} {'-':<12} -")
         if size == "L":
             out.append("  (implement runs once per plan step; docs only for user-facing changes)")
+    out.append(
+        "\n(the gate also triggers when the plan or, for S, the changed files touch"
+        " low-verifiability paths; see .carcara/config.json verifiability_paths)"
+    )
     return "\n".join(out) + "\n"
 
 
@@ -441,6 +445,33 @@ def diff_main(ns: argparse.Namespace) -> int:
     return 0
 
 
+def _verifiability_lines(state: dict[str, Any]) -> list[str]:
+    """Gate trigger, extent facts and open unverified items for the no-report fallback."""
+    from carcara.schemas import UNVERIFIED_KINDS
+
+    lines = []
+    gate = state.get("gate")
+    if gate:
+        paths = f" (paths: {', '.join(gate['paths'])})" if gate.get("paths") else ""
+        lines.append(f"gate: {gate.get('trigger', '?')}{paths}")
+    extent = state.get("extent")
+    if extent:
+        lines.append(
+            f"extent: {extent.get('files_changed', 0)} files, "
+            f"areas {', '.join(extent.get('areas') or []) or 'none'}, "
+            f"fix rounds {extent.get('fix_rounds', 0)} [{extent.get('rule', '?')}]"
+        )
+    open_items = [i for i in state.get("unverified") or [] if not i.get("resolved")]
+    if open_items:
+        counts = ", ".join(
+            f"{kind} {sum(1 for i in open_items if i.get('kind') == kind)}"
+            for kind in UNVERIFIED_KINDS
+        )
+        lines.append(f"unverified: {len(open_items)} open ({counts})")
+        lines.extend(f"  - {i['id']} [{i['kind']}] {i['text']}" for i in open_items)
+    return lines
+
+
 def status_main(ns: argparse.Namespace) -> int:
     from carcara.gate import render_plan
     from carcara.orchestrator import EXIT_CODES
@@ -473,6 +504,10 @@ def status_main(ns: argparse.Namespace) -> int:
             "cost_usd": float(state.get("totals", {}).get("cost_usd", 0.0)),
             "failed_attempts": len(attempts),
             "uncounted_stages": uncounted,
+            "gate": state.get("gate"),
+            "unverified": state.get("unverified") or [],
+            "probe_results": state.get("probe_results") or {},
+            "extent": state.get("extent"),
         }
         sys.stdout.write(json.dumps(data, indent=2) + "\n")
         return 0
@@ -492,6 +527,7 @@ def status_main(ns: argparse.Namespace) -> int:
                 f"warning: cost unknown for {len(uncounted)} failed stage attempt(s): "
                 f"{', '.join(map(str, uncounted))}"
             )
+        lines += _verifiability_lines(state)
         report = "\n".join(lines) + "\n"
     sys.stdout.write(report)
     if holder is not None and active:

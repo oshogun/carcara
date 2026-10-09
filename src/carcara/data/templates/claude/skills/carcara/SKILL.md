@@ -46,7 +46,11 @@ Take the exit code of the background `carcara run`, read
 - **0 done** (or plan_only): summarise the report - files changed, tests,
   review verdict, estimated cost - and mention `carcara diff <id>`.
 - **3 awaiting_approval**: show the output of `carcara status <id> --plan`, then
-  ask the user (AskUserQuestion): approve / request changes / reject.
+  ask the user (AskUserQuestion): approve / request changes / reject. The
+  plan's `Gate:` line says why it stopped. A low-verifiability gate after
+  implement (the steps list changed files) means the changes are already in
+  the working tree: offer `carcara diff <id>`, and only approve / reject
+  (request changes is not available).
   - Approve: background `carcara run --resume <id> --yes`. The user gets a
     permission prompt; that prompt is their approval.
   - Request changes: background

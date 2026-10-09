@@ -29,7 +29,7 @@ IMPLEMENT_OK = {
     "blocked": False,
     "user_facing_change": False,
 }
-REVIEW_OK = {"verdict": "approve", "findings": []}
+REVIEW_OK = {"verdict": "approve", "findings": [], "unverified": []}
 
 
 def result_message(structured=None, subtype="success", is_error=False, cost=0.12, errors=None):
