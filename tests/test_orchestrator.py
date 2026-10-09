@@ -459,14 +459,52 @@ def test_budget_none_stored_for_uncapped_run(repo):
 
 
 def test_stage_error_fails_and_is_resumable(repo):
-    err = StageResult(subtype="error_max_turns", is_error=True, errors=["too many turns"])
+    err = StageResult(subtype="error_during_execution", is_error=True, errors=["boom"])
     orch, _, _ = make(repo, {"implement": [impl()], "test": [err]}, size="S")
     out = go(orch)
     assert (out.status, out.exit_code) == ("failed", 1)
-    assert "too many turns" in out.report_text
+    assert "boom" in out.report_text
     orch2, backend2, _ = make(repo, {"test": [TEST_OK]})
     assert asyncio.run(orch2.resume(out.run_id)).status == "done"
     assert seq(backend2) == [("test", "test-runner")]
+
+
+def test_test_stage_max_turns_retried_once(repo):
+    err = StageResult(subtype="error_max_turns", is_error=True, cost_usd=0.008)
+    orch, backend, _ = make(repo, {"implement": [impl()], "test": [err, TEST_OK]}, size="S")
+    out = go(orch)
+    assert (out.status, out.exit_code) == ("done", 0)
+    first, retry = [r for r in backend.requests if r.stage == "test"]
+    assert "ran out of turns" not in first.prompt
+    assert "ran out of turns" in retry.prompt
+    assert "do not investigate or debug" in first.prompt
+    assert len(_events(orch, "stage_retry")) == 1
+    (attempt,) = orch.run_state.state["failed_attempts"]
+    assert attempt["key"] == "test" and attempt["counted"] is True
+
+
+def test_test_stage_max_turns_twice_needs_human(repo):
+    err = StageResult(subtype="error_max_turns", is_error=True, cost_usd=0.008)
+    orch, backend, _ = make(repo, {"implement": [impl()], "test": [err, err]}, size="S")
+    out = go(orch)
+    assert (out.status, out.exit_code) == ("needs_human", 4)
+    assert "test stage (test) ran out of turns" in out.report_text
+    assert "run the test suite yourself" in out.report_text
+    assert [r.stage for r in backend.requests].count("test") == 2
+    assert orch.run_state.state["totals"]["cost_usd"] == pytest.approx(0.016)
+    orch2, backend2, _ = make(repo, {"test": [TEST_OK]})
+    assert asyncio.run(orch2.resume(out.run_id)).status == "done"
+    assert seq(backend2) == [("test", "test-runner")]
+
+
+def test_non_test_stage_max_turns_not_retried(repo):
+    err = StageResult(subtype="error_max_turns", is_error=True, errors=["too many turns"])
+    orch, backend, _ = make(repo, {"implement": [err]}, size="S")
+    out = go(orch)
+    assert (out.status, out.exit_code) == ("failed", 1)
+    assert "too many turns" in out.report_text
+    assert [r.stage for r in backend.requests].count("implement") == 1
+    assert _events(orch, "stage_retry") == []
 
 
 def test_dirty_tree_refused_on_fresh_run(repo):
@@ -617,7 +655,7 @@ def test_other_backend_errors_not_retried(repo):
 
 
 def test_is_error_stage_cost_counted_in_totals(repo):
-    err = StageResult(subtype="error_max_turns", is_error=True, cost_usd=0.008)
+    err = StageResult(subtype="error_during_execution", is_error=True, cost_usd=0.008)
     orch, _, _ = make(repo, {"implement": [impl()], "test": [err]}, size="S")
     out = go(orch)
     assert out.status == "failed"
@@ -643,11 +681,12 @@ def test_failed_stage_cost_on_stage_error_event(repo):
 
 
 def test_is_error_stage_cost_on_event_and_failed_attempts(repo):
-    err = StageResult(subtype="error_max_turns", is_error=True, cost_usd=0.008, num_turns=3)
+    err = StageResult(subtype="error_during_execution", is_error=True, cost_usd=0.008, num_turns=3)
     orch, _, _ = make(repo, {"implement": [impl()], "test": [err]}, size="S")
     go(orch)
     (error,) = _events(orch, "stage_error")
-    assert error["subtype"] == "error_max_turns" and error["cost_usd"] == pytest.approx(0.008)
+    assert error["subtype"] == "error_during_execution"
+    assert error["cost_usd"] == pytest.approx(0.008)
     (attempt,) = orch.run_state.state["failed_attempts"]
     assert attempt["counted"] is True and attempt["cost_usd"] == pytest.approx(0.008)
     # Recorded once: the totals are not charged twice.

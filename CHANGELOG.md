@@ -6,6 +6,12 @@
 - The PyPI distribution is now named `carcara-sdlc` (`carcara` is taken on
   PyPI): install with `pipx install carcara-sdlc`. The import package and the
   `carcara` command are unchanged.
+- The test stage no longer fails the run when it runs out of turns (#18).
+  Its default turn limit goes from 30 to 50, and the prompt tells the
+  test-runner to run each command once and report without debugging. When
+  it still hits the limit it is retried once and told to report what it has.
+  A second time stops the run as `needs_human`, not `failed`. Other stages
+  are unchanged.
 
 ### Added
 - `carcara uninstall [target] [-n] [-f] [--purge]` removes carcara's agents,

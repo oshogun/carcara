@@ -80,7 +80,7 @@ DEFAULT_MAX_TURNS: dict[str, int] = {
     "plan": 5,
     "architect": 30,
     "implement": 80,
-    "test": 30,
+    "test": 50,
     "review": 30,
     "docs": 30,
 }
@@ -130,6 +130,13 @@ _STRUCTURED_OUTPUT_NUDGE = (
     "\n\nYour previous attempt at this stage ended without a result. When done, you"
     " MUST call the StructuredOutput tool exactly once with a result matching the"
     " stage's output schema."
+)
+
+# Appended to the test stage's prompt when retrying after it ran out of turns.
+_MAX_TURNS_NUDGE = (
+    "\n\nYour previous attempt at this stage ran out of turns. Do not investigate or"
+    " debug: run at most the essential commands, then report what you have now by"
+    " calling the StructuredOutput tool exactly once."
 )
 
 
@@ -965,6 +972,7 @@ class Orchestrator:
                 f"\n\nA previous attempt at this stage was blocked: {blocked.get('notes', '')}"
                 f"\n\nUser guidance:\n{blocked['feedback']}"
             )
+        nudge = ""
         for attempt in range(2):
             remaining: float | None = None
             if self.options.max_budget_usd is not None:
@@ -975,7 +983,7 @@ class Orchestrator:
                 stage,
                 role,
                 self.profile,
-                text if attempt == 0 else text + _STRUCTURED_OUTPUT_NUDGE,
+                text + nudge,
                 self.cwd,
                 max_turns=self.options.max_turns.get(turns_key),
                 max_budget_usd=remaining,
@@ -985,7 +993,6 @@ class Orchestrator:
             run.event("stage_started", key=key, stage=stage, role=role_name, model=request.model)
             try:
                 result = await self.backend.run_stage(request)
-                break
             except BackendError as exc:
                 # Count whatever the stage spent (e.g. a result with missing or
                 # invalid structured output); with no StageResult the cost is unknown.
@@ -999,6 +1006,7 @@ class Orchestrator:
                 if isinstance(exc, NoStructuredOutput) and attempt == 0:
                     # A missing result is usually a one-off slip: retry once.
                     run.event("stage_retry", key=key, reason=str(exc))
+                    nudge = _STRUCTURED_OUTPUT_NUDGE
                     continue
                 raise _Stop("failed", f"stage {key} failed: {exc}") from exc
             except BaseException as exc:
@@ -1008,6 +1016,24 @@ class Orchestrator:
                 )
                 run.event("stage_error", key=key, error=repr(exc), **cost)
                 raise
+            if stage == "test" and result.subtype == "error_max_turns":
+                # The test-runner kept going instead of reporting: nudge it once,
+                # then hand over to the human rather than failing the run.
+                run.add_cost(result.cost_usd, result.usage, result.num_turns)
+                cost = self._record_failure(
+                    run, key, stage, role_name, request.model, result, "ran out of turns"
+                )
+                run.event("stage_error", key=key, subtype=result.subtype, **cost)
+                if attempt == 0:
+                    run.event("stage_retry", key=key, reason="ran out of turns")
+                    nudge = _MAX_TURNS_NUDGE
+                    continue
+                raise _Stop(
+                    "needs_human",
+                    f"the test stage ({key}) ran out of turns twice without reporting; "
+                    "run the test suite yourself, or resume with guidance",
+                )
+            break
 
         run.add_cost(result.cost_usd, result.usage, result.num_turns)
         if result.subtype == "error_max_budget_usd":
@@ -1458,7 +1484,8 @@ class Orchestrator:
         def test_prompt() -> str:
             return (
                 f"Task: {task}\n\nRun the project's build, lint and tests relevant to the "
-                "change and report the results."
+                "change and report the results. Run each relevant command once; do not "
+                "investigate or debug failures. Report the results straight away."
             )
 
         def review_prompt() -> str:
