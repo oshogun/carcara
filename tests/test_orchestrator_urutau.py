@@ -18,6 +18,7 @@ from test_orchestrator import (
     REVIEW_OK,
     TEST_OK,
     TRIAGE_S,
+    _refute,
     impl,
 )
 
@@ -505,6 +506,7 @@ def test_ultra_inventory_comes_only_from_merge_review(repo):
         "explore:a": [EXPLORE],
         "explore:b": [EXPLORE],
         "review-dim": [dim] * 3 + [_with_inventory(REVIEW_OK, "dim only")] * 3,
+        "review-refute": [_refute()],
     }
     log: list = []
     orch, _ = make(repo, ultra, log=log, size="M", ultra=True)

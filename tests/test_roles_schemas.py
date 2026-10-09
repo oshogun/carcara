@@ -90,6 +90,8 @@ def test_schemas_are_strict():
         "test",
         "review",
         "review-dim",
+        "review-refute",
+        "review-refute-2",
         "docs",
     }
     for schema in SCHEMAS.values():
@@ -110,6 +112,29 @@ def test_review_dim_schema_matches_review():
     ok = {"verdict": "approve", "findings": [], "unverified": []}
     assert validate("review-dim", ok) == []
     assert validate("review-dim", {**ok, "verdict": "maybe"})
+
+
+def test_review_refute_schema():
+    ok = {
+        "disproved": False,
+        "severity": "major",
+        "goal_defeating": True,
+        "low_verifiability": False,
+        "rationale": "bypass",
+        "evidence": [],
+    }
+    assert validate("review-refute", ok) == []
+    assert SCHEMAS["review-refute-2"] is SCHEMAS["review-refute"]
+    cite = {"path": "a.py", "line": 2, "quote": "y = 2"}
+    assert validate("review-refute", {**ok, "evidence": [cite]}) == []
+    assert validate("review-refute", {k: v for k, v in ok.items() if k != "evidence"})
+    assert validate("review-refute", {**ok, "evidence": [{**cite, "line": "2"}]})
+    assert validate("review-refute", {**ok, "evidence": [{**cite, "line": 0}]})
+    assert validate("review-refute", {**ok, "evidence": [{**cite, "extra": 1}]})
+    assert validate("review-refute", {**ok, "severity": "critical"})
+    assert validate("review-refute", {**ok, "disproved": "no"})
+    assert validate("review-refute", {k: v for k, v in ok.items() if k != "goal_defeating"})
+    assert validate("review-refute", {**ok, "extra": 1})
 
 
 def test_plan_step_depends_on_is_optional():

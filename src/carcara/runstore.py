@@ -225,6 +225,15 @@ class Run:
         )
         self.save()
 
+    def amend_stage_output(self, key: str, output: Any) -> None:
+        """Replace a recorded stage's output, keeping the first original once."""
+        entry = self.stage(key)
+        if entry is None:
+            raise RunStoreError(f"stage key not recorded: {key}")
+        entry.setdefault("original_output", entry["output"])
+        entry["output"] = output
+        self.save()
+
     def write_report(self, text: str) -> None:
         (self.dir / "report.md").write_text(text if text.endswith("\n") else text + "\n")
 

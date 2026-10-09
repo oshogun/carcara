@@ -99,7 +99,10 @@ def test_dry_run_ultra_shows_parallel_rows(repo, capsys):
     out = capsys.readouterr().out
     stages = [ln.split()[0] for ln in out.splitlines() if ln.startswith("  ")]
     assert stages[:3] == ["stage", "scope", "explore"]
-    assert "explore x<=4 (parallel)" in out and "review x3 (parallel) + merge" in out
+    assert (
+        "explore x<=4 (parallel)" in out
+        and "review x3 (parallel) + merge + refute x<=6 (parallel)" in out
+    )
     scope = next(ln for ln in out.splitlines() if ln.strip().startswith("scope"))
     assert " main " in scope
 
@@ -114,7 +117,7 @@ def test_dry_run_ultra_rows_stay_aligned(repo, capsys):
     assert run(repo, "--dry-run", "--size", "L", "--ultra") == 0
     rows = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("  ")]
     rows = [ln for ln in rows if not ln.startswith("  (")]
-    width = len("review x3 (parallel) + merge")
+    width = len("review x3 (parallel) + merge + refute x<=6 (parallel)")
     assert {ln[2 + width] for ln in rows} == {" "}
     assert {ln[3 + width] for ln in rows} != {" "}
 
@@ -129,7 +132,7 @@ def test_dry_run_without_ultra_keeps_ten_char_stage_column(repo, capsys):
 def test_dry_run_ultra_small_review(repo, capsys):
     assert run(repo, "--dry-run", "--size", "S", "--ultra", "--review") == 0
     out = capsys.readouterr().out
-    assert "review x3 (parallel) + merge" in out and "scope" not in out
+    assert "review x3 (parallel) + merge + refute x<=6 (parallel)" in out and "scope" not in out
 
 
 def test_m_run_succeeds(repo, fake, capsys):

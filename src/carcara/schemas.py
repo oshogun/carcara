@@ -1,8 +1,8 @@
 """Strict JSON schemas for each ``carcara run`` stage's structured output.
 
 ``validate`` is a deliberately small checker (types, enums, required keys,
-``additionalProperties: false``, array items, ``maxItems``, ``maxLength``) so
-no jsonschema dependency is needed; it covers exactly the subset used by these
+``additionalProperties: false``, array items, ``maxItems``, ``maxLength``,
+``minimum``) so no jsonschema dependency is needed; it covers exactly the subset used by these
 schemas.
 """
 
@@ -59,6 +59,11 @@ _UNVERIFIED: dict[str, Any] = {
 }
 
 MAX_SCOPE_AREAS = 4
+# Ultra: at most this many merged review findings are refuted per round.
+MAX_REFUTERS = 6
+# The second-opinion round runs only for serious findings that were disproved
+# without valid evidence.
+MAX_SECOND_REFUTERS = MAX_REFUTERS
 
 _REVIEW: dict[str, Any] = _obj(
     {
@@ -79,6 +84,20 @@ _REVIEW: dict[str, Any] = _obj(
             )
         ),
         "unverified": _UNVERIFIED,
+    }
+)
+
+_REFUTE: dict[str, Any] = _obj(
+    {
+        "disproved": _BOOL,
+        "severity": {"type": "string", "enum": ["blocker", "major", "minor", "nit"]},
+        "goal_defeating": _BOOL,
+        "low_verifiability": _BOOL,
+        "rationale": _STR,
+        # Diff lines showing the finding is wrong; empty means no citation.
+        "evidence": _arr(
+            _obj({"path": _STR, "line": {"type": "integer", "minimum": 1}, "quote": _STR})
+        ),
     }
 )
 
@@ -136,6 +155,8 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "review": _REVIEW,
     "review-dim": _REVIEW,
+    "review-refute": _REFUTE,
+    "review-refute-2": _REFUTE,
     "scope": _obj(
         {
             "areas": _arr(_obj({"id": _STR, "focus": _STR}), max_items=MAX_SCOPE_AREAS),
@@ -170,6 +191,8 @@ def _check(schema: dict[str, Any], value: Any, path: str, errors: list[str]) -> 
             return
     if "enum" in schema and value not in schema["enum"]:
         errors.append(f"{path}: {value!r} not in {schema['enum']}")
+    if kind == "integer" and "minimum" in schema and value < schema["minimum"]:
+        errors.append(f"{path}: less than {schema['minimum']}")
     if kind == "string" and "maxLength" in schema and len(value) > schema["maxLength"]:
         errors.append(f"{path}: longer than {schema['maxLength']} characters")
     if kind == "object":

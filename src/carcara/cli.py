@@ -296,7 +296,11 @@ def _dry_run_stages(
 
     Ultra rows carry a label after the stage name (e.g. "review x3 ..."); the
     first word is the stage."""
-    review = ("review x3 (parallel) + merge", "reviewer") if ultra else ("review", "reviewer")
+    review = (
+        ("review x3 (parallel) + merge + refute x<=6 (parallel)", "reviewer")
+        if ultra
+        else ("review", "reviewer")
+    )
     if size == "S":
         rows = [("implement", "implementer"), ("test", "test-runner")]
         if review_small:
