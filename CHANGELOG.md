@@ -28,6 +28,22 @@
   The budget is split evenly across parallel siblings, and implementers stay
   sequential. The flag is kept on `--resume`. Plan steps may list
   `depends_on` to order steps. The report adds a `Parallel stages` line.
+- Ultra review findings are now challenged before they count (#22). After
+  the merge review, up to 6 non-nit findings (most severe first) each get a
+  parallel `review-refute:N` stage. The refuter tries to disprove the finding
+  and re-rates its severity with the diff in view. Severities are only raised,
+  never lowered. A finding flagged goal-defeating or low-verifiability is
+  raised to at least major, so it triggers the fix loop. A disproved finding
+  that is serious (major or higher as merged, or flagged or re-rated major or
+  higher by its refuter) is dropped only in one of two cases. Either the
+  refuter cites an added diff line near the finding, in the same file, with a
+  verbatim quote, and the finding is not a blocker and not flagged. Or a
+  second, independent `review-refute-2:N` stage agrees. Otherwise the finding
+  is kept. Other disproved findings are dropped. The verdict is then
+  recomputed from the surviving findings. The finding and the diff context
+  are fenced as untrusted data in refuter prompts. The report adds a
+  `Refutation: N checked, N re-rated, N disproved` line, with a breakdown
+  (by evidence, by second refuter, kept unverified) when it applies.
 - `carcara uninstall [target] [-n] [-f] [--purge]` removes carcara's agents,
   commands, skill, `settings.json` entries, `CLAUDE.md` section and
   `.carcara/` files while keeping user content; install then uninstall

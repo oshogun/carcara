@@ -342,9 +342,21 @@ in the state.
   false positives and merges duplicates. The merge is the review that counts:
   the fix loop, the report's `review:` line, unverified assumptions and Urutau
   data come only from it. Fix rounds use the same split (`fix-1:review-dim:*`).
+- **Refute.** After the merge, up to 6 non-nit findings (most severe first)
+  each get a parallel `review-refute:N` stage. The refuter tries to disprove
+  the finding against the diff and re-rates its severity. Severities are only
+  raised. A finding the refuter flags as goal-defeating or hard to verify
+  (security policy, shell parsing, resume and the like) becomes at least
+  major. A serious finding (major or higher, as merged or as re-rated or
+  flagged) is dropped only in two cases. Either the refuter quotes an added
+  diff line near the finding as evidence, which is never enough for blockers
+  or flagged findings. Or a second, independent `review-refute-2:N` agrees.
+  Otherwise it is kept. The verdict is then recomputed from what survives.
+  Findings and diffs are fenced as untrusted data in these prompts.
 
-Fan-out is capped at 4 explore areas and 3 dimension reviews. Each review
-round costs roughly 4x a normal review. With `--max-budget-usd`, the remaining
+Fan-out is capped at 4 explore areas, 3 dimension reviews and 6 refuters per
+round (plus up to 6 second refuters). Each review round costs roughly 4x a
+normal review, plus one review-sized stage per refuter. With `--max-budget-usd`, the remaining
 budget is split evenly across the parallel siblings. Implementers, test, docs
 and probes stay sequential in one working tree; v1 only fans out read-only
 roles. Plan steps may also list `depends_on` (ids of the steps they need);
@@ -353,7 +365,9 @@ the steps are run in dependency order, still one at a time.
 The flag is stored with the run, so `--resume` keeps the ultra stages even
 without `--ultra`. Finished parallel stages are replayed on resume and only
 the missing ones rerun. The report adds a `Parallel stages: <keys> ($x.xx)`
-line, and `--dry-run --ultra` shows the extra rows.
+line and, when refuters changed anything, a
+`Refutation: N checked, N re-rated, N disproved` line. `--dry-run --ultra`
+shows the extra rows.
 
 ### Tool policy
 
