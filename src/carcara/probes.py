@@ -131,10 +131,12 @@ def run_probes(
             outcome = "contradicted"
         else:
             outcome = "inconclusive"
-        results.append({
-            "id": str(item.get("id", "")),
-            "probe": name,
-            "outcome": outcome,
-            "result": result[:MAX_RESULT_CHARS],
-        })
+        results.append(
+            {
+                "id": str(item.get("id", "")),
+                "probe": name,
+                "outcome": outcome,
+                "result": result[:MAX_RESULT_CHARS],
+            }
+        )
     return results

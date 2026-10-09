@@ -100,8 +100,12 @@ def test_url_error_inconclusive():
 
 def test_timeout_result():
     out = run_probes([item()], PROBES, opener=FakeOpener(exc=TimeoutError()))
-    assert out[0] == {"id": "U1", "probe": "pypi-name", "outcome": "inconclusive",
-                      "result": "error: timeout"}
+    assert out[0] == {
+        "id": "U1",
+        "probe": "pypi-name",
+        "outcome": "inconclusive",
+        "result": "error: timeout",
+    }
 
 
 def test_capped_per_call():

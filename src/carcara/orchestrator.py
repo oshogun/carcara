@@ -1013,9 +1013,7 @@ class Orchestrator:
         if run.state.get("plan_approved"):
             return
         # Git is authoritative: an omitted or oddly spelled path still gates.
-        changed = match_paths(
-            self._changed_paths(run), self.config.verifiability_paths, self.cwd
-        )
+        changed = match_paths(self._changed_paths(run), self.config.verifiability_paths, self.cwd)
         if not changed:
             return
         plan = {
@@ -1047,9 +1045,7 @@ class Orchestrator:
                 + ". An external item may set probe {name, arg, expect} where expect is "
                 "'exists' or 'absent' for the resource the probe URL names with {arg}."
             )
-        flagged = match_paths(
-            self._changed_paths(run), self.config.verifiability_paths, self.cwd
-        )
+        flagged = match_paths(self._changed_paths(run), self.config.verifiability_paths, self.cwd)
         if flagged:
             questions = [q for pats, q in _PATH_QUESTIONS if match_paths(flagged, pats)]
             parts.append(

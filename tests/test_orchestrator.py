@@ -1447,10 +1447,18 @@ def test_probes_run_for_allow_listed_external_items(repo):
     )
     review = _review(
         unverified=[
-            {"id": "U1", "kind": "external", "text": "name is free",
-             "probe": {"name": "pypi-name", "arg": "carcara-sdlc", "expect": "absent"}},
-            {"id": "U2", "kind": "external", "text": "other",
-             "probe": {"name": "not-configured", "arg": "x", "expect": "exists"}},
+            {
+                "id": "U1",
+                "kind": "external",
+                "text": "name is free",
+                "probe": {"name": "pypi-name", "arg": "carcara-sdlc", "expect": "absent"},
+            },
+            {
+                "id": "U2",
+                "kind": "external",
+                "text": "other",
+                "probe": {"name": "not-configured", "arg": "x", "expect": "exists"},
+            },
             {"id": "U3", "kind": "normative", "text": "n"},
         ]
     )

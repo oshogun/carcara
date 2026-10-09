@@ -133,7 +133,7 @@ def _under(path: str, root: str) -> str | None:
     prefix = root.rstrip(os.sep) + os.sep
     if not path.startswith(prefix):
         return None
-    return path[len(prefix):].replace(os.sep, "/")
+    return path[len(prefix) :].replace(os.sep, "/")
 
 
 def _norm(path: str, cwd: str | None = None) -> str:
@@ -151,9 +151,7 @@ def _norm(path: str, cwd: str | None = None) -> str:
     return path
 
 
-def match_paths(
-    paths: Iterable[str], patterns: Iterable[str], cwd: str | None = None
-) -> list[str]:
+def match_paths(paths: Iterable[str], patterns: Iterable[str], cwd: str | None = None) -> list[str]:
     """Paths (normalized, deduplicated, in order) matching any of ``patterns``.
 
     With ``cwd``, absolute paths inside it are matched cwd-relative; other
