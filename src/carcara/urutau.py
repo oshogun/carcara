@@ -355,55 +355,61 @@ class UrutauClient:
         )
 
     async def get_estimate(self) -> dict[str, Any] | None:
-        """The card's {size, confidence} from get_board, or None when the issue has none."""
-        offset = 0
-        seen: set[int] = set()
-        for _ in range(MAX_BOARD_PAGES):
-            args: dict[str, Any] = {"repo": self.repo, "includeClosed": True}
-            if offset:
-                args["offset"] = offset
-            data = await self._call("get_board", args)
-            found = _find_card(data, self.issue)
-            if found is not None:
-                est = found["estimate"]
-                return {"size": est.get("size"), "confidence": est.get("confidence")}
-            lists = _card_lists(data)
-            numbers = {c["number"] for cards in lists for c in cards}
-            page = max((len(cards) for cards in lists), default=0)
-            if not page or numbers <= seen:
-                return None
-            seen |= numbers
-            offset += page
-        return None
+        """The card's {size, confidence} from get_board, or None when the issue has none.
+
+        The first call returns every bucket; buckets with ``more`` are then paged
+        one at a time, since Urutau only accepts ``offset`` with exactly one bucket.
+        """
+        base: dict[str, Any] = {"repo": self.repo, "includeClosed": True}
+        buckets = _buckets(await self._call("get_board", base))
+        pages = 1
+        card = _find_card(buckets, self.issue)
+        for bucket in buckets:
+            if card is not None:
+                break
+            bucket_id = bucket.get("id")
+            seen = _bucket_seen(bucket)
+            more = bucket.get("more") is True
+            while card is None and more and bucket_id is not None and pages < MAX_BOARD_PAGES:
+                args = {**base, "buckets": [bucket_id], "offset": seen}
+                data = await self._call("get_board", args)
+                pages += 1
+                page = [b for b in _buckets(data) if b.get("id") == bucket_id]
+                card = _find_card(page, self.issue)
+                count = sum(len(_cards(b)) for b in page)
+                if not count:
+                    break
+                seen += count
+                more = any(b.get("more") is True for b in page)
+        if card is None or not isinstance(card.get("estimate"), dict):
+            return None
+        est = card["estimate"]
+        return {"size": est.get("size"), "confidence": est.get("confidence")}
 
 
-def _find_card(node: Any, issue: int) -> dict[str, Any] | None:
-    if isinstance(node, dict):
-        if node.get("number") == issue and isinstance(node.get("estimate"), dict):
-            return node
-        node = list(node.values())
-    if isinstance(node, list):
-        for child in node:
-            hit = _find_card(child, issue)
-            if hit is not None:
-                return hit
+def _buckets(data: Any) -> list[dict[str, Any]]:
+    buckets = data.get("buckets") if isinstance(data, dict) else None
+    return [b for b in buckets if isinstance(b, dict)] if isinstance(buckets, list) else []
+
+
+def _cards(bucket: dict[str, Any]) -> list[dict[str, Any]]:
+    cards = bucket.get("cards")
+    return [c for c in cards if isinstance(c, dict)] if isinstance(cards, list) else []
+
+
+def _bucket_seen(bucket: dict[str, Any]) -> int:
+    """Cards of ``bucket`` already returned: its own offset plus the cards it carries."""
+    offset = bucket.get("offset")
+    return (offset if isinstance(offset, int) else 0) + len(_cards(bucket))
+
+
+def _find_card(buckets: list[dict[str, Any]], issue: int) -> dict[str, Any] | None:
+    """The card numbered ``issue``, whatever its estimate (it may be null)."""
+    for bucket in buckets:
+        for card in _cards(bucket):
+            if card.get("number") == issue:
+                return card
     return None
-
-
-def _card_lists(node: Any) -> list[list[dict[str, Any]]]:
-    """Every list of card-like dicts (with an int ``number``) in a get_board answer."""
-    out: list[list[dict[str, Any]]] = []
-    if isinstance(node, dict):
-        for child in node.values():
-            out.extend(_card_lists(child))
-    elif isinstance(node, list):
-        cards = [c for c in node if isinstance(c, dict) and isinstance(c.get("number"), int)]
-        if cards:
-            out.append(cards)
-        for child in node:
-            if isinstance(child, (dict, list)):
-                out.extend(_card_lists(child))
-    return out
 
 
 # --- payload helpers --------------------------------------------------------

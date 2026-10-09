@@ -308,20 +308,63 @@ def test_mcp_http_client_does_not_follow_redirects():
         run(http.aclose())
 
 
+def bucket(id: str, cards: list[dict[str, Any]], more: bool = False, offset: int = 0) -> dict:
+    total = offset + len(cards) + (1 if more else 0)
+    return {"id": id, "cards": cards, "total": total, "offset": offset, "more": more}
+
+
+def board(*buckets: dict) -> dict[str, Any]:
+    return {**sample("get_board-top-level.json"), "buckets": list(buckets)}
+
+
+def assert_offset_has_one_bucket(log: list[tuple[str, dict]]) -> None:
+    for _, args in log:
+        if "offset" in args:
+            assert len(args.get("buckets", [])) == 1
+
+
 def test_get_estimate():
     card = sample("get_board-card.json")
     other = {**card, "number": 3}
-    board = {
-        **sample("get_board-top-level.json"),
-        "buckets": [{"cards": [other]}, {"cards": [card]}],
-    }
-    client, log, _, _ = make_client([ok(board)])
+    client, log, _, _ = make_client([ok(board(bucket("todo", [other]), bucket("doing", [card])))])
     assert run(client.get_estimate()) == {"size": "S", "confidence": "unsure"}
     assert log == [("get_board", {"repo": "acme/widgets", "includeClosed": True})]
-    empty = {"buckets": [{"cards": []}]}
-    client, log, _, _ = make_client([ok({"buckets": [{"cards": [other]}]}), ok(empty)])
+
+
+def test_get_estimate_card_without_estimate_stops_paging():
+    card = {**sample("get_board-card.json"), "estimate": None}
+    other = {**card, "number": 3}
+    script = [ok(board(bucket("todo", [other], more=True), bucket("doing", [card])))]
+    client, log, _, _ = make_client(script)
     assert run(client.get_estimate()) is None
-    assert log[1][1]["offset"] == 1
+    assert len(log) == 1
+    assert_offset_has_one_bucket(log)
+
+
+def test_get_estimate_pages_one_bucket_at_a_time():
+    card = sample("get_board-card.json")
+    other = {**card, "number": 3}
+    first = board(bucket("todo", [other, {**card, "number": 4}], more=True), bucket("done", []))
+    second = board(bucket("todo", [card], offset=2))
+    client, log, _, _ = make_client([ok(first), ok(second)])
+    assert run(client.get_estimate()) == {"size": "S", "confidence": "unsure"}
+    assert len(log) == 2
+    assert log[1] == (
+        "get_board",
+        {"repo": "acme/widgets", "includeClosed": True, "buckets": ["todo"], "offset": 2},
+    )
+    assert_offset_has_one_bucket(log)
+
+
+def test_get_estimate_absent_card_is_none_and_bounded():
+    other = {**sample("get_board-card.json"), "number": 3}
+    pages = [ok(board(bucket("todo", [other], more=True), bucket("doing", [other], more=True)))]
+    pages += [ok(board(bucket("todo", [other], more=True)))] * (urutau.MAX_BOARD_PAGES + 2)
+    client, log, _, _ = make_client(pages)
+    assert run(client.get_estimate()) is None
+    assert len(log) == urutau.MAX_BOARD_PAGES
+    assert_offset_has_one_bucket(log)
+    assert [a["offset"] for _, a in log[1:3]] == [1, 2]
 
 
 def test_errors_never_carry_the_token():
