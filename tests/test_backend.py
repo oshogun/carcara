@@ -232,6 +232,32 @@ def test_fake_backend_consumes_script_in_order_and_records():
         run(fake, review)
 
 
+def test_fake_backend_prefers_key_over_stage_queue():
+    keyed = dict(REVIEW_OK, verdict="request_changes")
+    fake = FakeBackend(
+        {"review-dim:security": [keyed], "review-dim": [REVIEW_OK]},
+        costs={"review-dim": 0.1, "review-dim:security": 0.3},
+    )
+    sec = build_request(
+        "review-dim", ROLES["reviewer"], PROFILE, "p", CWD, key="review-dim:security"
+    )
+    assert sec.key == "review-dim:security"
+    first = run(fake, sec)
+    assert first.structured == keyed and first.cost_usd == 0.3
+    other = build_request(
+        "review-dim", ROLES["reviewer"], PROFILE, "p", CWD, key="review-dim:tests"
+    )
+    second = run(fake, other)
+    assert second.structured == REVIEW_OK and second.cost_usd == 0.1
+
+
+def test_fake_backend_raises_exception_entries():
+    fake = FakeBackend({"review": [BackendError("boom")]})
+    req = build_request("review", ROLES["reviewer"], PROFILE, "p", CWD)
+    with pytest.raises(BackendError, match="boom"):
+        run(fake, req)
+
+
 def test_fake_backend_validates_entries():
     fake = FakeBackend({"review": [{"verdict": "nope"}]})
     req = build_request("review", ROLES["reviewer"], PROFILE, "p", CWD)

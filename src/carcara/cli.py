@@ -149,6 +149,12 @@ def _add_run_parser(sub: Any) -> None:
     )
     run.add_argument("--review", action="store_true", help="also review S-sized changes")
     run.add_argument(
+        "--ultra",
+        action="store_true",
+        help="fan out exploration and review into parallel stages (higher cost; "
+        "persisted for --resume)",
+    )
+    run.add_argument(
         "--project-settings",
         action="store_true",
         help="load the project's Claude Code settings/CLAUDE.md into each stage",
@@ -283,16 +289,25 @@ def _urutau_config(ns: argparse.Namespace) -> Any:
     return load_config()
 
 
-def _dry_run_stages(size: str, review_small: bool) -> list[tuple[str, str | None]]:
-    """(stage, role) rows mirroring the orchestrator's pipelines."""
+def _dry_run_stages(
+    size: str, review_small: bool, ultra: bool = False
+) -> list[tuple[str, str | None]]:
+    """(stage, role) rows mirroring the orchestrator's pipelines.
+
+    Ultra rows carry a label after the stage name (e.g. "review x3 ..."); the
+    first word is the stage."""
+    review = ("review x3 (parallel) + merge", "reviewer") if ultra else ("review", "reviewer")
     if size == "S":
         rows = [("implement", "implementer"), ("test", "test-runner")]
         if review_small:
-            rows.append(("review", "reviewer"))
+            rows.append(review)
         return rows
     plan = ("plan", "architect") if size == "L" else ("plan", None)
-    rows = [("explore", "explorer"), plan, ("implement", "implementer")]
-    rows += [("test", "test-runner"), ("review", "reviewer")]
+    explore: list[tuple[str, str | None]] = [("explore", "explorer")]
+    if ultra:
+        explore = [("scope", None), ("explore x<=4 (parallel)", "explorer")]
+    rows = [*explore, plan, ("implement", "implementer")]
+    rows += [("test", "test-runner"), review]
     if size == "L":
         rows.append(("docs", "doc-writer"))
     return rows
@@ -346,18 +361,19 @@ def _dry_run(profile: Any, ns: argparse.Namespace, cwd: str, origin: str) -> str
     for size in (ns.size,) if ns.size else SIZES:
         out.append(f"\nsize {size}:")
         rows: list[tuple[str, str | None]] = [] if ns.size else [("triage", None)]
-        rows += _dry_run_stages(size, ns.review)
-        out.append(f"  {'stage':<10} {'role':<12} {'model':<24} {'mode':<12} tools")
+        rows += _dry_run_stages(size, ns.review, ns.ultra)
+        width = max(10, *(len(stage) for stage, _ in rows))
+        out.append(f"  {'stage':<{width}} {'role':<12} {'model':<24} {'mode':<12} tools")
         for stage, role_name in rows:
             role = get_role(role_name) if role_name else None
-            req = build_request(stage, role, profile, "", cwd)
+            req = build_request(stage.split()[0], role, profile, "", cwd)
             label = role_name or "main"
             tools = ",".join(req.allowed_tools) or "-"
             out.append(
-                f"  {stage:<10} {label:<12} {req.model:<24} {req.permission_mode:<12} {tools}"
+                f"  {stage:<{width}} {label:<12} {req.model:<24} {req.permission_mode:<12} {tools}"
             )
             if stage == "plan" and (size == "L" or ns.approve_plan):
-                out.append(f"  {'gate':<10} {'human':<12} {'-':<24} {'-':<12} -")
+                out.append(f"  {'gate':<{width}} {'human':<12} {'-':<24} {'-':<12} -")
         if size == "L":
             out.append("  (implement runs once per plan step; docs only for user-facing changes)")
     out.append(
@@ -822,6 +838,7 @@ def _run_main(ns: argparse.Namespace) -> int:
         options = RunOptions(
             size=ns.size,
             review_small=ns.review,
+            ultra=ns.ultra,
             approve_plan=ns.approve_plan,
             plan_only=ns.plan_only,
             max_budget_usd=ns.max_budget_usd,

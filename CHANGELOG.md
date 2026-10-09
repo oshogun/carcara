@@ -17,6 +17,13 @@
   revised plan (#20). All feedback entries are included, latest last.
 
 ### Added
+- `carcara run --ultra` fans out the read-only roles. A `scope` stage picks
+  up to 4 areas that are explored in parallel and merged before the plan.
+  Each review round runs 3 parallel dimension reviews (correctness, security,
+  tests) and then one merge review that verifies and dedupes their findings.
+  The budget is split evenly across parallel siblings, and implementers stay
+  sequential. The flag is kept on `--resume`. Plan steps may list
+  `depends_on` to order steps. The report adds a `Parallel stages` line.
 - `carcara uninstall [target] [-n] [-f] [--purge]` removes carcara's agents,
   commands, skill, `settings.json` entries, `CLAUDE.md` section and
   `.carcara/` files while keeping user content; install then uninstall

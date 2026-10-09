@@ -94,6 +94,44 @@ def test_dry_run_single_size(repo, capsys):
     assert "size S:" in out and "size M:" not in out and "triage" not in out
 
 
+def test_dry_run_ultra_shows_parallel_rows(repo, capsys):
+    assert run(repo, "--dry-run", "--size", "L", "--ultra") == 0
+    out = capsys.readouterr().out
+    stages = [ln.split()[0] for ln in out.splitlines() if ln.startswith("  ")]
+    assert stages[:3] == ["stage", "scope", "explore"]
+    assert "explore x<=4 (parallel)" in out and "review x3 (parallel) + merge" in out
+    scope = next(ln for ln in out.splitlines() if ln.strip().startswith("scope"))
+    assert " main " in scope
+
+
+def test_dry_run_without_ultra_has_no_parallel_rows(repo, capsys):
+    assert run(repo, "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "scope" not in out and "parallel" not in out
+
+
+def test_dry_run_ultra_rows_stay_aligned(repo, capsys):
+    assert run(repo, "--dry-run", "--size", "L", "--ultra") == 0
+    rows = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("  ")]
+    rows = [ln for ln in rows if not ln.startswith("  (")]
+    width = len("review x3 (parallel) + merge")
+    assert {ln[2 + width] for ln in rows} == {" "}
+    assert {ln[3 + width] for ln in rows} != {" "}
+
+
+def test_dry_run_without_ultra_keeps_ten_char_stage_column(repo, capsys):
+    assert run(repo, "--dry-run") == 0
+    rows = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("  ")]
+    assert "  stage      role         model" in rows[0]
+    assert all(ln[12] == " " and ln[13] != " " for ln in rows if not ln.startswith("  ("))
+
+
+def test_dry_run_ultra_small_review(repo, capsys):
+    assert run(repo, "--dry-run", "--size", "S", "--ultra", "--review") == 0
+    out = capsys.readouterr().out
+    assert "review x3 (parallel) + merge" in out and "scope" not in out
+
+
 def test_m_run_succeeds(repo, fake, capsys):
     fake(
         {
@@ -111,6 +149,27 @@ def test_m_run_succeeds(repo, fake, capsys):
     assert "tests: passed" in captured.out
     assert "carcara: explore (explorer," in captured.err
     assert "carcara: implement done ($0.25)" in captured.err
+
+
+def test_ultra_run_end_to_end(repo, fake, capsys):
+    scope = {"areas": [{"id": a, "focus": a} for a in ("a", "b")], "rationale": "r"}
+    fake(
+        {
+            "scope": [scope],
+            "explore:a": [EXPLORE],
+            "explore:b": [EXPLORE],
+            "plan": [PLAN],
+            "implement": [IMPL],
+            "test": [TEST_OK],
+            "review-dim": [REVIEW_OK] * 3,
+            "review": [REVIEW_OK],
+        }
+    )
+    assert run(repo, "add a feature", "--size", "M", "--ultra") == 0
+    (run_id,) = RunStore(repo).list_runs()
+    state = _state(repo, run_id)
+    assert state["ultra"] is True
+    assert [e["key"] for e in state["stages"]][:3] == ["scope", "explore:a", "explore:b"]
 
 
 def test_l_non_tty_defers_then_resume_with_yes(repo, fake, capsys):

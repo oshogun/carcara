@@ -4,6 +4,7 @@ from carcara.profiles import load_profile
 from carcara.resources import templates_root
 from carcara.roles import Role, RoleError, load_roles, model_for, parse_role, to_agent_definition
 from carcara.schemas import (
+    MAX_SCOPE_AREAS,
     MAX_UNVERIFIED,
     MAX_UNVERIFIED_TEXT,
     SCHEMAS,
@@ -79,9 +80,57 @@ def test_schemas_are_strict():
         elif schema.get("type") == "array":
             walk(schema["items"])
 
-    assert set(SCHEMAS) == {"triage", "explore", "plan", "implement", "test", "review", "docs"}
+    assert set(SCHEMAS) == {
+        "triage",
+        "scope",
+        "explore",
+        "plan",
+        "plan-ultra",
+        "implement",
+        "test",
+        "review",
+        "review-dim",
+        "docs",
+    }
     for schema in SCHEMAS.values():
         walk(schema)
+
+
+def test_scope_schema():
+    assert validate("scope", {"areas": [], "rationale": "narrow"}) == []
+    areas = [{"id": f"a{i}", "focus": "f"} for i in range(3)]
+    assert validate("scope", {"areas": areas, "rationale": "r"}) == []
+    areas5 = [{"id": f"a{i}", "focus": "f"} for i in range(MAX_SCOPE_AREAS + 1)]
+    assert validate("scope", {"areas": areas5, "rationale": "r"})
+    assert validate("scope", {"areas": [{"id": "a"}], "rationale": "r"})
+
+
+def test_review_dim_schema_matches_review():
+    assert SCHEMAS["review-dim"] is SCHEMAS["review"]
+    ok = {"verdict": "approve", "findings": [], "unverified": []}
+    assert validate("review-dim", ok) == []
+    assert validate("review-dim", {**ok, "verdict": "maybe"})
+
+
+def test_plan_step_depends_on_is_optional():
+    # The architect stage shares the "plan" schemas; only ultra runs ask for depends_on.
+    plan = {
+        "goal": "g",
+        "steps": [{"id": "a", "files": ["x.py"], "change": "c"}],
+        "tests": [],
+        "acceptance": [],
+        "risks": [],
+    }
+    assert validate("plan", plan) == []
+    assert validate("plan-ultra", plan) == []
+    plan["steps"].append({"id": "b", "files": [], "change": "c", "depends_on": ["a"]})
+    assert validate("plan-ultra", plan) == []
+    assert validate("plan", plan)
+    plan["steps"][1]["depends_on"] = "a"
+    assert validate("plan-ultra", plan)
+    steps = SCHEMAS["plan-ultra"]["properties"]["steps"]["items"]
+    assert "depends_on" not in steps["required"]
+    assert "depends_on" not in SCHEMAS["plan"]["properties"]["steps"]["items"]["properties"]
 
 
 def test_validate():

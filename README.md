@@ -288,6 +288,7 @@ and `extent` values.
 | `--allow-dirty` | allow uncommitted changes (clean tree required by default); the diff base is a snapshot of your uncommitted work |
 | `--unrestricted-bash` | turn off the implementer/test-runner Bash deny-list for this invocation only (prints a warning; pass it again with `--resume`) |
 | `--review` | also review S-sized changes |
+| `--ultra` | fan out explore and review into parallel stages (see [Ultra mode](#ultra-mode---ultra)); kept on `--resume` |
 | `--project-settings` | load the project's Claude Code settings and CLAUDE.md (note: their `env` / `apiKeyHelper` can re-enable API billing) |
 | `--cwd DIR` | project directory (default `.`) |
 
@@ -325,6 +326,34 @@ in the state.
 | 5 | budget exceeded |
 | 6 | another run is active (no run was started) |
 | 130 | interrupted (state saved; resume with `--resume`) |
+
+### Ultra mode (`--ultra`)
+
+`carcara run --ultra` runs the read-only roles in parallel:
+
+- **Explore (M/L).** A small main-model `scope` stage splits the task into
+  0-4 independent areas. With 2 or more areas, one `explore:<area>` stage runs
+  per area in parallel, and their summaries and findings are merged (findings
+  deduped) before the plan. With 0 or 1 area, the single `explore` stage runs
+  as usual. S runs have no explore stage.
+- **Review.** Each review round runs 3 parallel dimension reviews
+  (`review-dim:correctness`, `review-dim:security`, `review-dim:tests`). One
+  `review` merge stage then checks their findings against the code, drops
+  false positives and merges duplicates. The merge is the review that counts:
+  the fix loop, the report's `review:` line, unverified assumptions and Urutau
+  data come only from it. Fix rounds use the same split (`fix-1:review-dim:*`).
+
+Fan-out is capped at 4 explore areas and 3 dimension reviews. Each review
+round costs roughly 4x a normal review. With `--max-budget-usd`, the remaining
+budget is split evenly across the parallel siblings. Implementers, test, docs
+and probes stay sequential in one working tree; v1 only fans out read-only
+roles. Plan steps may also list `depends_on` (ids of the steps they need);
+the steps are run in dependency order, still one at a time.
+
+The flag is stored with the run, so `--resume` keeps the ultra stages even
+without `--ultra`. Finished parallel stages are replayed on resume and only
+the missing ones rerun. The report adds a `Parallel stages: <keys> ($x.xx)`
+line, and `--dry-run --ultra` shows the extra rows.
 
 ### Tool policy
 

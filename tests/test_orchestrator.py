@@ -7,18 +7,20 @@ import types
 
 import pytest
 
-from carcara.backend import FakeBackend, NoStructuredOutput, StageResult
+from carcara.backend import BackendError, FakeBackend, NoStructuredOutput, StageResult
 from carcara.orchestrator import (
     AutoGate,
     Orchestrator,
     OrchestratorError,
     RunOptions,
+    _Stop,
 )
 from carcara.policy import WRITE_TOOLS
 from carcara.profiles import load_profile
 from carcara.project_config import DEFAULT_VERIFIABILITY_PATHS, parse_project_config
 from carcara.roles import model_for
 from carcara.runstore import RunStore
+from carcara.schemas import SCHEMAS
 
 PROFILE = load_profile("balanced")
 
@@ -404,6 +406,109 @@ def test_budget_remaining_and_cost_totals(repo):
         sum(s["cost_usd"] for s in stages)
     )
     assert "$2.50" in out.report_text
+
+
+def _dim(name):
+    return {**REVIEW_OK, "findings": [{"severity": "nit", "path": name, "issue": "i", "fix": "f"}]}
+
+
+def _parallel_specs(names):
+    return [(f"review-dim:{n}", "review-dim", "reviewer", "review", lambda: "p") for n in names]
+
+
+def test_parallel_splits_budget_and_keeps_spec_order(repo):
+    script = {"review-dim:a": [_dim("a")], "review-dim:b": [_dim("b")]}
+    orch, backend, _ = make(repo, script, max_budget_usd=1.0)
+    orch.run_state = RunStore(repo).create("t", "balanced", "sha")
+    orch.run_state.add_cost(0.4, None, 0)
+    outs = asyncio.run(orch._parallel(_parallel_specs(["a", "b"])))
+    assert outs == [_dim("a"), _dim("b")]
+    assert [r.key for r in backend.requests] == ["review-dim:a", "review-dim:b"]
+    assert [r.max_budget_usd for r in backend.requests] == [
+        pytest.approx(0.3),
+        pytest.approx(0.3),
+    ]
+
+
+def test_parallel_failure_records_siblings_and_resume_reruns_missing(repo):
+    script = {
+        "review-dim:a": [_dim("a")],
+        "review-dim:b": [BackendError("boom")],
+        "review-dim:c": [_dim("c")],
+    }
+    orch, _, _ = make(repo, script)
+    orch.run_state = RunStore(repo).create("t", "balanced", "sha")
+    with pytest.raises(_Stop):
+        asyncio.run(orch._parallel(_parallel_specs(["a", "b", "c"])))
+    assert keys(orch) == ["review-dim:a", "review-dim:c"]
+    orch2, backend2, _ = make(repo, {"review-dim:b": [_dim("b")]})
+    orch2.run_state = orch.run_state
+    outs = asyncio.run(orch2._parallel(_parallel_specs(["a", "b", "c"])))
+    assert outs == [_dim("a"), _dim("b"), _dim("c")]
+    assert [r.key for r in backend2.requests] == ["review-dim:b"]
+
+
+def _no_output(cost):
+    return NoStructuredOutput("no structured output", StageResult(cost_usd=cost))
+
+
+def test_parallel_cap_is_a_lifetime_share_across_retries(repo):
+    script = {
+        "review-dim:a": [_no_output(0.6), _dim("a")],
+        "review-dim:b": [_no_output(0.6), _dim("b")],
+        "review-dim:c": [_dim("c")],
+    }
+    costs = {"review-dim:a": 0.4, "review-dim:b": 0.4, "review-dim:c": 1.0}
+    orch, backend, _ = make(repo, script, costs=costs, max_budget_usd=3.0)
+    orch.run_state = RunStore(repo).create("t", "balanced", "sha")
+    asyncio.run(orch._parallel(_parallel_specs(["a", "b", "c"])))
+    asked: dict[str, list[float]] = {}
+    for r in backend.requests:
+        asked.setdefault(r.key, []).append(r.max_budget_usd)
+    assert asked == {
+        "review-dim:a": [pytest.approx(1.0), pytest.approx(0.4)],
+        "review-dim:b": [pytest.approx(1.0), pytest.approx(0.4)],
+        "review-dim:c": [pytest.approx(1.0)],
+    }
+    # A retry asks only for what the failed attempt (0.6) left of the 1.0 share.
+    assert all(0.6 + asked[k][1] <= 1.0 + 1e-9 for k in ("review-dim:a", "review-dim:b"))
+    assert orch.run_state.state["totals"]["cost_usd"] <= 3.0 + 1.0
+
+
+def test_parallel_retry_stops_when_share_is_spent(repo):
+    script = {"review-dim:a": [_no_output(1.0), _dim("a")], "review-dim:b": [_dim("b")]}
+    orch, backend, _ = make(repo, script, max_budget_usd=2.0)
+    orch.run_state = RunStore(repo).create("t", "balanced", "sha")
+    with pytest.raises(_Stop) as stop:
+        asyncio.run(orch._parallel(_parallel_specs(["a", "b"])))
+    assert stop.value.status == "budget_exceeded"
+    assert "parallel share exhausted for review-dim:a" in stop.value.message
+    assert [r.key for r in backend.requests] == ["review-dim:a", "review-dim:b"]
+
+
+def test_parallel_sibling_over_its_share_reports_share_exhausted(repo):
+    over = StageResult(subtype="error_max_budget_usd", is_error=True, cost_usd=0.5)
+    script = {"review-dim:a": [over], "review-dim:b": [_dim("b")]}
+    orch, _, _ = make(repo, script, max_budget_usd=1.0)
+    orch.run_state = RunStore(repo).create("t", "balanced", "sha")
+    with pytest.raises(_Stop) as stop:
+        asyncio.run(orch._parallel(_parallel_specs(["a", "b"])))
+    assert stop.value.status == "budget_exceeded"
+    assert stop.value.message == (
+        "parallel share exhausted for review-dim:a ($0.50); "
+        "resume to retry it with the remaining budget"
+    )
+
+
+def test_parallel_pure_replay_ignores_spent_budget(repo):
+    script = {"review-dim:a": [_dim("a")], "review-dim:b": [_dim("b")]}
+    costs = {"review-dim:a": 0.5, "review-dim:b": 0.5}
+    orch, _, _ = make(repo, script, costs=costs, max_budget_usd=1.0)
+    orch.run_state = RunStore(repo).create("t", "balanced", "sha")
+    asyncio.run(orch._parallel(_parallel_specs(["a", "b"])))
+    assert orch.run_state.state["totals"]["cost_usd"] == pytest.approx(1.0)
+    outs = asyncio.run(orch._parallel(_parallel_specs(["a", "b"])))
+    assert outs == [_dim("a"), _dim("b")]
 
 
 def test_budget_exhausted_before_stage(repo):
@@ -1657,3 +1762,386 @@ def test_record_unverified_tolerates_old_review_output(repo):
     run.state["unverified"] = [{"id": "U9", "kind": "external", "text": "t"}]
     orch._record_unverified(run, "old:review", REVIEW_OK)
     assert run.state["unverified"][0]["id"] == "U9"
+
+
+# -- ultra: scope + parallel explore -------------------------------------------
+
+
+def _scope(*areas):
+    return {"areas": [{"id": i, "focus": f"look at {i}"} for i in areas], "rationale": "r"}
+
+
+def _explore_out(name, *facts):
+    return {
+        "summary": f"sum {name}",
+        "findings": [{"path": "a.py", "line": 1, "fact": f} for f in facts],
+    }
+
+
+def test_ultra_scope_fans_out_explore_and_merges(repo):
+    orch, backend, _ = make(
+        repo,
+        {
+            "scope": [_scope("a", "b", "c")],
+            "explore:a": [_explore_out("a", "x", "shared")],
+            "explore:b": [_explore_out("b", "shared")],
+            "explore:c": [_explore_out("c", "y")],
+            "plan": [PLAN],
+            "implement": [impl()],
+            "test": [TEST_OK],
+            "review-dim": [REVIEW_OK] * 3,
+            "review": [REVIEW_OK],
+        },
+        size="M",
+        ultra=True,
+    )
+    assert go(orch).status == "done"
+    stage_keys = keys(orch)
+    assert stage_keys[:4] == ["scope", "explore:a", "explore:b", "explore:c"]
+    assert "explore" not in stage_keys
+    scope_req = backend.requests[0]
+    assert (scope_req.stage, scope_req.role, scope_req.max_turns) == ("scope", None, 3)
+    explores = [r for r in backend.requests if r.stage == "explore"]
+    assert [r.key for r in explores] == ["explore:a", "explore:b", "explore:c"]
+    assert all(r.role == "explorer" for r in explores)
+    assert "look at b" in explores[1].prompt and "look at a" not in explores[1].prompt
+    plan_prompt = next(r.prompt for r in backend.requests if r.stage == "plan")
+    assert "[a] sum a\\n[b] sum b\\n[c] sum c" in plan_prompt
+    assert plan_prompt.count('"fact":"shared"') == 1
+    assert '"fact":"x"' in plan_prompt and '"fact":"y"' in plan_prompt
+
+
+def test_ultra_single_area_uses_plain_explore(repo):
+    orch, backend, _ = make(
+        repo,
+        {
+            "scope": [_scope("only")],
+            "explore": [EXPLORE],
+            "plan": [PLAN],
+            "implement": [impl()],
+            "test": [TEST_OK],
+            "review-dim": [REVIEW_OK] * 3,
+            "review": [REVIEW_OK],
+        },
+        size="M",
+        ultra=True,
+    )
+    assert go(orch).status == "done"
+    assert keys(orch)[:3] == ["scope", "explore", "plan"]
+    assert "look at only" in backend.requests[1].prompt
+
+
+def test_ultra_zero_areas_uses_plain_explore(repo):
+    orch, backend, _ = make(
+        repo,
+        {
+            "scope": [_scope()],
+            "explore": [EXPLORE],
+            "plan": [PLAN],
+            "implement": [impl()],
+            "test": [TEST_OK],
+            "review-dim": [REVIEW_OK] * 3,
+            "review": [REVIEW_OK],
+        },
+        size="M",
+        ultra=True,
+    )
+    assert go(orch).status == "done"
+    assert keys(orch)[:3] == ["scope", "explore", "plan"]
+    assert "Focus on" not in backend.requests[1].prompt
+
+
+def test_ultra_area_ids_are_slugged_and_deduped(repo):
+    orch, _, _ = make(
+        repo,
+        {
+            "scope": [_scope("Core API", "core api", "!!", "d")],
+            "explore": [EXPLORE] * 4,
+            "plan": [PLAN],
+            "implement": [impl()],
+            "test": [TEST_OK],
+            "review-dim": [REVIEW_OK] * 3,
+            "review": [REVIEW_OK],
+        },
+        size="M",
+        ultra=True,
+    )
+    assert go(orch).status == "done"
+    assert keys(orch)[1:5] == ["explore:core-api", "explore:core-api-2", "explore:3", "explore:d"]
+
+
+def test_dedupe_ids_keeps_step_semantics():
+    from carcara.orchestrator import _dedupe_ids, _merge_explore
+
+    assert _dedupe_ids(["a", "", "a", "3"]) == ["a", "2", "a-3", "3"]
+    merged = _merge_explore(
+        ["p", "q"],
+        [
+            {"summary": "s1", "findings": [{"path": "x", "fact": "f"}]},
+            {"summary": "s2", "findings": [{"path": "x", "line": None, "fact": "f"}]},
+        ],
+    )
+    assert merged == {"summary": "[p] s1\n[q] s2", "findings": [{"path": "x", "fact": "f"}]}
+
+
+# -- ultra: split review + merge -----------------------------------------------
+
+DIMS = ("correctness", "security", "tests")
+
+
+def _ultra_s(**opts):
+    return {"size": "S", "review_small": True, "ultra": True, **opts}
+
+
+def test_ultra_review_splits_into_dimensions_and_merges(repo):
+    script = {
+        "implement": [impl()],
+        "test": [TEST_OK],
+        **{f"review-dim:{d}": [_dim(d)] for d in DIMS},
+        "review": [REVIEW_OK],
+    }
+    orch, backend, _ = make(repo, script, **_ultra_s())
+    out = go(orch)
+    assert out.status == "done"
+    assert keys(orch) == [
+        "implement",
+        "test",
+        "review-dim:correctness",
+        "review-dim:security",
+        "review-dim:tests",
+        "review",
+    ]
+    stages = orch.run_state.state["stages"]
+    assert [e["stage"] for e in stages].count("review") == 1
+    dims = [r for r in backend.requests if r.stage == "review-dim"]
+    assert all(r.role == "reviewer" and r.max_turns == backend.requests[-1].max_turns for r in dims)
+    assert "ONLY for security" in dims[1].prompt and "git diff --stat" in dims[1].prompt
+    merge = backend.requests[-1]
+    assert (merge.stage, merge.key, merge.role) == ("review", "review", "reviewer")
+    assert all(f'"path":"{d}"' in merge.prompt for d in DIMS)
+    assert "drop false positives" in merge.prompt and "git diff --stat" in merge.prompt
+    assert orch.run_state.state["unverified_reviews"] == ["review"]
+
+
+def test_ultra_report_lists_parallel_stages(repo):
+    script = {
+        "implement": [impl()],
+        "test": [TEST_OK],
+        **{f"review-dim:{d}": [_dim(d)] for d in DIMS},
+        "review": [REVIEW_OK],
+    }
+    costs = {f"review-dim:{d}": 0.1 for d in DIMS}
+    orch, _, _ = make(repo, script, costs=costs, **_ultra_s())
+    go(orch)
+    lines = orch._report(orch.run_state).splitlines()
+    par = lines.index(
+        "Parallel stages: review-dim:correctness, review-dim:security, review-dim:tests ($0.30)"
+    )
+    assert lines[par - 1] == "review: approve (0 findings, 0 serious)"
+
+
+def test_report_without_parallel_stages_has_no_parallel_line(repo):
+    orch, _, _ = make(repo, {"implement": [impl()], "test": [TEST_OK]}, size="S")
+    go(orch)
+    assert "Parallel stages" not in orch._report(orch.run_state)
+
+
+def test_ultra_review_fix_round_uses_merge_and_prefix(repo):
+    script = {
+        "implement": [impl(), impl()],
+        "test": [TEST_OK, TEST_OK],
+        "review-dim": [REVIEW_MAJOR] * 3 + [REVIEW_OK] * 3,
+        "review": [REVIEW_MAJOR, REVIEW_OK],
+    }
+    orch, backend, _ = make(repo, script, **_ultra_s())
+    assert go(orch).status == "done"
+    assert keys(orch)[-5:] == [
+        "fix-1:test",
+        *(f"fix-1:review-dim:{d}" for d in DIMS),
+        "fix-1:review",
+    ]
+    fix_prompt = next(r.prompt for r in backend.requests if r.key == "fix-1:implement")
+    assert '"issue":"bug"' in fix_prompt
+    from carcara.orchestrator import _extent
+
+    assert _extent(orch.run_state)["fix_rounds"] == 1
+
+
+def test_ultra_review_dimension_budget_split(repo):
+    script = {
+        "implement": [impl()],
+        "test": [TEST_OK],
+        "review-dim": [REVIEW_OK] * 3,
+        "review": [REVIEW_OK],
+    }
+    orch, backend, _ = make(repo, script, costs={"implement": 0.4}, **_ultra_s(max_budget_usd=1.0))
+    assert go(orch).status == "done"
+    dims = [r.max_budget_usd for r in backend.requests if r.stage == "review-dim"]
+    assert dims == [pytest.approx(0.2)] * 3
+    assert backend.requests[-1].max_budget_usd == pytest.approx(0.6)
+
+
+def test_ultra_review_dimension_failure_then_resume_without_flag(repo):
+    script = {
+        "implement": [impl()],
+        "test": [TEST_OK],
+        "review-dim:correctness": [REVIEW_OK],
+        "review-dim:security": [BackendError("boom")],
+        "review-dim:tests": [REVIEW_OK],
+    }
+    orch, _, _ = make(repo, script, **_ultra_s())
+    out = go(orch)
+    assert out.status == "failed"
+    assert keys(orch) == ["implement", "test", "review-dim:correctness", "review-dim:tests"]
+
+    # review_small is not persisted, ultra is: resume without --ultra keeps the keys.
+    orch2, backend2, _ = make(
+        repo, {"review-dim": [REVIEW_OK], "review": [REVIEW_OK]}, review_small=True
+    )
+    assert asyncio.run(orch2.resume(out.run_id)).status == "done"
+    assert [r.key for r in backend2.requests] == ["review-dim:security", "review"]
+    replayed = [e["key"] for e in _events(orch2, "stage_replayed")]
+    assert {"review-dim:correctness", "review-dim:tests"} <= set(replayed)
+
+
+class _SlowBackend(FakeBackend):
+    async def run_stage(self, request):
+        await asyncio.sleep(0.01)
+        return await super().run_stage(request)
+
+
+def test_ultra_explore_and_review_stages_overlap(repo):
+    script = {
+        "scope": [_scope("a", "b")],
+        "explore": [EXPLORE] * 2,
+        "plan": [PLAN],
+        "implement": [impl()],
+        "test": [TEST_OK],
+        "review-dim": [REVIEW_OK] * 3,
+        "review": [REVIEW_OK],
+    }
+    orch = Orchestrator(
+        _SlowBackend(script),
+        PROFILE,
+        str(repo),
+        RunStore(repo),
+        AutoGate(),
+        RunOptions(size="M", ultra=True),
+    )
+    assert go(orch).status == "done"
+    events = [
+        json.loads(line) for line in (orch.run_state.dir / "events.jsonl").read_text().splitlines()
+    ]
+    for prefix, n in (("explore:", 2), ("review-dim:", 3)):
+        seen = [
+            e["event"]
+            for e in events
+            if e["event"] in ("stage_started", "stage_completed")
+            and str(e.get("key", "")).startswith(prefix)
+        ]
+        assert seen[:n] == ["stage_started"] * n, prefix
+
+
+def _dep_plan(*steps):
+    return {**PLAN, "steps": [{"files": ["a.py"], "change": "c", **s} for s in steps]}
+
+
+def _large_run(repo, plan, ultra=True, steps=None, **opts):
+    script = {
+        "explore": [EXPLORE],
+        "plan": [plan],
+        "implement": [impl()] * (steps or len(plan["steps"])),
+        "test": [TEST_OK],
+        "review": [REVIEW_OK],
+    }
+    if ultra:
+        script |= {"scope": [_scope()], "review-dim": [REVIEW_OK] * 3}
+    orch, backend, _ = make(repo, script, size="L", ultra=ultra, **opts)
+    assert go(orch).status == "done"
+    return orch, backend
+
+
+def test_plan_depends_on_reorders_steps(repo):
+    plan = _dep_plan({"id": "a", "depends_on": ["b"]}, {"id": "b"}, {"id": "c"})
+    orch, _ = _large_run(repo, plan)
+    impl_keys = [k for k in keys(orch) if k.startswith("implement:")]
+    assert impl_keys == ["implement:b", "implement:a", "implement:c"]
+    assert _events(orch, "plan_dependency_warning") == []
+
+
+@pytest.mark.parametrize(
+    "steps,detail",
+    [
+        (({"id": "a", "depends_on": ["b"]}, {"id": "b", "depends_on": ["a"]}), "cycle"),
+        (({"id": "a", "depends_on": ["zz"]}, {"id": "b"}), "unknown"),
+    ],
+)
+def test_plan_depends_on_falls_back_to_plan_order(repo, steps, detail):
+    orch, _ = _large_run(repo, _dep_plan(*steps))
+    assert [k for k in keys(orch) if k.startswith("implement:")] == [
+        "implement:a",
+        "implement:b",
+    ]
+    warnings = _events(orch, "plan_dependency_warning")
+    assert len(warnings) == 1 and detail in warnings[0]["detail"]
+
+
+def test_plan_depends_on_ignored_without_ultra(repo):
+    plan = _dep_plan(
+        {"id": "a", "depends_on": ["b"]},
+        {"id": "b", "depends_on": ["zz"]},
+        {"id": "c"},
+    )
+    # The non-ultra schema rejects depends_on, so bypass validation to check it's ignored.
+    orch, _ = _large_run(repo, StageResult(structured=plan), ultra=False, steps=3)
+    assert keys(orch) == [
+        "explore",
+        "architect",
+        "implement:a",
+        "implement:b",
+        "implement:c",
+        "test",
+        "review",
+    ]
+    assert _events(orch, "plan_dependency_warning") == []
+
+
+def test_parallel_resume_gives_missing_sibling_the_remaining_budget(repo):
+    script = {
+        "review-dim:a": [_dim("a")],
+        "review-dim:b": [BackendError("boom")],
+        "review-dim:c": [_dim("c")],
+    }
+    orch, _, _ = make(repo, script, costs={"review-dim:a": 0.1}, max_budget_usd=1.0)
+    orch.run_state = RunStore(repo).create("t", "balanced", "sha")
+    with pytest.raises(_Stop):
+        asyncio.run(orch._parallel(_parallel_specs(["a", "b", "c"])))
+    orch2, backend2, _ = make(repo, {"review-dim:b": [_dim("b")]}, max_budget_usd=1.0)
+    orch2.run_state = orch.run_state
+    asyncio.run(orch2._parallel(_parallel_specs(["a", "b", "c"])))
+    assert [(r.key, r.max_budget_usd) for r in backend2.requests] == [
+        ("review-dim:b", pytest.approx(0.9))
+    ]
+
+
+def test_plan_prompt_mentions_depends_on_only_in_ultra(repo):
+    _, backend = _large_run(repo, PLAN, ultra=False)
+    assert "depends_on" not in backend.requests[1].prompt
+    assert backend.requests[1].output_schema == SCHEMAS["plan"]
+    step_schema = SCHEMAS["plan"]["properties"]["steps"]["items"]
+    assert "depends_on" not in step_schema["properties"]
+    script = {
+        "scope": [{"areas": [], "rationale": "narrow"}],
+        "explore": [EXPLORE],
+        "plan": [PLAN],
+        "implement": [impl()] * 2,
+        "test": [TEST_OK],
+        "review-dim": [REVIEW_OK] * 3,
+        "review": [REVIEW_OK],
+    }
+    orch, backend, _ = make(repo, script, size="L", ultra=True)
+    assert go(orch).status == "done"
+    plan_req = next(r for r in backend.requests if r.stage == "plan")
+    assert "Steps may list depends_on" in plan_req.prompt
+    assert plan_req.output_schema == SCHEMAS["plan-ultra"]
+    assert "depends_on" in plan_req.output_schema["properties"]["steps"]["items"]["properties"]

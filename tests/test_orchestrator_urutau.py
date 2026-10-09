@@ -14,6 +14,7 @@ from test_orchestrator import (
     EXPLORE,
     PLAN,
     PROFILE,
+    REVIEW_MAJOR,
     REVIEW_OK,
     TEST_OK,
     TRIAGE_S,
@@ -476,3 +477,48 @@ def test_plan_only_findings_include_steps_and_acceptance(repo):
     orch2, _ = make(repo, {"explore": [EXPLORE], "plan": [big]}, log=log2, size="L", plan_only=True)
     assert asyncio.run(orch2.run("again")).status == "plan_only"
     assert len(record_calls(log2)[-1]["findings"]) == 4000
+
+
+def _with_inventory(review, *texts):
+    items = [{"id": f"U{n}", "kind": "untested", "text": t} for n, t in enumerate(texts, 1)]
+    return {**review, "unverified": items}
+
+
+def test_ultra_inventory_comes_only_from_merge_review(repo):
+    merge = [
+        _with_inventory(REVIEW_MAJOR, "merge item"),
+        _with_inventory(REVIEW_OK, "merge item"),
+    ]
+    common = {
+        "plan": [PLAN],
+        "implement": [impl(), impl()],
+        "test": [TEST_OK, TEST_OK],
+        "review": merge,
+    }
+    dim = _with_inventory(REVIEW_MAJOR, "dim only", "merge item")
+    ultra = {
+        **common,
+        "scope": [
+            {"areas": [{"id": a, "focus": a} for a in ("a", "b")], "rationale": "r"},
+        ],
+        # The explore schema has no `unverified`; only review-dim can carry stray items.
+        "explore:a": [EXPLORE],
+        "explore:b": [EXPLORE],
+        "review-dim": [dim] * 3 + [_with_inventory(REVIEW_OK, "dim only")] * 3,
+    }
+    log: list = []
+    orch, _ = make(repo, ultra, log=log, size="M", ultra=True)
+    assert asyncio.run(orch.run("do it")).status == "done"
+    end = record_calls(log)[-1]
+
+    plain_log: list = []
+    plain, _ = make(repo, {**common, "explore": [EXPLORE]}, log=plain_log, size="M")
+    assert asyncio.run(plain.run("do it again")).status == "done"
+    plain_end = record_calls(plain_log)[-1]
+
+    assert [i["text"] for i in end["unverified"]] == ["merge item"]
+    assert end["unverified"] == plain_end["unverified"]
+    assert end["fixRounds"] == plain_end["fixRounds"] == 1
+    assert end["areas"] == plain_end["areas"]
+    assert end["files"] == plain_end["files"]
+    assert orch.run_state.state["unverified_reviews"] == ["review", "fix-1:review"]

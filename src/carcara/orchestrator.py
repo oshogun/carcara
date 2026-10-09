@@ -52,7 +52,7 @@ from carcara.project_config import (
 )
 from carcara.roles import Role, get_role
 from carcara.runstore import Run, RunBusy, RunStore, _now
-from carcara.schemas import MAX_UNVERIFIED, UNVERIFIED_KINDS
+from carcara.schemas import MAX_SCOPE_AREAS, MAX_UNVERIFIED, UNVERIFIED_KINDS
 from carcara.urutau import (
     ClaimConflict,
     UrutauClient,
@@ -76,6 +76,7 @@ EXIT_CODES = {
 # Per-stage max_turns defaults, keyed by pipeline step name.
 DEFAULT_MAX_TURNS: dict[str, int] = {
     "triage": 3,
+    "scope": 3,
     "explore": 30,
     "plan": 5,
     "architect": 30,
@@ -124,6 +125,13 @@ _UNVERIFIED_INSTRUCTIONS = (
     "test exercises (kind untested). Use ids U1, U2, ...; at most 20 items, each text "
     "at most 200 characters. Use [] only if there is truly nothing to list."
 )
+
+# Ultra mode: the parallel review dimensions and their focus text.
+_REVIEW_DIMS = {
+    "correctness": "logic errors, broken behaviour, edge cases and regressions.",
+    "security": "injection, secrets, unsafe input handling and permission issues.",
+    "tests": "missing or weak tests for the changed behaviour.",
+}
 
 # Appended to a stage's prompt when retrying after it returned no structured output.
 _STRUCTURED_OUTPUT_NUDGE = (
@@ -189,6 +197,8 @@ class RunOptions:
     allow_dirty: bool = False
     project_settings: bool = False
     use_api_key: bool = False
+    # Fan out read-only roles in parallel; persisted as run.state["ultra"].
+    ultra: bool = False
     # Not persisted: a resume gets the Bash deny-list back unless the flag is given again.
     unrestricted_bash: bool = False
     max_turns: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_MAX_TURNS))
@@ -335,6 +345,70 @@ def _failing_items(test: dict[str, Any], review: dict[str, Any] | None) -> dict[
     return {}
 
 
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9-]", "-", text.lower()).strip("-")
+
+
+def _dedupe_ids(raw_ids: list[str]) -> list[str]:
+    """Stage-key ids: an empty id becomes its 1-based index, a repeat gets ``-index``."""
+    ids: list[str] = []
+    for index, raw in enumerate(raw_ids, 1):
+        item_id = raw or str(index)
+        if item_id in ids:
+            item_id = f"{item_id}-{index}"
+        ids.append(item_id)
+    return ids
+
+
+def _order_steps(
+    steps: list[dict[str, Any]], ids: list[str]
+) -> tuple[list[tuple[str, dict[str, Any]]], str | None]:
+    """Order plan steps topologically by ``depends_on``, plan order breaking ties.
+
+    Unknown or cyclic dependencies fall back to plan order with a warning.
+    """
+    plan_order = list(zip(ids, steps, strict=True))
+    first: dict[str, int] = {}
+    for index, step in enumerate(steps):
+        first.setdefault(str(step["id"]), index)
+    deps: list[set[int]] = []
+    unknown: list[str] = []
+    for step in steps:
+        wanted = set()
+        for raw in step.get("depends_on") or []:
+            if str(raw) in first:
+                wanted.add(first[str(raw)])
+            else:
+                unknown.append(str(raw))
+        deps.append(wanted)
+    if unknown:
+        return plan_order, f"unknown depends_on ids: {', '.join(unknown)}"
+    done: set[int] = set()
+    order: list[int] = []
+    while len(order) < len(steps):
+        ready = [i for i in range(len(steps)) if i not in done and deps[i] <= done]
+        if not ready:
+            cyclic = [ids[i] for i in range(len(steps)) if i not in done]
+            return plan_order, f"depends_on cycle among steps: {', '.join(cyclic)}"
+        done.add(ready[0])
+        order.append(ready[0])
+    return [plan_order[i] for i in order], None
+
+
+def _merge_explore(ids: list[str], outs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge parallel explore outputs into one explore-shaped dict (first finding wins)."""
+    findings: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for out in outs:
+        for finding in out["findings"]:
+            ident = (finding["path"], finding.get("line"), finding["fact"])
+            if ident not in seen:
+                seen.add(ident)
+                findings.append(finding)
+    summary = "\n".join(f"[{i}] {out['summary']}" for i, out in zip(ids, outs, strict=True))
+    return {"summary": summary, "findings": findings}
+
+
 def _norm_text(text: str) -> str:
     return " ".join(text.lower().split())
 
@@ -476,6 +550,8 @@ class Orchestrator:
             run.state["use_api_key"] = self.options.use_api_key
             # Persisted so a resume keeps the cap unless --max-budget-usd is given again.
             run.state["max_budget_usd"] = self.options.max_budget_usd
+            # Persisted so a resume keeps the parallel fan-out even without --ultra.
+            run.state["ultra"] = self.options.ultra
             # Snapshot: a resume uses this, not a re-read of .carcara/config.json.
             run.state["project_config"] = self.config.to_dict()
             self._record_issue(run)
@@ -950,6 +1026,7 @@ class Orchestrator:
         role_name: str | None,
         turns_key: str,
         prompt: Callable[[], str],
+        budget_cap: float | None = None,
     ) -> dict[str, Any]:
         run = self.run_state
         assert run is not None
@@ -973,12 +1050,25 @@ class Orchestrator:
                 f"\n\nUser guidance:\n{blocked['feedback']}"
             )
         nudge = ""
+        # budget_cap is this call's lifetime share: retries draw from what is left of it.
+        spent = 0.0
+        share_exhausted = (
+            f"parallel share exhausted for {key} (${budget_cap or 0:.2f}); "
+            "resume to retry it with the remaining budget"
+        )
+        capped = False
         for attempt in range(2):
             remaining: float | None = None
             if self.options.max_budget_usd is not None:
                 remaining = round(self.options.max_budget_usd - run.state["totals"]["cost_usd"], 6)
                 if remaining <= 0:
                     raise _Stop("budget_exceeded", f"budget exhausted before stage {key}")
+                if budget_cap is not None:
+                    share = round(budget_cap - spent, 6)
+                    if share <= 0:
+                        raise _Stop("budget_exceeded", share_exhausted)
+                    capped = share < remaining
+                    remaining = min(remaining, share)
             request = build_request(
                 stage,
                 role,
@@ -989,6 +1079,8 @@ class Orchestrator:
                 max_budget_usd=remaining,
                 setting_sources=["project"] if self.options.project_settings else [],
                 unrestricted_bash=self.options.unrestricted_bash,
+                key=key,
+                schema="plan-ultra" if stage == "plan" and self._ultra() else None,
             )
             run.event("stage_started", key=key, stage=stage, role=role_name, model=request.model)
             try:
@@ -999,6 +1091,7 @@ class Orchestrator:
                 if exc.result is not None:
                     failed = exc.result
                     run.add_cost(failed.cost_usd, failed.usage, failed.num_turns)
+                    spent += failed.cost_usd or 0.0
                 cost = self._record_failure(
                     run, key, stage, role_name, request.model, exc.result, str(exc)
                 )
@@ -1020,6 +1113,7 @@ class Orchestrator:
                 # The test-runner kept going instead of reporting: nudge it once,
                 # then hand over to the human rather than failing the run.
                 run.add_cost(result.cost_usd, result.usage, result.num_turns)
+                spent += result.cost_usd or 0.0
                 cost = self._record_failure(
                     run, key, stage, role_name, request.model, result, "ran out of turns"
                 )
@@ -1041,6 +1135,8 @@ class Orchestrator:
                 run, key, stage, role_name, request.model, result, "budget exhausted"
             )
             run.event("stage_error", key=key, subtype=result.subtype, **cost)
+            if capped:
+                raise _Stop("budget_exceeded", share_exhausted)
             raise _Stop("budget_exceeded", f"budget exhausted during stage {key}")
         if result.is_error:
             detail = (
@@ -1074,6 +1170,47 @@ class Orchestrator:
         )
         run.event("stage_completed", key=key, cost_usd=result.cost_usd)
         return output
+
+    async def _parallel(
+        self, specs: list[tuple[str, str, str | None, str, Callable[[], str]]]
+    ) -> list[dict[str, Any]]:
+        """Run independent read-only stages concurrently; return outputs in spec order.
+
+        Each spec is (key, stage, role, turns_key, prompt), as for _stage. No lock
+        is needed: every state mutation and save() happens synchronously between
+        awaits on one event loop, and Run.event does one write() per line. Prompts
+        must be precomputed or pure (siblings must not read state others mutate),
+        and a branch must never call _ask_human or _gate.
+
+        Siblings are not cancelled when one fails: each finishes within its share
+        of the budget and records itself, so a resume replays the finished keys and
+        re-runs only the missing ones. The first exception in spec order is raised.
+        """
+        run = self.run_state
+        assert run is not None
+        if not specs:
+            return []
+        cap: float | None = None
+        # Split among siblings still to run: memoised ones replay at no cost.
+        pending = sum(1 for spec in specs if run.stage(spec[0]) is None)
+        if self.options.max_budget_usd is not None and pending:
+            remaining = round(self.options.max_budget_usd - run.state["totals"]["cost_usd"], 6)
+            if remaining <= 0:
+                keys = ", ".join(spec[0] for spec in specs)
+                raise _Stop("budget_exceeded", f"budget exhausted before stages {keys}")
+            cap = remaining / pending
+        results = await asyncio.gather(
+            *(self._stage(*spec, budget_cap=cap) for spec in specs), return_exceptions=True
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return results  # type: ignore[return-value]
+
+    def _ultra(self) -> bool:
+        # Read from run state, not options, so a resume keeps the same stage keys.
+        assert self.run_state is not None
+        return bool(self.run_state.state.get("ultra"))
 
     # -- git context ---------------------------------------------------------
 
@@ -1170,16 +1307,7 @@ class Orchestrator:
                 )
             )
         else:
-            explore = await self._stage(
-                "explore",
-                "explore",
-                "explorer",
-                "explore",
-                lambda: (
-                    f"Task: {task}\n\nFind the files, symbols and conventions relevant to "
-                    "this task. Report file:line facts only."
-                ),
-            )
+            explore = await self._explore(run, task)
             plan = await self._plan_stage(task, explore, architect=size == "L")
             if self.options.plan_only:
                 return "plan_only", None
@@ -1206,12 +1334,13 @@ class Orchestrator:
                 )
             steps = plan["steps"] if size == "L" else []
             if steps:
-                seen: set[str] = set()
-                for index, step in enumerate(steps, 1):
-                    step_id = str(step["id"]) or str(index)
-                    if step_id in seen:
-                        step_id = f"{step_id}-{index}"
-                    seen.add(step_id)
+                step_ids = _dedupe_ids([str(step["id"]) for step in steps])
+                ordered = list(zip(step_ids, steps, strict=True))
+                if self._ultra():
+                    ordered, warning = _order_steps(steps, step_ids)
+                    if warning:
+                        run.event("plan_dependency_warning", detail=warning)
+                for step_id, step in ordered:
                     implements.append(
                         await self._stage(
                             f"implement:{step_id}",
@@ -1256,6 +1385,38 @@ class Orchestrator:
             )
         return "done", message
 
+    async def _explore(self, run: Run, task: str) -> dict[str, Any]:
+        base = (
+            f"Task: {task}\n\nFind the files, symbols and conventions relevant to "
+            "this task. Report file:line facts only."
+        )
+        if not self._ultra():
+            return await self._stage("explore", "explore", "explorer", "explore", lambda: base)
+        scope = await self._stage(
+            "scope",
+            "scope",
+            None,
+            "scope",
+            lambda: (
+                f"Task: {task}\n\nSplit the codebase exploration for this task into "
+                f"0-{MAX_SCOPE_AREAS} independent areas that can be explored in parallel, "
+                "each with a short id and a focus. Give 0 or 1 area if the task is narrow."
+            ),
+        )
+        areas = scope["areas"][:MAX_SCOPE_AREAS]
+        ids = _dedupe_ids([_slug(str(area["id"])) for area in areas])
+        focus = [f"{base}\n\nFocus on this area: {area['focus']}" for area in areas]
+        if len(areas) < 2:
+            prompt = focus[0] if areas else base
+            return await self._stage("explore", "explore", "explorer", "explore", lambda: prompt)
+        outs = await self._parallel(
+            [
+                (f"explore:{area_id}", "explore", "explorer", "explore", lambda p=prompt: p)
+                for area_id, prompt in zip(ids, focus, strict=True)
+            ]
+        )
+        return _merge_explore(ids, outs)
+
     async def _plan_stage(
         self, task: str, explore: dict[str, Any] | None, *, architect: bool
     ) -> dict[str, Any]:
@@ -1283,6 +1444,8 @@ class Orchestrator:
                     "Write a revised implementation plan addressing the feedback: ordered "
                     "steps with stable ids and files, tests, acceptance criteria and risks."
                 )
+            if self._ultra():
+                ask += " Steps may list depends_on: ids of earlier steps they require."
             return f"Task: {task}{context}\n\n{ask}"
 
         if architect:
@@ -1483,6 +1646,48 @@ class Orchestrator:
         done.append(key)
         run.save()
 
+    async def _split_review(self, run: Run, task: str, prefix: str) -> dict[str, Any]:
+        """Ultra review: parallel per-dimension reviews, then one merging `review`.
+
+        The merge is the round's only stage=="review" entry, so _last_failing,
+        the report and the unverified inventory see exactly one review per round.
+        """
+        context: dict[str, str] = {}
+
+        def shared() -> str:
+            # Computed once, on first use, before any sibling's prompt is built.
+            if not context:
+                context["inv"] = self._inventory_prompt(run)
+                context["diff"] = self._diff_context()
+            return f"{context['inv']}\n\n{context['diff']}"
+
+        def dim_prompt(dim: str) -> Callable[[], str]:
+            return lambda: (
+                f"Task: {task}\n\nReview this change ONLY for {dim}: {_REVIEW_DIMS[dim]} "
+                f"Report only real issues.\n\n{shared()}"
+            )
+
+        outs = await self._parallel(
+            [
+                (f"{prefix}review-dim:{dim}", "review-dim", "reviewer", "review", dim_prompt(dim))
+                for dim in _REVIEW_DIMS
+            ]
+        )
+        found = dict(zip(_REVIEW_DIMS, outs, strict=True))
+
+        def merge_prompt() -> str:
+            return (
+                f"Task: {task}\n\nDimension review findings (JSON):\n{_dumps(found)}\n\n"
+                "Verify each finding against the code, drop false positives, merge "
+                "duplicates; keep any finding you cannot disprove. Give the overall "
+                f"verdict.\n\n{shared()}"
+            )
+
+        key = f"{prefix}review"
+        review = await self._stage(key, "review", "reviewer", "review", merge_prompt)
+        self._record_unverified(run, key, review)
+        return review
+
     async def _verify(
         self, run: Run, task: str, review_on: bool
     ) -> tuple[str | None, list[dict[str, Any]]]:
@@ -1510,7 +1715,9 @@ class Orchestrator:
                 f"{stage_prefix}test", "test", "test-runner", "test", test_prompt
             )
             review = None
-            if review_on and test["passed"]:
+            if review_on and test["passed"] and self._ultra():
+                review = await self._split_review(run, task, stage_prefix)
+            elif review_on and test["passed"]:
                 key = f"{stage_prefix}review"
                 review = await self._stage(key, "review", "reviewer", "review", review_prompt)
                 self._record_unverified(run, key, review)
@@ -1621,6 +1828,13 @@ class Orchestrator:
             f"files changed: {', '.join(files) if files else 'none'}",
             f"tests: {test_line}",
             f"review: {review_line}",
+        ]
+        par = [e for e in stages if e["stage"] == "review-dim" or e["key"].startswith("explore:")]
+        if par:
+            par_cost = sum(e["cost_usd"] for e in par)
+            keys = ", ".join(e["key"] for e in par)
+            lines.append(f"Parallel stages: {keys} (${par_cost:.2f})")
+        lines += [
             f"est. cost: {costs}",
             f"total est. cost: ${state['totals']['cost_usd']:.2f} "
             f"({'API key' if state.get('use_api_key') else 'subscription login'})"

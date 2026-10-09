@@ -115,6 +115,9 @@ class StageRequest:
     env: dict[str, str] = field(default_factory=dict)
     # From ``carcara run --unrestricted-bash``: skip the implementer/test-runner deny-list.
     unrestricted_bash: bool = False
+    # The orchestrator's stage key (e.g. ``review-dim:security``); lets
+    # FakeBackend script parallel siblings of one stage individually.
+    key: str | None = None
 
 
 @dataclass
@@ -141,8 +144,13 @@ def build_request(
     max_budget_usd: float | None = None,
     setting_sources: list[str] | None = None,
     unrestricted_bash: bool = False,
+    key: str | None = None,
+    schema: str | None = None,
 ) -> StageRequest:
-    """Assemble a stage request; ``role=None`` means the main model with no tools."""
+    """Assemble a stage request; ``role=None`` means the main model with no tools.
+
+    ``schema`` names the output schema when it differs from ``stage``.
+    """
     if role is None:
         model = model_for("main", profile)
         append = MAIN_PROMPT + STAGE_SCHEMA_NOTE
@@ -169,12 +177,13 @@ def build_request(
         disallowed_tools=disallowed,
         permission_mode=mode,
         cwd=cwd,
-        output_schema=schema_for(stage),
+        output_schema=schema_for(schema or stage),
         max_turns=max_turns,
         max_budget_usd=max_budget_usd,
         setting_sources=list(setting_sources or []),
         env={STAGE_ENV_VAR: role_name or "main"},
         unrestricted_bash=unrestricted_bash,
+        key=key,
     )
 
 
@@ -306,9 +315,11 @@ def _to_result(result_msg: Any) -> StageResult:
 class FakeBackend:
     """Scripted backend: ``script[stage]`` is consumed in order.
 
-    Entries are structured outputs (validated against the stage schema) or
-    ready-made ``StageResult`` objects. ``costs[stage]`` sets ``cost_usd`` for
-    structured entries.
+    ``script[key]`` (the request's stage key, e.g. ``review-dim:security``)
+    takes precedence over ``script[stage]`` when present. Entries are
+    structured outputs (validated against the stage schema), ready-made
+    ``StageResult`` objects, or exception instances (raised). ``costs[key]``
+    or ``costs[stage]`` sets ``cost_usd`` for structured entries.
     """
 
     def __init__(
@@ -322,17 +333,24 @@ class FakeBackend:
 
     async def run_stage(self, request: StageRequest) -> StageResult:
         self.requests.append(request)
-        queue = self.script.get(request.stage)
+        key = request.key
+        name = key if key is not None and key in self.script else request.stage
+        queue = self.script.get(name)
         if not queue:
-            raise BackendError(f"FakeBackend: script exhausted for stage {request.stage}")
+            raise BackendError(f"FakeBackend: script exhausted for stage {name}")
         entry = queue.pop(0)
+        if isinstance(entry, BaseException):
+            raise entry
         if isinstance(entry, StageResult):
             return entry
         _check_structured(request, entry)
+        cost = self.costs.get(request.stage, 0.0)
+        if key is not None:
+            cost = self.costs.get(key, cost)
         return StageResult(
             structured=entry,
             text=None,
-            cost_usd=self.costs.get(request.stage, 0.0),
+            cost_usd=cost,
             num_turns=1,
             session_id=f"fake-{request.stage}-{len(self.requests)}",
         )

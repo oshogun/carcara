@@ -20,8 +20,11 @@ def _obj(properties: dict[str, Any], optional: tuple[str, ...] = ()) -> dict[str
     }
 
 
-def _arr(items: dict[str, Any]) -> dict[str, Any]:
-    return {"type": "array", "items": items}
+def _arr(items: dict[str, Any], max_items: int | None = None) -> dict[str, Any]:
+    schema: dict[str, Any] = {"type": "array", "items": items}
+    if max_items is not None:
+        schema["maxItems"] = max_items
+    return schema
 
 
 _STR: dict[str, Any] = {"type": "string"}
@@ -55,6 +58,43 @@ _UNVERIFIED: dict[str, Any] = {
     ),
 }
 
+MAX_SCOPE_AREAS = 4
+
+_REVIEW: dict[str, Any] = _obj(
+    {
+        "verdict": {"type": "string", "enum": ["approve", "request_changes"]},
+        "findings": _arr(
+            _obj(
+                {
+                    "severity": {
+                        "type": "string",
+                        "enum": ["blocker", "major", "minor", "nit"],
+                    },
+                    "path": _STR,
+                    "line": _INT,
+                    "issue": _STR,
+                    "fix": _STR,
+                },
+                optional=("line",),
+            )
+        ),
+        "unverified": _UNVERIFIED,
+    }
+)
+
+
+def _plan(step: dict[str, Any]) -> dict[str, Any]:
+    return _obj(
+        {
+            "goal": _STR,
+            "steps": _arr(step),
+            "tests": _arr(_STR),
+            "acceptance": _arr(_STR),
+            "risks": _arr(_STR),
+        }
+    )
+
+
 SCHEMAS: dict[str, dict[str, Any]] = {
     "triage": _obj(
         {
@@ -70,14 +110,13 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "findings": _arr(_obj({"path": _STR, "line": _INT, "fact": _STR}, optional=("line",))),
         }
     ),
-    "plan": _obj(
-        {
-            "goal": _STR,
-            "steps": _arr(_obj({"id": _STR, "files": _arr(_STR), "change": _STR})),
-            "tests": _arr(_STR),
-            "acceptance": _arr(_STR),
-            "risks": _arr(_STR),
-        }
+    "plan": _plan(_obj({"id": _STR, "files": _arr(_STR), "change": _STR})),
+    # Ultra runs may order steps with depends_on; non-ultra requests keep "plan".
+    "plan-ultra": _plan(
+        _obj(
+            {"id": _STR, "files": _arr(_STR), "change": _STR, "depends_on": _arr(_STR)},
+            optional=("depends_on",),
+        )
     ),
     "implement": _obj(
         {
@@ -95,25 +134,12 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "failures": _arr(_obj({"name": _STR, "detail": _STR})),
         }
     ),
-    "review": _obj(
+    "review": _REVIEW,
+    "review-dim": _REVIEW,
+    "scope": _obj(
         {
-            "verdict": {"type": "string", "enum": ["approve", "request_changes"]},
-            "findings": _arr(
-                _obj(
-                    {
-                        "severity": {
-                            "type": "string",
-                            "enum": ["blocker", "major", "minor", "nit"],
-                        },
-                        "path": _STR,
-                        "line": _INT,
-                        "issue": _STR,
-                        "fix": _STR,
-                    },
-                    optional=("line",),
-                )
-            ),
-            "unverified": _UNVERIFIED,
+            "areas": _arr(_obj({"id": _STR, "focus": _STR}), max_items=MAX_SCOPE_AREAS),
+            "rationale": _STR,
         }
     ),
     "docs": _obj({"changed": _arr(_STR)}),
