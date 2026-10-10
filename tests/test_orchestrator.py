@@ -1535,6 +1535,66 @@ def test_small_gate_tests_fail_no_review(repo):
     assert review_line.endswith("(forced: verifiability gate)")
 
 
+@pytest.mark.parametrize("reverted", [True, False])
+def test_small_retry_forces_review_only_while_diff_touches_gated_path(repo, reverted):
+    (repo / ".github" / "workflows").mkdir(parents=True)
+    out = {**impl(), "changed": []}
+    orch, _ = make_editing(
+        repo,
+        {"implement": [out] * 3, "test": [TEST_FAIL] * 3},
+        [{".github/workflows/x.yml": "on: push\n"}],
+        size="S",
+    )
+    first = go(orch)
+    assert first.status == "needs_human"
+    assert orch.run_state.state["gate"]["stage"] == "post-implement"
+    assert orch.run_state.state["review_reason"] == "verifiability gate"
+    if reverted:
+        (repo / ".github" / "workflows" / "x.yml").unlink()
+
+    orch2, backend2 = make_editing(
+        repo,
+        {"implement": [out], "test": [TEST_OK], "review": [REVIEW_OK]},
+        [{"a.py": "x = 2\n"}],
+    )
+    out2 = asyncio.run(orch2.resume(first.run_id, feedback="try again"))
+    assert out2.status == "done"
+    state = orch2.run_state.state
+    events = [
+        json.loads(e) for e in (orch2.run_state.dir / "events.jsonl").read_text().splitlines()
+    ]
+    cleared = [e for e in events if e["event"] == "gate_cleared"]
+    if reverted:
+        assert ("review", "reviewer") not in seq(backend2)
+        assert state["review_reason"] is None
+        assert "gate" not in state and "gate_plan" not in state
+        assert "forced" not in out2.report_text and "gate:" not in out2.report_text
+        assert cleared[0]["paths"] == [".github/workflows/x.yml"]
+        # The earlier gate stays in the event log.
+        assert any(e["event"] == "gate" and e.get("trigger") == "verifiability" for e in events)
+    else:
+        assert ("review", "reviewer") in seq(backend2)
+        assert state["review_reason"] == "verifiability gate"
+        assert state["gate"]["trigger"] == "verifiability"
+        assert cleared == []
+
+
+def test_plan_gate_replaces_stale_gate_plan(repo):
+    orch, _, _ = make(
+        repo,
+        {"implement": [impl("src/carcara/policy.py")]},
+        gate=AutoGate(decision="defer"),
+        size="S",
+    )
+    go(orch)
+    run = orch.run_state
+    assert "gate_plan" in run.state
+    orch.gate = AutoGate()
+    asyncio.run(orch._gate(run, PLAN, "revision"))
+    assert run.state["gate"]["stage"] == "plan"
+    assert "gate_plan" not in run.state
+
+
 def test_small_fix_round_gated_path_gates_then_reviews(repo):
     orch, backend, gate = make(
         repo,

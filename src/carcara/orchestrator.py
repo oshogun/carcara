@@ -1788,6 +1788,9 @@ class Orchestrator:
         if stage == "post-implement":
             # The synthetic plan is not a plan stage output; keep it for status --plan.
             run.state["gate_plan"] = {**plan, "gate_reason": reason}
+        else:
+            # An earlier post-implement plan must not outlive its gate.
+            run.state.pop("gate_plan", None)
         run.save()
         decision = await self._ask_human(
             run,
@@ -1846,10 +1849,24 @@ class Orchestrator:
         await self._gate(run, plan, "verifiability", changed, stage="post-implement")
 
     def _force_review_on_gate(self, run: Run, review_on: bool) -> bool:
-        """Turn review on when the verifiability gate fired (read from persisted
-        state, so a resumed run past the gate still reviews)."""
+        """Turn review on when the verifiability gate fired and the current diff
+        still touches a gated path (a resumed run past the gate still reviews)."""
         gate = run.state.get("gate") or {}
-        if review_on or gate.get("trigger") != "verifiability":
+        if gate.get("trigger") != "verifiability":
+            return review_on
+        flagged = match_paths(self._changed_paths(run), self.config.verifiability_paths, self.cwd)
+        if not flagged:
+            # Stale: a later round no longer touches a gated path. The earlier
+            # gate stays in the event log.
+            if gate.get("stage") == "post-implement":
+                run.state.pop("gate", None)
+                run.state.pop("gate_plan", None)
+                run.event("gate_cleared", trigger="verifiability", paths=gate.get("paths") or [])
+            if run.state.get("review_reason") == "verifiability gate":
+                run.state["review_reason"] = None
+            run.save()
+            return review_on
+        if review_on:
             return review_on
         if run.state.get("review_reason") != "verifiability gate":
             run.state["review_reason"] = "verifiability gate"
