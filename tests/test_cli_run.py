@@ -94,6 +94,14 @@ def test_dry_run_single_size(repo, capsys):
     assert "size S:" in out and "size M:" not in out and "triage" not in out
 
 
+def test_dry_run_small_notes_gate_review(repo, capsys):
+    assert run(repo, "--dry-run", "--size", "S") == 0
+    out = capsys.readouterr().out
+    assert "(review runs only if the verifiability gate fires)" in out
+    assert run(repo, "--dry-run", "--size", "S", "--review") == 0
+    assert "only if the verifiability gate" not in capsys.readouterr().out
+
+
 def test_dry_run_ultra_shows_parallel_rows(repo, capsys):
     assert run(repo, "--dry-run", "--size", "L", "--ultra") == 0
     out = capsys.readouterr().out
@@ -631,6 +639,7 @@ STATUS_KEYS = {
     "failed_attempts",
     "uncounted_stages",
     "gate",
+    "review_reason",
     "unverified",
     "probe_results",
     "extent",
@@ -727,15 +736,19 @@ def test_status_verifiability_fields(repo, capsys):
         {"id": "U1", "kind": "external", "text": "pypi name free"},
         {"id": "U2", "kind": "normative", "text": "done", "resolved": True},
     ]
-    run_.state.update(gate=gate, extent=extent, unverified=items)
+    run_.state.update(
+        gate=gate, extent=extent, unverified=items, review_reason="verifiability gate"
+    )
     run_.save()
     data = _status_json(repo, capsys)
     assert data["gate"] == gate and data["extent"] == extent
+    assert data["review_reason"] == "verifiability gate"
     assert data["unverified"] == items and data["probe_results"] == {}
 
     assert status(repo) == 0
     out = capsys.readouterr().out
     assert "gate: verifiability (paths: .github/x.yml)\n" in out
+    assert "review: forced by verifiability gate\n" in out
     assert "extent: 1 files, areas .github, fix rounds 0 [carcara/extent-1]\n" in out
     assert "unverified: 1 open (external 1, normative 0, untested 0)\n" in out
     assert "  - U1 [external] pypi name free\n" in out and "U2" not in out

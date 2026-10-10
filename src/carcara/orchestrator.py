@@ -2,7 +2,7 @@
 
 Pipelines (size from TRIAGE unless given):
 
-- S: IMPLEMENT -> TEST [-> REVIEW if ``review_small``]
+- S: IMPLEMENT -> TEST [-> REVIEW if ``review_small`` or the verifiability gate fired]
 - M: EXPLORE -> PLAN (main model, no tools) [-> GATE if ``approve_plan``]
   -> IMPLEMENT -> TEST -> REVIEW
 - L: EXPLORE -> ARCHITECT -> GATE -> IMPLEMENT per plan step -> TEST -> REVIEW
@@ -11,7 +11,9 @@ Pipelines (size from TRIAGE unless given):
 Low-verifiability paths (``.carcara/config.json`` ``verifiability_paths``) also
 gate: M/L before IMPLEMENT when plan step files match; otherwise (always for S,
 which has no plan) after IMPLEMENT and before TEST when changed files match.
-The post-implement gate leaves the changes in the working tree.
+The post-implement gate leaves the changes in the working tree. Whenever the
+verifiability gate fires, REVIEW runs whatever the size (split review under
+ultra); a stale gate from an earlier round of the same run still forces it.
 
 Failing tests or blocker/major review findings trigger at most two fix
 iterations (implementer with only the failing items -> test -> review), then
@@ -1612,6 +1614,7 @@ class Orchestrator:
                 )
 
         await self._post_implement_gate(run)
+        review_on = self._force_review_on_gate(run, review_on)
         message, fixes = await self._verify(run, task, review_on)
         implements.extend(fixes)
 
@@ -1787,6 +1790,18 @@ class Orchestrator:
             ],
         }
         await self._gate(run, plan, "verifiability", changed, stage="post-implement")
+
+    def _force_review_on_gate(self, run: Run, review_on: bool) -> bool:
+        """Turn review on when the verifiability gate fired (read from persisted
+        state, so a resumed run past the gate still reviews)."""
+        gate = run.state.get("gate") or {}
+        if review_on or gate.get("trigger") != "verifiability":
+            return review_on
+        if run.state.get("review_reason") != "verifiability gate":
+            run.state["review_reason"] = "verifiability gate"
+            run.event("review_forced", reason="verifiability", paths=gate.get("paths") or [])
+            run.save()
+        return True
 
     def _inventory_prompt(self, run: Run) -> str:
         """Reviewer instructions for the `unverified` assumptions inventory."""
@@ -2114,6 +2129,12 @@ class Orchestrator:
                 review_line = (
                     f"{out['verdict']} ({len(out['findings'])} findings, {serious} serious)"
                 )
+        reason = state.get("review_reason")
+        if reason and review_line == "not run":
+            failed = "; tests failed" if test_line.startswith("FAILED") else ""
+            review_line += f" (required by {reason}{failed})"
+        elif reason:
+            review_line += f" (forced: {reason})"
         attempts = state.get("failed_attempts", [])
         cost_items = [f"{e['key']} ${e['cost_usd']:.2f}" for e in stages]
         cost_items += [

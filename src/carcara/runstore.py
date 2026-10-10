@@ -289,6 +289,8 @@ class RunStore:
             "issue": None,
             "card_estimate": None,
             "plan_rejected": False,
+            # Why review ran on a size that skips it by default (e.g. "verifiability gate").
+            "review_reason": None,
             # Urutau record_run reporting; ``last`` becomes
             # {status, ok, code, claim_held, unverified_open, at}. Runs written
             # before this key existed read it with .get() (missing = disabled).

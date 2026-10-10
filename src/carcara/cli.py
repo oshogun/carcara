@@ -147,7 +147,11 @@ def _add_run_parser(sub: Any) -> None:
         help="disable the implementer/test-runner Bash deny-list for this invocation only "
         "(not persisted; pass it again with --resume)",
     )
-    run.add_argument("--review", action="store_true", help="also review S-sized changes")
+    run.add_argument(
+        "--review",
+        action="store_true",
+        help="also review S-sized changes (review always runs when the verifiability gate fires)",
+    )
     run.add_argument(
         "--ultra",
         action="store_true",
@@ -378,6 +382,8 @@ def _dry_run(profile: Any, ns: argparse.Namespace, cwd: str, origin: str) -> str
             )
             if stage == "plan" and (size == "L" or ns.approve_plan):
                 out.append(f"  {'gate':<{width}} {'human':<12} {'-':<24} {'-':<12} -")
+        if size == "S" and not ns.review:
+            out.append("  (review runs only if the verifiability gate fires)")
         if size == "L":
             out.append("  (implement runs once per plan step; docs only for user-facing changes)")
     out.append(
@@ -587,6 +593,8 @@ def _verifiability_lines(state: dict[str, Any]) -> list[str]:
     if gate:
         paths = f" (paths: {', '.join(gate['paths'])})" if gate.get("paths") else ""
         lines.append(f"gate: {gate.get('trigger', '?')}{paths}")
+    if state.get("review_reason"):
+        lines.append(f"review: forced by {state['review_reason']}")
     extent = state.get("extent")
     if extent:
         lines.append(
@@ -656,6 +664,7 @@ def status_main(ns: argparse.Namespace) -> int:
             "failed_attempts": len(attempts),
             "uncounted_stages": uncounted,
             "gate": state.get("gate"),
+            "review_reason": state.get("review_reason"),
             "unverified": state.get("unverified") or [],
             "probe_results": state.get("probe_results") or {},
             "extent": state.get("extent"),

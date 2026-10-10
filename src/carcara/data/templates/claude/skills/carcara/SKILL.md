@@ -55,7 +55,9 @@ Take the exit code of the background `carcara run`, read
   plan's `Gate:` line says why it stopped. A low-verifiability gate after
   implement (the steps list changed files) means the changes are already in
   the working tree: offer `carcara diff <id>`, and only approve / reject
-  (request changes is not available).
+  (request changes is not available). Whenever the verifiability gate fires,
+  review runs whatever the size (split review under `--ultra`); the report's
+  `review:` line says `forced: verifiability gate`.
   - Approve: background `carcara run --resume <id> --yes`. The user gets a
     permission prompt; that prompt is their approval.
   - Request changes: background

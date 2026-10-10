@@ -1341,12 +1341,14 @@ def test_small_verifiability_gate_after_implement_then_approve(repo):
     with pytest.raises(OrchestratorError, match="--feedback"):
         asyncio.run(orch2.resume(out.run_id, feedback="other"))
 
-    # Approving replays the memoised implement stage and continues to test.
-    orch3, backend3, gate3 = make(repo, {"test": [TEST_OK]})
+    # Approving replays the memoised implement stage and continues to test, then
+    # the review the persisted verifiability gate forces.
+    orch3, backend3, gate3 = make(repo, {"test": [TEST_OK], "review": [REVIEW_OK]})
     out3 = asyncio.run(orch3.resume(out.run_id))
     assert out3.status == "done"
-    assert seq(backend3) == [("test", "test-runner")]
+    assert seq(backend3) == [("test", "test-runner"), ("review", "reviewer")]
     assert len(gate3.plans) == 1
+    assert orch3.run_state.state["review_reason"] == "verifiability gate"
 
 
 def test_small_verifiability_gate_reject_points_to_diff(repo):
@@ -1402,7 +1404,7 @@ def test_project_config_snapshot_used_on_resume(repo):
     assert orch.run_state.state["project_config"] == snapshot
     # A mid-run edit (e.g. adding a probe host) has no effect on the resumed run.
     config.write_text('{"verifiability_paths": [], "probes": {"p": "https://evil/{arg}"}}')
-    orch2, _, _ = make(repo, {"test": [TEST_OK]})
+    orch2, _, _ = make(repo, {"test": [TEST_OK], "review": [REVIEW_OK]})
     assert orch2.config.probes
     assert asyncio.run(orch2.resume(out.run_id)).status == "done"
     assert orch2.config.verifiability_paths == ["db/**"] and orch2.config.probes == {}
@@ -1418,7 +1420,7 @@ def test_resume_without_config_snapshot_reads_file(repo):
     run = orch.run_state
     del run.state["project_config"]
     run.save()
-    orch2, _, _ = make(repo, {"test": [TEST_OK]})
+    orch2, _, _ = make(repo, {"test": [TEST_OK], "review": [REVIEW_OK]})
     assert asyncio.run(orch2.resume(out.run_id)).status == "done"
     assert orch2.config.verifiability_paths == list(DEFAULT_VERIFIABILITY_PATHS)
 
@@ -1429,14 +1431,136 @@ def test_small_ordinary_path_no_gate(repo):
     assert gate.plans == []
     assert "gate" not in orch.run_state.state
     assert [s for s, _ in seq(backend)] == ["implement", "test"]
+    assert orch.run_state.state["review_reason"] is None
 
 
 def test_small_verifiability_paths_config_disables(repo):
     (repo / ".carcara").mkdir()
     (repo / ".carcara" / "config.json").write_text('{"verifiability_paths": []}')
-    orch, _, gate = make(repo, {"implement": [impl(".github/x.yml")], "test": [TEST_OK]}, size="S")
+    orch, backend, gate = make(
+        repo, {"implement": [impl(".github/x.yml")], "test": [TEST_OK]}, size="S"
+    )
     assert go(orch).status == "done"
     assert gate.plans == []
+    assert [s for s, _ in seq(backend)] == ["implement", "test"]
+    assert orch.run_state.state["review_reason"] is None
+
+
+@pytest.mark.parametrize("path", ["src/carcara/policy.py", ".github/workflows/x.yml"])
+def test_small_gated_path_forces_review(repo, path):
+    orch, backend, _ = make(
+        repo, {"implement": [impl(path)], "test": [TEST_OK], "review": [REVIEW_OK]}, size="S"
+    )
+    out = go(orch)
+    assert out.status == "done"
+    assert seq(backend) == [
+        ("implement", "implementer"),
+        ("test", "test-runner"),
+        ("review", "reviewer"),
+    ]
+    state = orch.run_state.state
+    assert state["gate"]["trigger"] == "verifiability"
+    assert state["review_reason"] == "verifiability gate"
+    assert "review: approve (0 findings, 0 serious) (forced: verifiability gate)" in out.report_text
+    assert len(out.report_text.splitlines()) <= 12
+    events = [json.loads(e) for e in (orch.run_state.dir / "events.jsonl").read_text().splitlines()]
+    forced = [e for e in events if e["event"] == "review_forced"]
+    assert len(forced) == 1 and forced[0]["paths"] == [path]
+
+
+def test_small_forced_review_records_unverified(repo):
+    from carcara.urutau import build_inventory
+
+    item = {"id": "U1", "kind": "untested", "text": "policy denies sed -i"}
+    review = {**REVIEW_OK, "unverified": [item]}
+    orch, _, _ = make(
+        repo,
+        {"implement": [impl("src/carcara/policy.py")], "test": [TEST_OK], "review": [review]},
+        size="S",
+    )
+    assert go(orch).status == "done"
+    state = orch.run_state.state
+    assert [i["id"] for i in state["unverified"]] == ["U1"]
+    unverified = build_inventory(state)[0]
+    assert [i["text"] for i in unverified] == ["policy denies sed -i"]
+
+
+def test_ultra_small_gate_forces_split_review(repo):
+    script = {
+        "implement": [impl("src/carcara/policy.py")],
+        "test": [TEST_OK],
+        **{f"review-dim:{d}": [_dim(d)] for d in DIMS},
+        "review": [REVIEW_OK],
+    }
+    orch, _, _ = make(repo, script, **_ultra_s(review_small=False))
+    assert go(orch).status == "done"
+    assert keys(orch) == [
+        "implement",
+        "test",
+        *(f"review-dim:{d}" for d in DIMS),
+        "review",
+    ]
+    assert orch.run_state.state["review_reason"] == "verifiability gate"
+
+
+def test_small_gate_tests_fail_no_review(repo):
+    orch, backend, _ = make(
+        repo,
+        {
+            "implement": [impl("src/carcara/policy.py")] * 3,
+            "test": [TEST_FAIL] * 3,
+        },
+        size="S",
+    )
+    out = go(orch)
+    assert out.status == "needs_human"
+    assert "review" not in [s for s, _ in seq(backend)]
+    assert "review: not run (required by verifiability gate; tests failed)" in out.report_text
+
+    orch2, backend2, _ = make(
+        repo,
+        {"implement": [impl("src/carcara/policy.py")], "test": [TEST_OK], "review": [REVIEW_OK]},
+    )
+    out2 = asyncio.run(orch2.resume(out.run_id, feedback="fix the deny-list"))
+    assert (out2.status, out2.exit_code) == ("done", 0)
+    assert ("review", "reviewer") in seq(backend2)
+    assert keys(orch2)[-1] == "retry-1:review"
+    assert orch2.run_state.state["review_reason"] == "verifiability gate"
+    events_path = orch2.run_state.dir / "events.jsonl"
+    events = [json.loads(e) for e in events_path.read_text().splitlines()]
+    assert len([e for e in events if e["event"] == "review_forced"]) == 1
+    review_line = next(ln for ln in out2.report_text.splitlines() if ln.startswith("review:"))
+    assert review_line.endswith("(forced: verifiability gate)")
+
+
+def test_medium_plan_gate_review_reason_unset(repo):
+    plan = {**PLAN, "steps": [{"id": "s1", "files": ["db/migrations/1.sql"], "change": "x"}]}
+    script = {
+        "explore": [EXPLORE],
+        "plan": [plan],
+        "implement": [impl("db/migrations/1.sql")],
+        "test": [TEST_OK],
+        "review": [REVIEW_OK],
+    }
+    orch, backend, _ = make(repo, script, size="M")
+    assert go(orch).status == "done"
+    assert orch.run_state.state["gate"]["trigger"] == "verifiability"
+    assert ("review", "reviewer") in seq(backend)
+    assert orch.run_state.state["review_reason"] is None
+
+
+def test_small_review_flag_no_reason(repo):
+    orch, backend, _ = make(
+        repo,
+        {"implement": [impl("src/carcara/policy.py")], "test": [TEST_OK], "review": [REVIEW_OK]},
+        size="S",
+        review_small=True,
+    )
+    out = go(orch)
+    assert out.status == "done"
+    assert ("review", "reviewer") in seq(backend)
+    assert orch.run_state.state["review_reason"] is None
+    assert "forced" not in out.report_text
 
 
 def test_invalid_project_config_is_orchestrator_error(repo):
@@ -1457,7 +1581,7 @@ def test_resume_uses_snapshot_when_disk_config_invalid(repo):
     out = go(orch)
     assert out.status == "awaiting_approval"
     config.write_text('{"nope": 1}')
-    orch2, _, _ = make(repo, {"test": [TEST_OK]})
+    orch2, _, _ = make(repo, {"test": [TEST_OK], "review": [REVIEW_OK]})
     assert asyncio.run(orch2.resume(out.run_id)).status == "done"
     assert orch2.config.verifiability_paths == ["db/**"]
 

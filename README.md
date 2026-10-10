@@ -213,7 +213,7 @@ Stages per size (triage picks the size unless `--size S|M|L` is given):
 
 | Size | Stages |
 |---|---|
-| S | implement (→ **approval** if low-verifiability paths changed) → test (→ review with `--review`) |
+| S | implement (→ **approval** if low-verifiability paths changed) → test (→ review with `--review` or when the verifiability gate fired) |
 | M | explore → plan (→ **approval** with `--approve-plan` or low-verifiability paths) → implement → test → review |
 | L | explore → plan (architect) → **approval** → implement per plan step → test → review → docs |
 
@@ -238,6 +238,11 @@ is refused at this gate. The same post-implement check also catches M/L
 changes that touch a pattern even though no plan step listed it. The gate
 prompt starts with `Gate: <reason>`, and `state.json` records
 `gate: {trigger, paths, stage}`, where `stage` is `plan` or `post-implement`.
+When the verifiability gate fires, review runs whatever the size (the split
+review under `--ultra`), so the change gets an `unverified` inventory. The
+report's `review:` line then ends with `(forced: verifiability gate)`, and
+`state.json` records `review_reason`. Review is still skipped when tests fail.
+A gate from an earlier fix round of the same run keeps forcing review.
 
 On a TTY you are prompted; `--yes` auto-approves; without a TTY the run stops with
 exit code 3 and is continued later with `--resume <id> --yes`. If tests still
@@ -287,7 +292,7 @@ and `extent` values.
 | `--accept-failures` | with `--resume`: finish a needs_human run, accepting its failures |
 | `--allow-dirty` | allow uncommitted changes (clean tree required by default); the diff base is a snapshot of your uncommitted work |
 | `--unrestricted-bash` | turn off the implementer/test-runner Bash deny-list for this invocation only (prints a warning; pass it again with `--resume`) |
-| `--review` | also review S-sized changes |
+| `--review` | also review S-sized changes (review always runs when the verifiability gate fires) |
 | `--ultra` | fan out explore and review into parallel stages (see [Ultra mode](#ultra-mode---ultra)); kept on `--resume` |
 | `--project-settings` | load the project's Claude Code settings and CLAUDE.md (note: their `env` / `apiKeyHelper` can re-enable API billing) |
 | `--cwd DIR` | project directory (default `.`) |
