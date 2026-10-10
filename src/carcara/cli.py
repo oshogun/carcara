@@ -682,6 +682,15 @@ def status_main(ns: argparse.Namespace) -> int:
         sys.stdout.write(json.dumps(data, indent=2) + "\n")
         return 0
     if ns.plan:
+        # A post-implement gate has a synthetic plan (not a plan stage output);
+        # while it awaits approval it is what the user decides on.
+        gate_plan = state.get("gate_plan")
+        if gate_plan and (plan is None or status == "awaiting_approval"):
+            sys.stdout.write(render_plan(gate_plan))
+            if status == "awaiting_approval":
+                cmd = _resume_cmd(run.id, ns.cwd)
+                sys.stdout.write(f"Approve: {cmd} --yes\nReject: {cmd} --reject\n")
+            return 0
         if plan is None:
             _err(f"run {run.id} has no plan")
             return 1

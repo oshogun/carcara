@@ -1735,12 +1735,15 @@ class Orchestrator:
             return
         paths = list(paths)[:20]
         run.state["gate"] = {"trigger": trigger, "paths": paths, "stage": stage}
-        run.save()
         reason = {
             "size": "size L",
             "flag": "--approve-plan",
             "revision": "revised plan",
         }.get(trigger) or "low-verifiability paths: " + ", ".join(paths)
+        if stage == "post-implement":
+            # The synthetic plan is not a plan stage output; keep it for status --plan.
+            run.state["gate_plan"] = {**plan, "gate_reason": reason}
+        run.save()
         decision = await self._ask_human(
             run,
             lambda: self.gate.approve_plan({**plan, "gate_reason": reason}),

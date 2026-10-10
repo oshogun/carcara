@@ -1333,6 +1333,8 @@ def test_small_verifiability_gate_after_implement_then_approve(repo):
     assert state["extent"]["areas"] == [".github"]
     assert gate.plans[0]["steps"][0]["files"] == [".github/workflows/x.yml"]
     assert gate.plans[0]["gate_reason"] == "low-verifiability paths: .github/workflows/x.yml"
+    # Persisted so status --plan can show it (there is no plan stage output).
+    assert state["gate_plan"] == gate.plans[0]
     events = [json.loads(e) for e in (orch.run_state.dir / "events.jsonl").read_text().splitlines()]
     assert any(e["event"] == "gate" and e.get("trigger") == "verifiability" for e in events)
 

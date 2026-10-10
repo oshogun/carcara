@@ -754,6 +754,39 @@ def test_status_verifiability_fields(repo, capsys):
     assert "  - U1 [external] pypi name free\n" in out and "U2" not in out
 
 
+def test_status_plan_shows_post_implement_gate(repo, capsys):
+    run_ = RunStore(repo).create("t", "balanced", "sha", size="S")
+    gate_plan = {
+        "goal": "Review changes to low-verifiability paths before test/review",
+        "steps": [{"id": "changed", "files": [".github/x.yml"], "change": "implementer changes"}],
+        "tests": [],
+        "acceptance": [],
+        "risks": [],
+        "gate_reason": "low-verifiability paths: .github/x.yml",
+    }
+    run_.state.update(
+        status="awaiting_approval",
+        gate={"trigger": "verifiability", "paths": [".github/x.yml"], "stage": "post-implement"},
+        gate_plan=gate_plan,
+    )
+    run_.save()
+    capsys.readouterr()
+    assert status(repo, "--plan") == 0
+    out = capsys.readouterr().out
+    assert out.startswith("Gate: low-verifiability paths: .github/x.yml\n")
+    assert "Plan: Review changes to low-verifiability paths" in out
+    assert "     files: .github/x.yml\n" in out
+    cmd = f"carcara run --resume {run_.id} --cwd {repo}"
+    assert out.endswith(f"Approve: {cmd} --yes\nReject: {cmd} --reject\n")
+
+    # Once rejected (no longer awaiting) it still shows, without the commands.
+    run_.state["status"] = "failed"
+    run_.save()
+    assert status(repo, "--plan") == 0
+    out = capsys.readouterr().out
+    assert out.startswith("Gate: ") and "Approve:" not in out
+
+
 def test_status_review_findings_and_done(repo):
     store = RunStore(repo)
     run_ = store.create("t", "balanced", "sha", size="S")
