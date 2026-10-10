@@ -2019,12 +2019,19 @@ def _ultra_s(**opts):
     return {"size": "S", "review_small": True, "ultra": True, **opts}
 
 
-def _refute(severity="major", disproved=False, goal=False, lowv=False, evidence=()):
+def _refute(
+    severity="major", disproved=False, goal=False, lowv=False, evidence=(), raise_reason=None
+):
+    # By default a major-or-higher rating names a floor reason so it is not capped.
+    if raise_reason is None:
+        serious = severity in ("major", "blocker")
+        raise_reason = "correctness" if serious and not (goal or lowv) else "none"
     return {
         "disproved": disproved,
         "severity": severity,
         "goal_defeating": goal,
         "low_verifiability": lowv,
+        "raise_reason": raise_reason,
         "rationale": "r",
         "evidence": list(evidence),
     }
@@ -2209,16 +2216,62 @@ def test_ultra_refute_escalates_goal_defeating_minor_and_starts_fix_round(repo):
             "basis": "rerated",
         }
     ]
-    assert "Refutation: 1 checked, 1 re-rated, 0 disproved\n" in out.report_text
+    assert "Refutation: 1 checked, 1 re-rated (1 escalated), 0 disproved\n" in out.report_text
     assert "review-refute:0" in out.report_text.split("Parallel stages: ")[1]
 
 
-def test_ultra_refute_major_rating_escalates_without_flags(repo):
+def test_ultra_refute_unjustified_major_on_missing_test_is_capped(repo):
+    # Issue #34: a test gap re-rated major with no floor reason stays minor.
+    from carcara.orchestrator import _extent
+
+    finding = _finding("minor", "missing test for variant X")
+    review = _minor_review(finding)
+    refutes = {"review-refute:0": [_refute("major", raise_reason="none")]}
+    orch, _ = _refute_run(repo, review, refutes)
+    out = go(orch)
+    assert out.status == "done"
+    entry = orch.run_state.stage("review")
+    assert entry["output"]["findings"] == [finding]
+    assert entry["output"]["verdict"] == "approve"
+    assert "original_output" not in entry
+    assert "fix-1:implement" not in keys(orch)
+    assert _extent(orch.run_state)["fix_rounds"] == 0
+    assert _events(orch, "review_rerated") == []
+    (event,) = _events(orch, "review_raise_capped")
+    assert event["capped"] == [{"index": 0, "before": "minor", "refuter_severity": "major"}]
+    assert orch.run_state.state["refutations"] == [
+        {
+            "key": "review-refute:0",
+            "index": 0,
+            "before": "minor",
+            "after": "minor",
+            "disproved": False,
+            "capped": True,
+            "basis": "capped",
+        }
+    ]
+    line = "Refutation: 1 checked, 0 re-rated, 0 disproved, 1 raises capped\n"
+    assert line in out.report_text
+
+
+@pytest.mark.parametrize("reason", ["correctness", "security"])
+def test_ultra_refute_major_rating_with_floor_reason_escalates(repo, reason):
     review = _minor_review(_finding("minor"))
-    orch, _ = _refute_run(repo, review, {"review-refute:0": [_refute("major")]}, fixes=1)
-    assert go(orch).status == "done"
+    refutes = {"review-refute:0": [_refute("major", raise_reason=reason)]}
+    orch, _ = _refute_run(repo, review, refutes, fixes=1)
+    out = go(orch)
+    assert out.status == "done"
     assert orch.run_state.stage("review")["output"]["findings"][0]["severity"] == "major"
     assert "fix-1:implement" in keys(orch)
+    assert _events(orch, "review_raise_capped") == []
+    assert "1 re-rated (1 escalated)" in out.report_text and "capped" not in out.report_text
+
+
+def test_refute_rules_cap_test_gaps():
+    from carcara.orchestrator import _REFUTE_RULES
+
+    assert "raise_reason" in _REFUTE_RULES
+    assert "missing or weak test is a test gap, at most minor" in _REFUTE_RULES
 
 
 def test_ultra_refute_low_verifiability_escalates(repo):
@@ -2606,6 +2659,71 @@ def test_apply_refutations():
     }
     lax = {**review, "findings": [_finding("blocker")]}
     assert _apply_refutations(lax, {})[0]["verdict"] == "request_changes"
+
+
+def test_refuter_severity():
+    from carcara.orchestrator import _refuter_severity
+
+    assert _refuter_severity(_refute("major", raise_reason="none")) == ("minor", True)
+    assert _refuter_severity(_refute("blocker", raise_reason="none")) == ("minor", True)
+    for reason in ("security", "correctness", "goal_defeating", "low_verifiability"):
+        assert _refuter_severity(_refute("major", raise_reason=reason)) == ("major", False)
+    assert _refuter_severity(_refute("blocker", goal=True)) == ("blocker", False)
+    assert _refuter_severity(_refute("major", lowv=True)) == ("major", False)
+    assert _refuter_severity(_refute("minor")) == ("minor", False)
+    assert _refuter_severity(_refute("nit", raise_reason="none")) == ("nit", False)
+    legacy = {k: v for k, v in _refute("major").items() if k != "raise_reason"}
+    assert _refuter_severity(legacy) == ("minor", True)
+
+
+def test_apply_refutations_caps_unjustified_raises():
+    from carcara.orchestrator import _apply_refutations
+
+    review = {
+        "verdict": "approve",
+        "findings": [_finding("minor", "a"), _finding("nit", "b"), _finding("major", "c")],
+        "unverified": [],
+    }
+    bare = _refute("major", raise_reason="none")
+    adjusted, changes = _apply_refutations(review, {0: bare, 1: bare, 2: bare})
+    # Capped at minor: the minor stays, the nit rises to minor, the major is untouched.
+    assert [f["severity"] for f in adjusted["findings"]] == ["minor", "minor", "major"]
+    assert changes == [
+        {
+            "index": 0,
+            "before": "minor",
+            "after": "minor",
+            "disproved": False,
+            "capped": True,
+            "basis": "capped",
+        },
+        {
+            "index": 1,
+            "before": "nit",
+            "after": "minor",
+            "disproved": False,
+            "capped": True,
+            "basis": "rerated",
+        },
+    ]
+    # A justified second rating still raises; the cap then suppressed nothing.
+    up, changes = _apply_refutations(
+        review, {0: bare}, {0: _refute("major", raise_reason="security")}
+    )
+    assert up["findings"][0]["severity"] == "major" and up["verdict"] == "request_changes"
+    assert changes == [
+        {"index": 0, "before": "minor", "after": "major", "disproved": False, "basis": "rerated"}
+    ]
+
+
+def test_contested_ignores_unjustified_major():
+    from carcara.orchestrator import _contested, _needs_second_opinion
+
+    review = {"verdict": "approve", "findings": [_finding("minor")], "unverified": []}
+    bare = _refute("major", disproved=True, raise_reason="none")
+    assert not _contested(review["findings"][0], bare)
+    assert _needs_second_opinion(review, {0: bare}, {}) == []
+    assert _contested(review["findings"][0], _refute("major", disproved=True))
 
 
 def test_apply_refutations_serious_disproves():

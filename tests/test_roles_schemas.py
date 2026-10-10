@@ -120,6 +120,7 @@ def test_review_refute_schema():
         "severity": "major",
         "goal_defeating": True,
         "low_verifiability": False,
+        "raise_reason": "goal_defeating",
         "rationale": "bypass",
         "evidence": [],
     }
@@ -135,6 +136,11 @@ def test_review_refute_schema():
     assert validate("review-refute", {**ok, "disproved": "no"})
     assert validate("review-refute", {k: v for k, v in ok.items() if k != "goal_defeating"})
     assert validate("review-refute", {**ok, "extra": 1})
+    reasons = ("none", "goal_defeating", "low_verifiability", "security", "correctness")
+    for reason in reasons:
+        assert validate("review-refute", {**ok, "raise_reason": reason}) == []
+    assert validate("review-refute", {**ok, "raise_reason": "tests"})
+    assert validate("review-refute", {k: v for k, v in ok.items() if k != "raise_reason"})
 
 
 def test_plan_step_depends_on_is_optional():

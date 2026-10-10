@@ -352,7 +352,13 @@ in the state.
   the finding against the diff and re-rates its severity. Severities are only
   raised. A finding the refuter flags as goal-defeating or hard to verify
   (security policy, shell parsing, resume and the like) becomes at least
-  major. A serious finding (major or higher, as merged or as re-rated or
+  major. A refuter's rating of major or higher counts only with a floor
+  reason in `raise_reason` (goal-defeating, low-verifiability, a security
+  defect or a correctness defect); without one the raise is capped at minor.
+  A missing or weak test is at most minor unless the untested path is
+  goal-defeating or hard to verify, so test gaps alone do not start fix
+  rounds. Refuters still never lower a severity (open question U3 from #22).
+  A serious finding (major or higher, as merged or as re-rated or
   flagged) is dropped only in two cases. Either the refuter quotes an added
   diff line near the finding as evidence, which is never enough for blockers
   or flagged findings. Or a second, independent `review-refute-2:N` agrees.
@@ -371,7 +377,10 @@ The flag is stored with the run, so `--resume` keeps the ultra stages even
 without `--ultra`. Finished parallel stages are replayed on resume and only
 the missing ones rerun. The report adds a `Parallel stages: <keys> ($x.xx)`
 line and, when refuters changed anything, a
-`Refutation: N checked, N re-rated, N disproved` line. `--dry-run --ultra`
+`Refutation: N checked, N re-rated, N disproved` line. It adds
+`(N escalated)` after the re-rated count when refuters raised severities, and
+`N raises capped` when unjustified raises were capped (also logged as a
+`review_raise_capped` event). `--dry-run --ultra`
 shows the extra rows.
 
 ### Tool policy

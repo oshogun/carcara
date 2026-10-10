@@ -93,6 +93,12 @@ _REFUTE: dict[str, Any] = _obj(
         "severity": {"type": "string", "enum": ["blocker", "major", "minor", "nit"]},
         "goal_defeating": _BOOL,
         "low_verifiability": _BOOL,
+        # Why the re-rated severity is major or higher; "none" when it is not or no
+        # floor reason applies (such a raise is capped at minor).
+        "raise_reason": {
+            "type": "string",
+            "enum": ["none", "goal_defeating", "low_verifiability", "security", "correctness"],
+        },
         "rationale": _STR,
         # Diff lines showing the finding is wrong; empty means no citation.
         "evidence": _arr(

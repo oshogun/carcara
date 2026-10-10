@@ -157,15 +157,42 @@ _REFUTE_RULES = (
     "added ('+') line in the diff showing the finding is wrong, plus a verbatim quote "
     "of that whole line; with no such line, set disproved=false. Otherwise leave evidence "
     "empty. (2) Re-rate "
-    "the severity from scratch; do not anchor on the reviewer's rating. (3) Set "
+    "the severity from scratch; do not anchor on the reviewer's rating. A rating of "
+    "major or blocker must name its floor reason in `raise_reason`: goal_defeating, "
+    "low_verifiability, security (a security defect) or correctness (wrong behaviour in "
+    "the shipped code); otherwise set raise_reason=none. A major or higher rating with "
+    "raise_reason=none is ignored and capped at minor. (3) Set "
     "goal_defeating=true if the finding lets the change's own goal be bypassed or "
     "defeated (e.g. another interpreter flag ordering that skips the new check); "
     "such a finding is at least major. (4) Set low_verifiability=true if it touches "
     "a path tests/CI cannot easily exercise (security policy, permission checks, "
-    "shell parsing, resume/persistence); such a finding is at least major."
+    "shell parsing, resume/persistence); such a finding is at least major. (5) A "
+    "missing or weak test is a test gap, at most minor, unless the untested path is "
+    "goal-defeating or low-verifiability, in which case set that flag."
 )
 
 _SEVERITY_RANK = {"blocker": 3, "major": 2, "minor": 1, "nit": 0}
+_RAISE_REASONS = frozenset({"goal_defeating", "low_verifiability", "security", "correctness"})
+
+
+def _refuter_severity(res: dict[str, Any]) -> tuple[str, bool]:
+    """The refuter's effective severity, and whether an unjustified raise was capped.
+
+    A rating of major or higher counts only with a floor reason: a goal-defeating or
+    low-verifiability flag, or a security/correctness raise_reason; otherwise it is
+    capped at minor (outputs without raise_reason are capped too).
+    """
+    severity = res["severity"]
+    if _SEVERITY_RANK[severity] < _SEVERITY_RANK["major"]:
+        return severity, False
+    if (
+        res.get("goal_defeating")
+        or res.get("low_verifiability")
+        or res.get("raise_reason", "none") in _RAISE_REASONS
+    ):
+        return severity, False
+    return "minor", True
+
 
 # Appended to a stage's prompt when retrying after it returned no structured output.
 _STRUCTURED_OUTPUT_NUDGE = (
@@ -490,14 +517,15 @@ def _contested(finding: dict[str, Any], res: dict[str, Any]) -> bool:
     """True when dropping the finding on `res`'s disproof needs evidence or a second refuter.
 
     That is when the finding is serious as merged, or the refuter's own ratings say
-    it is (goal-defeating, low-verifiability, or re-rated major or higher): such a
-    disproof contradicts itself, so it cannot drop the finding on its own say-so.
+    it is (goal-defeating, low-verifiability, or re-rated major or higher with a floor
+    reason): such a disproof contradicts itself, so it cannot drop the finding on its
+    own say-so.
     """
     return (
         _serious(finding)
         or res["goal_defeating"]
         or res["low_verifiability"]
-        or _SEVERITY_RANK[res["severity"]] >= _SEVERITY_RANK["major"]
+        or _SEVERITY_RANK[_refuter_severity(res)[0]] >= _SEVERITY_RANK["major"]
     )
 
 
@@ -511,7 +539,7 @@ def _proven(
     the refuter flags goal-defeating or low-verifiability always needs a second refuter.
     """
     if (
-        "blocker" in (finding["severity"], res["severity"])
+        "blocker" in (finding["severity"], _refuter_severity(res)[0])
         or res["goal_defeating"]
         or res["low_verifiability"]
     ):
@@ -543,7 +571,10 @@ def _apply_refutations(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Apply refuter outputs to the merged review and recompute its verdict.
 
-    Severities are raised, never lowered; flagged findings are at least major.
+    Severities are raised, never lowered; flagged findings are at least major. A
+    refuter raise to major or higher needs a floor reason, else it is capped at minor
+    (see _refuter_severity); a cap that suppressed a raise is recorded as capped=True,
+    as a basis "capped" change (before == after) when nothing else changed.
     A disproved finding is dropped outright only when not _contested; otherwise only
     with valid evidence (never enough for blockers or flagged findings, see _proven) or a
     second refuter's agreement, else it is kept. The verdict is
@@ -578,16 +609,25 @@ def _apply_refutations(
                 continue
         ratings = [res] + ([other] if other is not None else [])
         flagged = any(r["goal_defeating"] or r["low_verifiability"] for r in ratings)
+        effective = [_refuter_severity(r) for r in ratings]
         after = max(
             before,
             "major" if flagged else "nit",
-            *(r["severity"] for r in ratings),
+            *(severity for severity, _ in effective),
             key=_SEVERITY_RANK.__getitem__,
         )
+        capped = any(
+            was_capped and _SEVERITY_RANK[r["severity"]] > _SEVERITY_RANK[after]
+            for r, (_, was_capped) in zip(ratings, effective, strict=True)
+        )
+        change = {"index": index, "before": before, "after": after, "disproved": False}
+        if capped:
+            change["capped"] = True
         if after != before or basis == "kept_unverified":
-            change = {"index": index, "before": before, "after": after, "disproved": False}
             changes.append({**change, "basis": basis})
             finding = {**finding, "severity": after}
+        elif capped:
+            changes.append({**change, "basis": "capped"})
         findings.append(finding)
     verdict = "request_changes" if any(_serious(f) for f in findings) else "approve"
     return {**review, "verdict": verdict, "findings": findings}, changes
@@ -2010,8 +2050,27 @@ class Orchestrator:
                 run.amend_stage_output(key, adjusted)
             else:
                 run.save()
-            if changes:
-                run.event("review_rerated", key=key, checked=len(candidates), changes=changes)
+            # Capped-only records change nothing; adjusted == review keeps them unamended.
+            real = [c for c in changes if c["basis"] != "capped"]
+            if real:
+                run.event("review_rerated", key=key, checked=len(candidates), changes=real)
+            if capped := [c for c in changes if c.get("capped")]:
+                raw = {
+                    i: max(
+                        (r["severity"] for r in (results[i], second.get(i)) if r is not None),
+                        key=_SEVERITY_RANK.__getitem__,
+                    )
+                    for i in {c["index"] for c in capped}
+                }
+                capped = [
+                    {
+                        "index": c["index"],
+                        "before": c["before"],
+                        "refuter_severity": raw[c["index"]],
+                    }
+                    for c in capped
+                ]
+                run.event("review_raise_capped", key=key, capped=capped)
             review = adjusted
         self._record_unverified(run, key, review)
         return review
@@ -2179,8 +2238,15 @@ class Orchestrator:
             checked = sum(1 for e in stages if e["stage"] == "review-refute")
             bases = [c.get("basis", "minor" if c["disproved"] else "rerated") for c in changes]
             disproved = sum(1 for c in changes if c["disproved"])
-            line = f"Refutation: {checked} checked, {bases.count('rerated')} re-rated, "
-            line += f"{disproved} disproved"
+            escalated = sum(
+                1
+                for c, basis in zip(changes, bases, strict=True)
+                if basis == "rerated" and _SEVERITY_RANK[c["after"]] > _SEVERITY_RANK[c["before"]]
+            )
+            line = f"Refutation: {checked} checked, {bases.count('rerated')} re-rated"
+            if escalated:
+                line += f" ({escalated} escalated)"
+            line += f", {disproved} disproved"
             by = [
                 f"{n} {label}"
                 for n, label in (
@@ -2193,6 +2259,8 @@ class Orchestrator:
                 line += f" ({', '.join(by)})"
             if kept := bases.count("kept_unverified"):
                 line += f", {kept} kept unverified"
+            if capped := sum(1 for c in changes if c.get("capped")):
+                line += f", {capped} raises capped"
             lines.append(line)
         lines += [
             f"est. cost: {costs}",
