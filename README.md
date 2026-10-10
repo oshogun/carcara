@@ -386,7 +386,11 @@ enforced by a PreToolUse hook, which applies in every permission mode;
 `bypassPermissions` is never used.
 
 implementer and test-runner may run any Bash command except those caught by a
-deny-list: `git push`, `git reset --hard`, `git clean -f`, curl/wget piped or
+deny-list: git subcommands that create commits or move refs (`push`,
+`commit`, `reset`, `merge`, `rebase`, `cherry-pick`, `revert`, `am`,
+`commit-tree`, `update-ref`, `pull`, `symbolic-ref`, `stash`/`notes` except
+`list`/`show`, `tag` except listing, `branch -f/-d/-m/-c`, `checkout -B`,
+`switch -C`), `git -c alias.*` and `--config-env`, `git clean -f`, curl/wget piped or
 substituted into a shell or interpreter, shell access to `.env`/`secrets/`
 paths, shell writes (redirections, `tee`, `rm`/`mv`/`cp`/`mkdir`/...,
 `sed -i`/`perl -i`/`ruby -i`) outside the repo or into `.git`, `.claude` or

@@ -24,12 +24,16 @@ Accepted limitations:
 - git pathspec globs (``git log -- ':(glob)**'``) are not secret-checked;
   git only reads tracked content, which should not include secrets.
 - test-runner and implementer Bash is guarded only by a best-effort deny-list
-  (``_check_unrestricted_bash``: git push, git reset --hard, git clean -f,
+  (``_check_unrestricted_bash``: git push/commit/reset/tag/merge/rebase/
+  cherry-pick/revert/am/commit-tree/update-ref/pull/symbolic-ref/stash/notes,
+  ref-moving branch/checkout -B/switch -C, ``git -c alias.*`` and
+  ``--config-env``, git clean -f,
   fetch-and-exec, shell access to secret paths, shell writes -- including
   ``sed -i``/``perl -i``/``ruby -i`` -- outside ``cwd`` or into
   ``.git``/``.carcara``/``.claude``, and ``-c``/``-e``/``eval`` code strings
   naming those directories). Variables, paths built at runtime, base64,
-  ``cd``, aliases, heredoc/stdin programs, scripts written into the repo and
+  ``cd``, aliases (including git aliases from ``~/.gitconfig``, e.g.
+  ``git ci``), heredoc/stdin programs, scripts written into the repo and
   then run, ``awk -i inplace``, ex/vi/ed and ``dd of=`` all bypass it; reads
   outside ``cwd`` are allowed. Wrapper options that take a value (``sudo -u``,
   ``nice -n``, ``env -u``/``-C``/``-S``, ...) are skipped via
@@ -718,6 +722,28 @@ _ASSIGNMENT = re.compile(r"^[A-Za-z_]\w*=")
 _GIT_VALUE_OPTS = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
 )
+# git subcommands that create commits or move refs; denied for implementer/test-runner.
+_GIT_DENIED_SUBCOMMANDS = frozenset(
+    {
+        "push",
+        "commit",
+        "reset",
+        "merge",
+        "cherry-pick",
+        "revert",
+        "am",
+        "rebase",
+        "commit-tree",
+        "update-ref",
+        "pull",
+        "symbolic-ref",
+    }
+)
+# git branch flags that delete, rename, copy or force-move a branch ref.
+_GIT_BRANCH_REF_FLAGS = frozenset({"--force", "--delete", "--move", "--copy"})
+_GIT_BRANCH_REF_SHORT = frozenset("fdDmMcC")
+# Recursion bound for shell/eval code strings in _check_unrestricted_bash.
+_MAX_SHELL_NESTING = 8
 _DEV_SINKS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"})
 _FETCH_SUBST = re.compile(r"(?:[<$]\(|`)\s*(?:curl|wget)\b")
 _DEST_COMMANDS = frozenset({"cp", "mv", "ln", "install"})
@@ -799,6 +825,37 @@ def _git_subcommand(args: list[str]) -> tuple[str, list[str]]:
         else:
             return tok, args[i + 1 :]
     return "", []
+
+
+def _git_alias_override(args: list[str]) -> bool:
+    """True if git global options define an alias (``-c alias.*``) or use ``--config-env``."""
+    for i, tok in enumerate(args):
+        if tok == "--config-env" or tok.startswith("--config-env="):
+            return True
+        if tok == "-c" and i + 1 < len(args) and args[i + 1].lower().startswith("alias."):
+            return True
+        if not tok.startswith("-") and (i == 0 or args[i - 1] not in _GIT_VALUE_OPTS):
+            return False
+    return False
+
+
+def _git_short_flag(args: list[str], flag: str, value_flags: str) -> bool:
+    """True if ``flag`` appears in a short-option cluster (``-fB``, ``-Bmain``).
+
+    Scanning a cluster stops at a value-taking option in ``value_flags``, so
+    ``-bBugfix`` (``-b`` with value ``Bugfix``) does not match ``B``.
+    """
+    for tok in args:
+        if tok == "--":
+            return False
+        if not tok.startswith("-") or tok.startswith("--"):
+            continue
+        for ch in tok[1:]:
+            if ch == flag:
+                return True
+            if ch in value_flags:
+                break
+    return False
 
 
 def _write_operands(cmd: str, args: list[str]) -> list[str]:
@@ -1110,17 +1167,24 @@ def _interpreter_code(cmd: str, args: list[str]) -> list[str]:
     return []
 
 
-def _check_unrestricted_bash(command: str, cwd: str | None) -> Decision | None:
+def _check_unrestricted_bash(command: str, cwd: str | None, depth: int = 0) -> Decision | None:
     """Best-effort deny-list for implementer/test-runner Bash; None if acceptable.
 
-    Denies git push, git reset --hard, git clean -f, curl/wget piped or
-    substituted into a shell/interpreter, shell access to secret paths, and
+    Denies git subcommands that create commits or move refs
+    (``_GIT_DENIED_SUBCOMMANDS``, git stash/notes except list/show, git tag
+    except listing, git branch -f/-d/-m/-c, ``checkout -B``, ``switch -C``),
+    ``git -c alias.*``/``--config-env``, git clean -f,
+    curl/wget piped or substituted into a shell/interpreter, shell access to
+    secret paths, and
     writes (redirections, tee, rm/mv/cp/..., ``sed -i``/``perl -i``/``ruby -i``)
     outside ``cwd`` or into ``.git``/``.carcara``/``.claude``. Interpreter
     code strings (``sh -c``, ``python -c``, ``node -e``, ``perl -e``,
     ``eval``, ...) naming one of those directories are denied outright, even
-    read-only ones such as ``bash -c 'ls .git'``. Reads outside ``cwd`` stay
-    allowed. Trivially bypassable (variables, scripts, cd): defence in depth only.
+    read-only ones such as ``bash -c 'ls .git'``; shell and ``eval`` code
+    strings are also run through this check recursively (unparseable ones are
+    skipped; nesting deeper than ``_MAX_SHELL_NESTING`` is denied). Reads
+    outside ``cwd`` stay allowed. Trivially bypassable (variables, scripts,
+    cd): defence in depth only.
     """
     segments = _shell_segments(command)
     if segments is None:
@@ -1140,11 +1204,37 @@ def _check_unrestricted_bash(command: str, cwd: str | None) -> Decision | None:
             continue
         cmd = posixpath.basename(argv[0])
         if cmd == "git":
+            if _git_alias_override(argv[1:]):
+                return _deny("git -c alias.*/--config-env is denied")
             sub, rest = _git_subcommand(argv[1:])
-            if sub == "push":
-                return _deny("git push is denied")
-            if sub == "reset" and "--hard" in rest:
-                return _deny("git reset --hard is denied")
+            if sub in _GIT_DENIED_SUBCOMMANDS:
+                return _deny(f"git {sub} is denied; committing is left to the user")
+            if sub == "stash" and not (rest and rest[0] in ("list", "show")):
+                return _deny("git stash is denied; committing is left to the user")
+            if sub == "tag" and rest and not {"-l", "--list"} & set(rest):
+                return _deny("git tag is denied; committing is left to the user")
+            if sub == "notes":
+                action = next((t for t in rest if not t.startswith("-")), "list")
+                if action not in ("list", "show"):
+                    return _deny("git notes is denied; committing is left to the user")
+            if sub == "branch" and any(
+                t.split("=", 1)[0] in _GIT_BRANCH_REF_FLAGS
+                or (
+                    t.startswith("-")
+                    and not t.startswith("--")
+                    and _GIT_BRANCH_REF_SHORT & set(t[1:])
+                )
+                for t in rest
+            ):
+                return _deny("git branch -f/-d/-m/-c is denied; committing is left to the user")
+            if (sub == "checkout" and _git_short_flag(rest, "B", "b")) or (
+                sub == "switch"
+                and (
+                    _git_short_flag(rest, "C", "c")
+                    or any(t.split("=", 1)[0] == "--force-create" for t in rest)
+                )
+            ):
+                return _deny(f"git {sub} resetting a branch is denied")
             if sub == "clean" and any(
                 t == "--force" or (t.startswith("-") and not t.startswith("--") and "f" in t)
                 for t in rest
@@ -1166,6 +1256,13 @@ def _check_unrestricted_bash(command: str, cwd: str | None) -> Decision | None:
         for code in _interpreter_code(cmd, argv[1:]):
             if _PROTECTED_CODE_RE.search(code):
                 return _deny(f"interpreter code naming .git/.carcara/.claude is denied: {cmd}")
+            # Unparseable nested code is skipped, not denied: the outer string parsed.
+            if (cmd in _SHELLS or cmd == "eval") and _shell_segments(code) is not None:
+                if depth >= _MAX_SHELL_NESTING:
+                    return _deny("nested shell code too deep")
+                nested = _check_unrestricted_bash(code, cwd, depth + 1)
+                if nested is not None:
+                    return nested
         for target in targets:
             problem = _write_path_problem(target, cwd)
             if problem:
