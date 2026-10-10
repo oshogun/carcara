@@ -1620,6 +1620,10 @@ class Orchestrator:
                 await self._gate(
                     run, plan, trigger, plan_paths if trigger == "verifiability" else ()
                 )
+                # The human saw the plan's gated paths whatever the trigger.
+                approved = {*run.state.get("gate_approved_paths", ()), *plan_paths}
+                run.state["gate_approved_paths"] = sorted(approved)
+                run.save()
             steps = plan["steps"] if size == "L" else []
             if steps:
                 step_ids = _dedupe_ids([str(step["id"]) for step in steps])
@@ -1771,8 +1775,9 @@ class Orchestrator:
         *,
         stage: str = "plan",
     ) -> None:
-        if run.state.get("plan_approved"):
+        if stage == "plan" and run.state.get("plan_approved"):
             return
+        approved = sorted({*run.state.get("gate_approved_paths", ()), *paths})
         paths = list(paths)[:20]
         run.state["gate"] = {"trigger": trigger, "paths": paths, "stage": stage}
         reason = {
@@ -1792,6 +1797,7 @@ class Orchestrator:
         run.event("gate", decision=decision, trigger=trigger)
         if decision == "approve":
             run.state["plan_approved"] = True
+            run.state["gate_approved_paths"] = approved
             run.save()
             return
         if decision == "defer":
@@ -1810,11 +1816,16 @@ class Orchestrator:
 
     async def _post_implement_gate(self, run: Run) -> None:
         """Gate before TEST when ungated implement changes touch low-verifiability paths."""
-        if run.state.get("plan_approved"):
-            return
         # Git is authoritative: an omitted or oddly spelled path still gates.
         changed = match_paths(self._changed_paths(run), self.config.verifiability_paths, self.cwd)
-        if not changed:
+        if run.state.get("plan_approved") and "gate_approved_paths" not in run.state:
+            # Runs saved before gate_approved_paths existed: the human approved
+            # what was gated then; seed once so a resume does not ask again.
+            gate_paths = (run.state.get("gate") or {}).get("paths") or []
+            run.state["gate_approved_paths"] = sorted({*gate_paths, *changed})
+            run.save()
+        # Paths a human already approved do not re-gate; any new one does.
+        if not set(changed) - set(run.state.get("gate_approved_paths", ())):
             return
         plan = {
             "goal": "Review changes to low-verifiability paths before test/review",
@@ -2097,6 +2108,12 @@ class Orchestrator:
                 f"{self._inventory_prompt(run)}\n\n{self._diff_context()}"
             )
 
+        async def recheck_gate() -> None:
+            # A later implement may first touch a low-verifiability path.
+            nonlocal review_on
+            await self._post_implement_gate(run)
+            review_on = self._force_review_on_gate(run, review_on)
+
         async def check(stage_prefix: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
             test = await self._stage(
                 f"{stage_prefix}test", "test", "test-runner", "test", test_prompt
@@ -2133,6 +2150,7 @@ class Orchestrator:
                     guided_prompt,
                 )
             )
+            await recheck_gate()
 
         test, review = await check(prefix)
         failing = _failing_items(test, review)
@@ -2153,6 +2171,7 @@ class Orchestrator:
                     f"{fix_prefix}implement", "implement", "implementer", "implement", fix_prompt
                 )
             )
+            await recheck_gate()
             test, review = await check(fix_prefix)
             failing = _failing_items(test, review)
 

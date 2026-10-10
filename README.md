@@ -229,7 +229,8 @@ Stages per size (triage picks the size unless `--size S|M|L` is given):
 The default patterns are `.github/**`, `**/migrations/**`, `**/auth/**`,
 `**/policy*` and `**/policy/**`. To change them, see [Project config](#project-config-carcaraconfigjson).
 S runs have no plan, so the verifiability gate runs after implement and before
-test/review. It checks the files git shows as changed since the run base, plus
+test/review. It runs again after each fix-round implement, so a path first
+touched by a fix still gates and forces review. It checks the files git shows as changed since the run base, plus
 any the implementer reported, so an omitted file still gates. The changes are
 then already in the working tree (uncommitted;
 inspect them with `carcara diff <id>`). Approving continues with test and

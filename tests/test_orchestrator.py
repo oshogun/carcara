@@ -1535,6 +1535,119 @@ def test_small_gate_tests_fail_no_review(repo):
     assert review_line.endswith("(forced: verifiability gate)")
 
 
+def test_small_fix_round_gated_path_gates_then_reviews(repo):
+    orch, backend, gate = make(
+        repo,
+        {
+            "implement": [impl("a.py"), impl("src/carcara/policy.py")],
+            "test": [TEST_FAIL],
+        },
+        gate=AutoGate(decision="defer"),
+        size="S",
+    )
+    out = go(orch)
+    assert (out.status, out.exit_code) == ("awaiting_approval", 3)
+    assert [s for s, _ in seq(backend)] == ["implement", "test", "implement"]
+    state = orch.run_state.state
+    assert state["gate"] == {
+        "trigger": "verifiability",
+        "paths": ["src/carcara/policy.py"],
+        "stage": "post-implement",
+    }
+    assert gate.plans[0]["steps"][0]["files"] == ["src/carcara/policy.py"]
+
+    # Approving replays the implement stages and runs the fix round's test and
+    # the review the gate forces.
+    orch2, backend2, gate2 = make(repo, {"test": [TEST_OK], "review": [REVIEW_OK]})
+    out2 = asyncio.run(orch2.resume(out.run_id))
+    assert out2.status == "done"
+    assert seq(backend2) == [("test", "test-runner"), ("review", "reviewer")]
+    assert len(gate2.plans) == 1
+    assert orch2.run_state.state["review_reason"] == "verifiability gate"
+    assert keys(orch2) == ["implement", "test", "fix-1:implement", "fix-1:test", "fix-1:review"]
+
+
+def test_small_fix_round_gated_path_reject(repo):
+    orch, backend, _ = make(
+        repo,
+        {
+            "implement": [impl("a.py"), impl("src/carcara/policy.py")],
+            "test": [TEST_FAIL],
+        },
+        gate=AutoGate(decision="reject"),
+        size="S",
+    )
+    out = go(orch)
+    assert out.status == "failed"
+    assert orch.run_state.state["gate"]["stage"] == "post-implement"
+    assert [s for s, _ in seq(backend)] == ["implement", "test", "implement"]
+    assert keys(orch) == ["implement", "test", "fix-1:implement"]
+
+
+def test_small_fix_round_ordinary_path_no_gate(repo):
+    orch, backend, gate = make(
+        repo,
+        {"implement": [impl("a.py"), impl("b.py")], "test": [TEST_FAIL, TEST_OK]},
+        size="S",
+    )
+    assert go(orch).status == "done"
+    assert gate.plans == []
+    assert "gate" not in orch.run_state.state
+    assert orch.run_state.state["review_reason"] is None
+    assert keys(orch) == ["implement", "test", "fix-1:implement", "fix-1:test"]
+
+
+def test_small_fix_round_new_gated_path_after_approval_reasks(repo):
+    orch, backend, gate = make(
+        repo,
+        {
+            "implement": [impl("src/carcara/policy.py"), impl(".github/workflows/x.yml")],
+            "test": [TEST_FAIL, TEST_OK],
+            "review": [REVIEW_OK, REVIEW_OK],
+        },
+        size="S",
+    )
+    assert go(orch).status == "done"
+    assert len(gate.plans) == 2
+    assert sorted(gate.plans[1]["steps"][0]["files"]) == [
+        ".github/workflows/x.yml",
+        "src/carcara/policy.py",
+    ]
+    state = orch.run_state.state
+    assert state["gate_approved_paths"] == [".github/workflows/x.yml", "src/carcara/policy.py"]
+    assert state["review_reason"] == "verifiability gate"
+
+
+def test_small_fix_round_same_gated_path_not_reasked(repo):
+    orch, backend, gate = make(
+        repo,
+        {
+            "implement": [impl("src/carcara/policy.py"), impl("src/carcara/policy.py")],
+            "test": [TEST_FAIL, TEST_OK],
+            "review": [REVIEW_OK, REVIEW_OK],
+        },
+        size="S",
+    )
+    assert go(orch).status == "done"
+    assert len(gate.plans) == 1
+    assert orch.run_state.state["review_reason"] == "verifiability gate"
+
+
+def test_medium_flag_gate_fix_round_unplanned_policy_path_gates(repo):
+    script = {
+        "explore": [EXPLORE],
+        "plan": [PLAN],
+        "implement": [impl("a.py"), impl("src/carcara/policy.py")],
+        "test": [TEST_FAIL, TEST_OK],
+        "review": [REVIEW_OK, REVIEW_OK],
+    }
+    orch, backend, gate = make(repo, script, size="M", approve_plan=True)
+    assert go(orch).status == "done"
+    assert len(gate.plans) == 2
+    assert orch.run_state.state["gate"]["trigger"] == "verifiability"
+    assert "fix-1:review" in keys(orch)
+
+
 def test_medium_plan_gate_review_reason_unset(repo):
     plan = {**PLAN, "steps": [{"id": "s1", "files": ["db/migrations/1.sql"], "change": "x"}]}
     script = {
@@ -1544,11 +1657,59 @@ def test_medium_plan_gate_review_reason_unset(repo):
         "test": [TEST_OK],
         "review": [REVIEW_OK],
     }
-    orch, backend, _ = make(repo, script, size="M")
+    orch, backend, gate = make(repo, script, size="M")
     assert go(orch).status == "done"
-    assert orch.run_state.state["gate"]["trigger"] == "verifiability"
+    state = orch.run_state.state
+    assert state["gate"]["trigger"] == "verifiability"
     assert ("review", "reviewer") in seq(backend)
-    assert orch.run_state.state["review_reason"] is None
+    assert state["review_reason"] is None
+    # The planned gated path was approved at the plan gate; implement does not re-ask.
+    assert len(gate.plans) == 1
+    assert state["gate"]["stage"] == "plan"
+    assert state["gate_approved_paths"] == ["db/migrations/1.sql"]
+
+
+def test_large_plan_gated_path_gates_once(repo):
+    plan = {**PLAN, "steps": [{"id": "s1", "files": ["db/migrations/1.sql"], "change": "x"}]}
+    script = {
+        "explore": [EXPLORE],
+        "plan": [plan],
+        "implement": [impl("db/migrations/1.sql")],
+        "test": [TEST_OK],
+        "review": [REVIEW_OK],
+    }
+    orch, _, gate = make(repo, script, size="L")
+    assert go(orch).status == "done"
+    state = orch.run_state.state
+    assert len(gate.plans) == 1
+    assert gate.plans[0]["gate_reason"] == "size L"
+    assert state["gate"]["stage"] == "plan"
+    assert state["gate_approved_paths"] == ["db/migrations/1.sql"]
+
+
+def test_resume_legacy_approved_state_does_not_regate(repo):
+    orch, _, _ = make(
+        repo,
+        {"implement": [impl("src/carcara/policy.py")], "test": [TEST_FAIL]},
+        gate=AutoGate(decision="defer"),
+        size="S",
+    )
+    out = go(orch)
+    assert out.status == "awaiting_approval"
+    # Reshape into a pre-gate_approved_paths run the human already approved.
+    run = orch.run_state
+    run.state["plan_approved"] = True
+    run.state.pop("gate_approved_paths", None)
+    run.save()
+    orch2, backend2, gate2 = make(
+        repo,
+        {"test": [TEST_OK], "review": [REVIEW_OK]},
+        gate=AutoGate(decision="defer"),
+    )
+    assert asyncio.run(orch2.resume(out.run_id)).status == "done"
+    assert gate2.plans == []
+    assert ("review", "reviewer") in seq(backend2)
+    assert orch2.run_state.state["gate_approved_paths"] == ["src/carcara/policy.py"]
 
 
 def test_small_review_flag_no_reason(repo):
