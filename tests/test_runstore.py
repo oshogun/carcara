@@ -189,7 +189,7 @@ def test_acquire_and_release_lock(tmp_path):
     holder = store.active()
     assert holder["run_id"] == "run-1" and holder["pid"] == os.getpid()
     # No temp/aside files left behind.
-    assert sorted(p.name for p in store.base.iterdir()) == [".gitignore", "active.json", "runs"]
+    assert sorted(p.name for p in store.base.iterdir()) == [".gitignore", "active.json"]
 
     store.release_lock("run-1")
     assert not store.lock_path.exists()

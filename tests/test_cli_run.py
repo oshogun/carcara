@@ -534,7 +534,7 @@ def test_lock_released_on_exit(repo, fake, monkeypatch, script, args, code):
 
     monkeypatch.setattr(RunStore, "create", spy)
     assert run(repo, "x", *args) == code
-    assert seen == [False]
+    assert seen == [True]  # locked before the run dir is created
     assert not _lock(repo).exists()
 
 

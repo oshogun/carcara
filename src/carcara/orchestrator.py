@@ -824,12 +824,16 @@ class Orchestrator:
         holder = self.store.active()
         if holder is not None:
             raise RunBusy(holder["run_id"])
-        run = self.store.create(task, self.profile.name, base_sha, size=self.options.size)
+        # Lock before creating the run dir: a starter that loses the race (to
+        # another run or ``uninstall --purge``) writes nothing under runs/.
+        run_id = self.store.new_run_id()
+        self.store.acquire_lock(run_id)
         try:
-            self.store.acquire_lock(run.id)
-        except RunBusy as exc:
-            # Lost a race with another starter after the pre-check.
-            run.set_status("failed", str(exc))
+            run = self.store.create(
+                task, self.profile.name, base_sha, size=self.options.size, run_id=run_id
+            )
+        except BaseException:
+            self.store.release_lock(run_id)
             raise
         try:
             self._started(run, resumed=False)

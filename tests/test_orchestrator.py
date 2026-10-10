@@ -904,6 +904,21 @@ def test_lock_acquire_release_and_ownership(repo):
     assert list(store.base.glob(".active.json.*")) == []
 
 
+def test_run_losing_lock_race_writes_nothing_under_runs(repo, monkeypatch):
+    from carcara.runstore import RunBusy
+
+    orch, backend, _ = make(repo, {})
+    orch.store.acquire_lock("other")
+    # The holder appears after the pre-check (e.g. uninstall --purge).
+    monkeypatch.setattr(orch.store, "active", lambda: None)
+    with pytest.raises(RunBusy) as info:
+        go(orch)
+    assert info.value.run_id == "other"
+    assert not orch.store.root.exists()
+    assert json.loads(orch.store.lock_path.read_text())["run_id"] == "other"
+    assert backend.requests == []
+
+
 def test_resume_releases_lock(repo):
     orch, _, _ = make(
         repo, {"explore": [EXPLORE], "plan": [PLAN]}, gate=AutoGate(decision="defer"), size="L"

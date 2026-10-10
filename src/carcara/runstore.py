@@ -250,23 +250,39 @@ class RunStore:
         self.base = self.cwd / ".carcara"
         self.root = self.base / "runs"
 
-    def _ensure_root(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
+    def _ensure_base(self) -> None:
+        self.base.mkdir(parents=True, exist_ok=True)
         ignore = self.base / ".gitignore"
         if not ignore.exists():
             ignore.write_text("*\n", encoding="utf-8")
 
-    def create(self, task: str, profile: str, base_sha: str, size: str | None = None) -> Run:
+    def _ensure_root(self) -> None:
+        self._ensure_base()
+        self.root.mkdir(exist_ok=True)
+
+    @staticmethod
+    def new_run_id() -> str:
+        return time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
+
+    def create(
+        self,
+        task: str,
+        profile: str,
+        base_sha: str,
+        size: str | None = None,
+        run_id: str | None = None,
+    ) -> Run:
+        """Create a run dir; a given ``run_id`` that already exists raises RunStoreError."""
         self._ensure_root()
-        for _ in range(100):
-            run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
-            run_dir = self.root / run_id
+        for _ in range(1 if run_id is not None else 100):
+            run_dir = self.root / (run_id or self.new_run_id())
             try:
                 run_dir.mkdir()
             except FileExistsError:
                 continue
+            run_id = run_dir.name
             break
-        else:  # pragma: no cover - astronomically unlikely
+        else:  # a given run_id exists, or (astronomically unlikely) 100 collisions
             raise RunStoreError("could not allocate a run directory")
         state: dict[str, Any] = {
             "run_id": run_id,
@@ -359,9 +375,9 @@ class RunStore:
         """Create ``active.json`` exclusively; take over stale/corrupt locks.
 
         Raises ``RunBusy`` when a live process holds the lock (even this one,
-        under another run id).
+        under another run id). Writes under ``.carcara`` only, never ``runs/``.
         """
-        self._ensure_root()
+        self._ensure_base()
         lock: dict[str, Any] = {"pid": os.getpid(), "run_id": run_id, "started": _now()}
         start = _proc_start(os.getpid())
         if start is not None:

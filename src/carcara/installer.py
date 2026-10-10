@@ -27,6 +27,7 @@ any write.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import glob
 import json
@@ -849,6 +850,54 @@ def _check_purge(target: str, runs: str) -> None:
         raise InstallError(f"refusing to purge {runs}: not a directory inside {target}")
 
 
+# Run id ``uninstall --purge`` holds the active-run lock under while it removes files.
+PURGE_LOCK_ID = "uninstall-purge"
+
+
+def _purge_lock_paths(target: str) -> list[str]:
+    """``active.json`` (if present) and the ``acquire_lock`` leftovers next to it."""
+    active = f"{target}/{ACTIVE_RUN_REL}"
+    leftovers = sorted(
+        path
+        for pattern in runstore.LOCK_LEFTOVER_GLOBS
+        for path in glob.glob(os.path.join(glob.escape(f"{target}/.carcara"), pattern))
+    )
+    return ([active] if os.path.lexists(active) else []) + leftovers
+
+
+def _acquire_purge_lock(target: str) -> runstore.RunStore:
+    """Take the active-run lock so no ``carcara run`` starts during the purge.
+
+    ``acquire_lock`` creates ``.carcara`` and ``.carcara/.gitignore`` when
+    missing; on failure those are removed again.
+    """
+    active = f"{target}/{ACTIVE_RUN_REL}"
+    if os.path.islink(active):
+        # Not live (checked by the caller); a dangling link would block acquire_lock.
+        os.unlink(active)
+    created = [
+        p
+        for p in (f"{target}/.carcara", f"{target}/{CARCARA_GITIGNORE_REL}")
+        if not os.path.lexists(p)
+    ]
+    store = runstore.RunStore(Path(target))
+    try:
+        store.acquire_lock(PURGE_LOCK_ID)
+    except runstore.RunStoreError as exc:
+        for p in reversed(created):
+            try:
+                if os.path.isdir(p) and not os.path.islink(p):
+                    os.rmdir(p)
+                else:
+                    os.unlink(p)
+            except OSError:
+                pass
+        if isinstance(exc, runstore.RunBusy):
+            raise InstallError(f"refusing to purge: run {exc.run_id} is active") from exc
+        raise InstallError(f"refusing to purge: {exc}") from exc
+    return store
+
+
 def uninstall(
     target: str = ".",
     *,
@@ -860,7 +909,9 @@ def uninstall(
     """Remove what ``install`` added to ``target``; returns the number of changes.
 
     Raises InstallError before any change (bad CLAUDE.md markers, bad
-    settings.json or manifest, home directory, unsafe --purge path).
+    settings.json or manifest, home directory, a directory at a carcara file
+    or lock file, unsafe --purge path, live run). ``--purge`` holds the
+    active-run lock while it removes files, so no run can start meanwhile.
     """
     out = sys.stdout if out is None else out
     target = target or "."
@@ -876,6 +927,17 @@ def uninstall(
         if os.path.isdir(path) and not os.path.islink(path):
             raise InstallError(f"{path} is a directory, not a carcara file; refusing to uninstall")
     if purge:
+        carcara_dir = f"{target}/.carcara"
+        inside = os.path.join(os.path.realpath(target), ".carcara")
+        if os.path.lexists(carcara_dir) and (
+            os.path.islink(carcara_dir) or os.path.realpath(carcara_dir) != inside
+        ):
+            raise InstallError(f"refusing to purge {carcara_dir}: not a directory inside {target}")
+        for path in _purge_lock_paths(target):
+            if os.path.isdir(path) and not os.path.islink(path):
+                raise InstallError(
+                    f"{path} is a directory, not a carcara lock file; refusing to uninstall"
+                )
         holder = runstore.live_lock_holder(f"{target}/{ACTIVE_RUN_REL}")
         if holder is not None:
             raise InstallError(f"refusing to purge: run {holder['run_id']} is active")
@@ -895,74 +957,95 @@ def uninstall(
     if purge and os.path.lexists(runs):
         _check_purge(target, runs)
 
-    suffix = " (dry run)" if dry_run else ""
-    out.write(f"carcara {__version__}: uninstalling from {target}{suffix}\n")
-    changes = _uninstall_claude_files(
-        target, _uninstall_profiles(target, manifest), force, dry_run, out
-    )
-
-    if settings is not None:
-        raw, data = settings
-        new = unmerge_settings(data, _template_permissions(), manifest)
-        if new != data:
-            if manifest is None:
-                out.write(
-                    "warning: no install manifest; removing every carcara template "
-                    "permission (also ones you added yourself) and keeping 'model'\n"
-                )
-            changes += 1
-            created = manifest.get("settings_created") if manifest else True
-            if not new and created:
-                out.write(_action("remove", settings_dest))
-                if not dry_run:
-                    os.unlink(settings_dest)
-            elif _dump_settings(new) != raw:
-                out.write(_action("strip", settings_dest))
-                if not dry_run:
-                    _write_atomic(settings_dest, _dump_settings(new))
-    if not dry_run:
-        _prune_dirs([os.path.join(target, ".claude", d) for d in CLAUDE_DIRS])
-
-    if claude_md_data is not None and claude_md_new != claude_md_data:
-        changes += 1
-        if claude_md_new is None:
-            out.write(_action("remove", claude_md))
-            if not dry_run:
-                os.unlink(claude_md)
-        else:
-            out.write(_action("strip", claude_md))
-            if not dry_run:
-                with open(claude_md, "wb") as fh:
-                    fh.write(claude_md_new)
-
-    # install.json last: if anything fails before it, uninstall can be retried.
-    for rel in CARCARA_FILES:
-        path = f"{target}/{rel}"
-        if os.path.lexists(path):
-            out.write(_action("remove", path))
-            changes += 1
-            if not dry_run:
-                os.unlink(path)
-    if os.path.lexists(runs):
-        if purge:
-            out.write(_action("purge", runs))
-            changes += 1
-            if not dry_run:
-                shutil.rmtree(runs)
-        else:
-            out.write(f"  keep       {runs} (run history; use --purge to delete)\n")
-    if purge:
-        active = f"{target}/{ACTIVE_RUN_REL}"
-        leftovers = sorted(
-            path
-            for pattern in runstore.LOCK_LEFTOVER_GLOBS
-            for path in glob.glob(os.path.join(glob.escape(f"{target}/.carcara"), pattern))
+    # Snapshot before acquire_lock, which may create .carcara/.gitignore.
+    present = {p for p in (f"{target}/{rel}" for rel in CARCARA_FILES) if os.path.lexists(p)}
+    lock_paths = _purge_lock_paths(target) if purge else []
+    store = _acquire_purge_lock(target) if purge and not dry_run else None
+    try:
+        if store is not None and os.path.lexists(runs):
+            # Again under the lock: a run may have created runs/ since the check.
+            try:
+                _check_purge(target, runs)
+            except InstallError:
+                gitignore = f"{target}/{CARCARA_GITIGNORE_REL}"
+                if gitignore not in present:
+                    with contextlib.suppress(OSError):
+                        os.unlink(gitignore)
+                raise
+        suffix = " (dry run)" if dry_run else ""
+        out.write(f"carcara {__version__}: uninstalling from {target}{suffix}\n")
+        changes = _uninstall_claude_files(
+            target, _uninstall_profiles(target, manifest), force, dry_run, out
         )
-        for path in ([active] if os.path.lexists(active) else []) + leftovers:
-            out.write(_action("purge", path))
+
+        if settings is not None:
+            raw, data = settings
+            new = unmerge_settings(data, _template_permissions(), manifest)
+            if new != data:
+                if manifest is None:
+                    out.write(
+                        "warning: no install manifest; removing every carcara template "
+                        "permission (also ones you added yourself) and keeping 'model'\n"
+                    )
+                changes += 1
+                created = manifest.get("settings_created") if manifest else True
+                if not new and created:
+                    out.write(_action("remove", settings_dest))
+                    if not dry_run:
+                        os.unlink(settings_dest)
+                elif _dump_settings(new) != raw:
+                    out.write(_action("strip", settings_dest))
+                    if not dry_run:
+                        _write_atomic(settings_dest, _dump_settings(new))
+        if not dry_run:
+            _prune_dirs([os.path.join(target, ".claude", d) for d in CLAUDE_DIRS])
+
+        if claude_md_data is not None and claude_md_new != claude_md_data:
             changes += 1
-            if not dry_run:
-                os.unlink(path)
+            if claude_md_new is None:
+                out.write(_action("remove", claude_md))
+                if not dry_run:
+                    os.unlink(claude_md)
+            else:
+                out.write(_action("strip", claude_md))
+                if not dry_run:
+                    with open(claude_md, "wb") as fh:
+                        fh.write(claude_md_new)
+
+        # Removal order: CARCARA_FILES (install.json included), runs, lock
+        # leftovers; then releasing the purge lock removes active.json and empty
+        # dirs are pruned. If anything fails once install.json is gone, a retry
+        # takes the no-manifest fallback, which is harmless here. A .gitignore
+        # missing from ``present`` was created by acquire_lock: removed silently.
+        for rel in CARCARA_FILES:
+            path = f"{target}/{rel}"
+            if os.path.lexists(path):
+                if path in present:
+                    out.write(_action("remove", path))
+                    changes += 1
+                if not dry_run:
+                    os.unlink(path)
+        if os.path.lexists(runs):
+            if purge:
+                out.write(_action("purge", runs))
+                changes += 1
+                if not dry_run:
+                    shutil.rmtree(runs)
+            else:
+                out.write(f"  keep       {runs} (run history; use --purge to delete)\n")
+        if purge:
+            active = f"{target}/{ACTIVE_RUN_REL}"
+            for path in lock_paths:
+                out.write(_action("purge", path))
+                changes += 1
+                # active.json is our own lock now: release_lock removes it below.
+                if not dry_run and path != active:
+                    # A starting run may clear its own leftovers meanwhile.
+                    with contextlib.suppress(FileNotFoundError):
+                        os.unlink(path)
+    finally:
+        if store is not None:
+            store.release_lock(PURGE_LOCK_ID)
     if not dry_run:
         _prune_dirs([f"{target}/.carcara"])
 

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from carcara import runstore
+from carcara import installer, runstore
 from carcara.cli import main
 from carcara.installer import INSTALL_MANIFEST_REL, hook_group
 
@@ -362,6 +362,132 @@ def test_uninstall_refuses_directory_at_carcara_file(proj, capsys):
         "carcara: d/.carcara/profile is a directory, not a carcara file; refusing to uninstall\n"
     )
     assert tree(proj) == before and dirs(proj) == before_dirs
+
+
+LOCK_NAMES = ["active.json", ".active.json.123.ab.tmp", ".active.json.123.ab.stale"]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("name", LOCK_NAMES)
+def test_purge_refuses_directory_at_lock_path(proj, capsys, name, dry_run):
+    assert main(["d"]) == 0
+    (proj / ".carcara" / "runs" / "r1").mkdir(parents=True)
+    (proj / ".carcara" / name).mkdir()
+    (proj / ".carcara" / name / "notes").write_text("mine")
+    before, before_dirs = tree(proj), dirs(proj)
+    capsys.readouterr()
+    assert main(["uninstall", *(["-n"] if dry_run else []), "--purge", "d"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        f"carcara: d/.carcara/{name} is a directory, not a carcara lock file; "
+        "refusing to uninstall\n"
+    )
+    assert tree(proj) == before and dirs(proj) == before_dirs
+
+
+def test_purge_holds_lock_against_starting_run(proj, capsys, monkeypatch):
+    assert main(["d"]) == 0
+    (proj / ".carcara" / "runs" / "r1").mkdir(parents=True)
+    real_rmtree = shutil.rmtree
+    busy = []
+
+    def rmtree(path, *args, **kwargs):
+        if Path(path).name == "runs":
+            before = sorted(os.listdir(path))
+            # Orchestrator.run's order: lock first, then create the run dir.
+            try:
+                runstore.RunStore(proj).acquire_lock("r2")
+            except runstore.RunBusy as exc:
+                busy.append(exc.run_id)
+            else:
+                busy.append(None)
+            assert sorted(os.listdir(path)) == before
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(installer.shutil, "rmtree", rmtree)
+    capsys.readouterr()
+    assert main(["uninstall", "--purge", "d"]) == 0
+    assert busy == [installer.PURGE_LOCK_ID]
+    out = capsys.readouterr().out
+    assert "  purge      d/.carcara/runs\n" in out
+    assert "active.json" not in out
+    # Only r2's own acquire_lock (_ensure_root) recreated the .gitignore.
+    assert tree(proj) == {".carcara/.gitignore": b"*\n"}
+    assert dirs(proj) == [".carcara"]
+
+
+def test_purge_refuses_when_lock_taken_after_check(proj, capsys, monkeypatch):
+    assert main(["d"]) == 0
+    (proj / ".carcara" / "runs" / "r1").mkdir(parents=True)
+    write_lock(proj, os.getpid(), runstore._proc_start(os.getpid()))
+    before, before_dirs = tree(proj), dirs(proj)
+    # The run starts between the read-only check and acquiring the lock.
+    monkeypatch.setattr(installer.runstore, "live_lock_holder", lambda path: None)
+    capsys.readouterr()
+    assert main(["uninstall", "--purge", "d"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("carcara: refusing to purge: run r1 is active")
+    assert tree(proj) == before and dirs(proj) == before_dirs
+
+
+def test_purge_lock_race_without_runs_dir_leaves_nothing_behind(proj, monkeypatch):
+    assert main(["d"]) == 0
+    write_lock(proj, os.getpid(), runstore._proc_start(os.getpid()))
+    before, before_dirs = tree(proj), dirs(proj)
+    monkeypatch.setattr(installer.runstore, "live_lock_holder", lambda path: None)
+    assert main(["uninstall", "--purge", "d"]) == 1
+    assert tree(proj) == before and dirs(proj) == before_dirs
+
+
+def test_purge_refuses_symlinked_carcara_dir(proj, tmp_path, capsys):
+    assert main(["d"]) == 0
+    elsewhere = tmp_path / "elsewhere"
+    (proj / ".carcara").rename(elsewhere)
+    (elsewhere / "runs" / "r1").mkdir(parents=True)
+    (proj / ".carcara").symlink_to(elsewhere)
+    before, before_dirs = tree(proj), dirs(proj)
+    outside = tree(elsewhere)
+    capsys.readouterr()
+    assert main(["uninstall", "--purge", "d"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("carcara: refusing to purge d/.carcara: not a directory")
+    assert tree(proj) == before and dirs(proj) == before_dirs
+    assert tree(elsewhere) == outside and (elsewhere / "runs" / "r1").is_dir()
+
+
+def test_purge_rechecks_runs_created_before_lock(proj, tmp_path, capsys, monkeypatch):
+    assert main(["d"]) == 0
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "r1").mkdir(parents=True)
+    real_acquire = installer._acquire_purge_lock
+
+    def acquire(target):
+        # runs/ shows up (as a symlink) between the checks and taking the lock.
+        (proj / ".carcara" / "runs").symlink_to(elsewhere)
+        return real_acquire(target)
+
+    monkeypatch.setattr(installer, "_acquire_purge_lock", acquire)
+    before = tree(proj)
+    capsys.readouterr()
+    assert main(["uninstall", "--purge", "d"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("carcara: refusing to purge d/.carcara/runs")
+    (proj / ".carcara" / "runs").unlink()
+    assert tree(proj) == before
+    assert (elsewhere / "r1").is_dir()
+
+
+def test_purge_removes_dangling_symlink_at_active(proj, capsys):
+    assert main(["d"]) == 0
+    (proj / ".carcara" / "active.json").symlink_to(proj / "nowhere")
+    capsys.readouterr()
+    assert main(["uninstall", "--purge", "d"]) == 0
+    assert "  purge      d/.carcara/active.json\n" in capsys.readouterr().out
+    assert list(proj.iterdir()) == []
 
 
 def test_dry_run_writes_nothing(proj, capsys):
