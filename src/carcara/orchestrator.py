@@ -922,6 +922,10 @@ class Orchestrator:
                 run.save()
                 return await self._finish(run, "failed", "plan rejected by user")
             if accept_failures:
+                try:
+                    await self._accept_review(run)
+                except _Stop as stop:
+                    return await self._finish(run, stop.status, stop.message)
                 run.state["accepted_failures"] = True
                 run.save()
                 run.event("failures_accepted")
@@ -2103,6 +2107,43 @@ class Orchestrator:
         self._record_unverified(run, key, review)
         return review
 
+    async def _run_review(self, run: Run, task: str, prefix: str) -> dict[str, Any]:
+        """The round's review under ``prefix``: split for ultra, else one stage."""
+        if self._ultra():
+            return await self._split_review(run, task, prefix)
+
+        def review_prompt() -> str:
+            return (
+                f"Task: {task}\n\nReview this change for correctness, security and "
+                f"missing tests. Report only real issues.\n\n"
+                f"{self._inventory_prompt(run)}\n\n{self._diff_context()}"
+            )
+
+        key = f"{prefix}review"
+        review = await self._stage(key, "review", "reviewer", "review", review_prompt)
+        self._record_unverified(run, key, review)
+        return review
+
+    async def _accept_review(self, run: Run) -> None:
+        """Before --accept-failures finishes a run: the forced review, if the
+        current verify round has none yet and the diff still touches a gated path."""
+        if not run.state.get("review_reason"):
+            return
+        if not match_paths(self._changed_paths(run), self.config.verifiability_paths, self.cwd):
+            return
+        rnd = int(run.state.get("verify_round", 0))
+        prefix = f"retry-{rnd}:"
+        for entry in run.state["stages"]:
+            key = entry["key"]
+            in_round = key.startswith(prefix) if rnd else not key.startswith("retry-")
+            if entry["stage"] == "review" and in_round:
+                return
+        # Keyed by round so a later accept never replays an earlier diff's review.
+        accept_prefix = f"accept-{rnd}:"
+        if run.stage(f"{accept_prefix}review") is None:
+            run.event("review_forced_on_failing_tests", key=f"{accept_prefix}review")
+        await self._run_review(run, run.state["task"], accept_prefix)
+
     async def _verify(
         self, run: Run, task: str, review_on: bool
     ) -> tuple[str | None, list[dict[str, Any]]]:
@@ -2118,30 +2159,23 @@ class Orchestrator:
                 "investigate or debug failures. Report the results straight away."
             )
 
-        def review_prompt() -> str:
-            return (
-                f"Task: {task}\n\nReview this change for correctness, security and "
-                f"missing tests. Report only real issues.\n\n"
-                f"{self._inventory_prompt(run)}\n\n{self._diff_context()}"
-            )
-
         async def recheck_gate() -> None:
             # A later implement may first touch a low-verifiability path.
             nonlocal review_on
             await self._post_implement_gate(run)
             review_on = self._force_review_on_gate(run, review_on)
 
+        last_prefix = prefix
+
         async def check(stage_prefix: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
+            nonlocal last_prefix
+            last_prefix = stage_prefix
             test = await self._stage(
                 f"{stage_prefix}test", "test", "test-runner", "test", test_prompt
             )
             review = None
-            if review_on and test["passed"] and self._ultra():
-                review = await self._split_review(run, task, stage_prefix)
-            elif review_on and test["passed"]:
-                key = f"{stage_prefix}review"
-                review = await self._stage(key, "review", "reviewer", "review", review_prompt)
-                self._record_unverified(run, key, review)
+            if review_on and test["passed"]:
+                review = await self._run_review(run, task, stage_prefix)
             return test, review
 
         guidance = run.state.get("retry_feedback", {}).get(str(rnd)) if rnd else None
@@ -2194,6 +2228,13 @@ class Orchestrator:
 
         if not failing:
             return None, fixes
+        await recheck_gate()
+        if review is None and review_on and run.state.get("review_reason"):
+            # A gated change still gets reviewed (and its unverified inventory
+            # recorded) even though tests fail; the findings are informational.
+            if run.stage(f"{last_prefix}review") is None:
+                run.event("review_forced_on_failing_tests", key=f"{last_prefix}review")
+            await self._run_review(run, task, last_prefix)
         summary = f"still failing after {MAX_FIX_ITERATIONS} fix iterations: {_dumps(failing)}"
         run.event("fix_loop_exhausted", failing=failing)
         if await self._ask_human(run, lambda: self.gate.ask_continue(summary), bool):
@@ -2210,6 +2251,7 @@ class Orchestrator:
         files: list[str] = []
         test_line = "not run"
         review_line = "not run"
+        test_failed = review_on_failing = False
         for entry in stages:
             out = entry["output"]
             if entry["stage"] == "implement":
@@ -2217,6 +2259,7 @@ class Orchestrator:
                     if change["path"] not in files:
                         files.append(change["path"])
             elif entry["stage"] == "test":
+                test_failed = not out["passed"]
                 if out["passed"]:
                     test_line = f"passed ({len(out['commands'])} commands)"
                 else:
@@ -2224,6 +2267,7 @@ class Orchestrator:
                     test_line = f"FAILED: {names or 'see test output'}"
             elif entry["stage"] == "review":
                 serious = sum(1 for f in out["findings"] if f["severity"] in ("blocker", "major"))
+                review_on_failing = test_failed
                 review_line = (
                     f"{out['verdict']} ({len(out['findings'])} findings, {serious} serious)"
                 )
@@ -2232,7 +2276,8 @@ class Orchestrator:
             failed = "; tests failed" if test_line.startswith("FAILED") else ""
             review_line += f" (required by {reason}{failed})"
         elif reason:
-            review_line += f" (forced: {reason})"
+            failing = "; tests failing" if review_on_failing else ""
+            review_line += f" (forced: {reason}{failing})"
         attempts = state.get("failed_attempts", [])
         cost_items = [f"{e['key']} ${e['cost_usd']:.2f}" for e in stages]
         cost_items += [

@@ -1505,19 +1505,30 @@ def test_ultra_small_gate_forces_split_review(repo):
     assert orch.run_state.state["review_reason"] == "verifiability gate"
 
 
-def test_small_gate_tests_fail_no_review(repo):
+def test_small_gate_tests_fail_still_reviews(repo):
     orch, backend, _ = make(
         repo,
         {
             "implement": [impl("src/carcara/policy.py")] * 3,
             "test": [TEST_FAIL] * 3,
+            "review": [REVIEW_OK],
         },
         size="S",
     )
     out = go(orch)
     assert out.status == "needs_human"
-    assert "review" not in [s for s, _ in seq(backend)]
-    assert "review: not run (required by verifiability gate; tests failed)" in out.report_text
+    stages = [s for s, _ in seq(backend)]
+    assert stages.count("review") == 1 and stages[-1] == "review"
+    assert keys(orch)[-1] == "fix-2:review"
+    review_line = next(ln for ln in out.report_text.splitlines() if ln.startswith("review:"))
+    assert review_line == (
+        "review: approve (0 findings, 0 serious) (forced: verifiability gate; tests failing)"
+    )
+    assert len(out.report_text.splitlines()) <= 12
+    events = [json.loads(e) for e in (orch.run_state.dir / "events.jsonl").read_text().splitlines()]
+    assert [e["key"] for e in events if e["event"] == "review_forced_on_failing_tests"] == [
+        "fix-2:review"
+    ]
 
     orch2, backend2, _ = make(
         repo,
@@ -1539,14 +1550,16 @@ def test_small_gate_tests_fail_no_review(repo):
 def test_small_retry_forces_review_only_while_diff_touches_gated_path(repo, reverted):
     (repo / ".github" / "workflows").mkdir(parents=True)
     out = {**impl(), "changed": []}
-    orch, _ = make_editing(
+    orch, backend = make_editing(
         repo,
-        {"implement": [out] * 3, "test": [TEST_FAIL] * 3},
+        {"implement": [out] * 3, "test": [TEST_FAIL] * 3, "review": [REVIEW_OK]},
         [{".github/workflows/x.yml": "on: push\n"}],
         size="S",
     )
     first = go(orch)
     assert first.status == "needs_human"
+    # The gated path is still in the diff when the fix loop gives up.
+    assert seq(backend)[-1] == ("review", "reviewer")
     assert orch.run_state.state["gate"]["stage"] == "post-implement"
     assert orch.run_state.state["review_reason"] == "verifiability gate"
     if reverted:
@@ -1577,6 +1590,168 @@ def test_small_retry_forces_review_only_while_diff_touches_gated_path(repo, reve
         assert state["review_reason"] == "verifiability gate"
         assert state["gate"]["trigger"] == "verifiability"
         assert cleared == []
+
+
+def test_small_fix_reverting_gated_path_skips_review_on_failing_tests(repo):
+    (repo / ".github").mkdir()
+    (repo / ".github" / "x.yml").write_text("on: push\n")
+    git(repo, "add", ".github/x.yml")
+    git(repo, "commit", "-q", "-m", "ci")
+    out = {**impl(), "changed": []}
+    orch, backend = make_editing(
+        repo,
+        {"implement": [out] * 3, "test": [TEST_FAIL] * 3},
+        [{".github/x.yml": "on: pull_request\n"}, {".github/x.yml": "on: push\n"}],
+        size="S",
+    )
+    first = go(orch)
+    assert first.status == "needs_human"
+    assert "review" not in [s for s, _ in seq(backend)]
+    assert orch.run_state.state["review_reason"] is None
+
+
+def _gated_failing_run(repo, review, **opts):
+    script = {
+        "implement": [impl("src/carcara/policy.py")] * 3,
+        "test": [TEST_FAIL] * 3,
+        **review,
+    }
+    orch, _, _ = make(repo, script, **opts)
+    out = go(orch)
+    assert out.status == "needs_human"
+    return out.run_id
+
+
+def _accept(repo, run_id):
+    from carcara.urutau import build_inventory
+
+    orch2, backend2, _ = make(repo, {})
+    out = asyncio.run(orch2.resume(run_id, accept_failures=True))
+    assert (out.status, out.exit_code) == ("done", 0)
+    assert backend2.requests == []
+    state = orch2.run_state.state
+    assert [i["text"] for i in build_inventory(state)[0]] == ["policy denies sed -i"]
+    assert "(forced: verifiability gate; tests failing)" in out.report_text
+    return orch2
+
+
+UNVERIFIED_ITEM = {"id": "U1", "kind": "untested", "text": "policy denies sed -i"}
+
+
+def test_accept_failures_gated_path_has_review_and_inventory(repo):
+    review = {**REVIEW_OK, "unverified": [UNVERIFIED_ITEM]}
+    run_id = _gated_failing_run(repo, {"review": [review]}, size="S")
+    orch2 = _accept(repo, run_id)
+    assert [e["key"] for e in orch2.run_state.state["stages"] if e["stage"] == "review"] == [
+        "fix-2:review"
+    ]
+
+
+def test_accept_failures_gated_path_ultra_split_review(repo):
+    review = {**REVIEW_OK, "unverified": [UNVERIFIED_ITEM]}
+    script = {**{f"fix-2:review-dim:{d}": [_dim(d)] for d in DIMS}, "review": [review]}
+    run_id = _gated_failing_run(repo, script, **_ultra_s(review_small=False))
+    orch2 = _accept(repo, run_id)
+    assert keys(orch2)[-len(DIMS) - 1 :] == [
+        *(f"fix-2:review-dim:{d}" for d in DIMS),
+        "fix-2:review",
+    ]
+
+
+def test_accept_failures_runs_missing_forced_review(repo):
+    review = {**REVIEW_OK, "unverified": [UNVERIFIED_ITEM]}
+    run_id = _gated_failing_run(repo, {"review": [review]}, size="S")
+    # A run paused before forced review ran on failing tests.
+    run = RunStore(repo).load(run_id)
+    run.state["stages"] = [e for e in run.state["stages"] if e["stage"] != "review"]
+    for key in ("unverified", "unverified_reviews", "unverified_next"):
+        run.state.pop(key, None)
+    run.save()
+
+    orch2, backend2, _ = make(repo, {"review": [review]})
+    out = asyncio.run(orch2.resume(run_id, accept_failures=True))
+    assert (out.status, out.exit_code) == ("done", 0)
+    assert seq(backend2) == [("review", "reviewer")]
+    assert keys(orch2)[-1] == "accept-0:review"
+    assert [i["id"] for i in orch2.run_state.state["unverified"]] == ["U1"]
+    assert "(forced: verifiability gate; tests failing)" in out.report_text
+
+
+def test_accept_failures_later_round_does_not_replay_earlier_accept_review(repo):
+    review = {**REVIEW_OK, "unverified": [UNVERIFIED_ITEM]}
+    run_id = _gated_failing_run(repo, {"review": [review]}, size="S")
+    # An accept-time review from round 0 was recorded, then the user resumed
+    # without --accept-failures and round 1 paused with no review.
+    run = RunStore(repo).load(run_id)
+    old = next(e for e in run.state["stages"] if e["stage"] == "review")
+    run.state["stages"] = [e for e in run.state["stages"] if e["stage"] != "review"]
+    run.state["stages"].append({**old, "key": "accept-0:review"})
+    run.state["verify_round"] = 1
+    for key in ("unverified", "unverified_reviews", "unverified_next"):
+        run.state.pop(key, None)
+    run.save()
+
+    orch2, backend2, _ = make(repo, {"review": [review]})
+    out = asyncio.run(orch2.resume(run_id, accept_failures=True))
+    assert (out.status, out.exit_code) == ("done", 0)
+    assert seq(backend2) == [("review", "reviewer")]
+    assert keys(orch2)[-1] == "accept-1:review"
+
+
+def test_accept_failures_later_round_keeps_its_own_review(repo):
+    review = {**REVIEW_OK, "unverified": [UNVERIFIED_ITEM]}
+    run_id = _gated_failing_run(repo, {"review": [review]}, size="S")
+    # Round 1 already reviewed its diff on failing tests.
+    run = RunStore(repo).load(run_id)
+    for entry in run.state["stages"]:
+        if entry["stage"] == "review":
+            entry["key"] = "retry-1:fix-2:review"
+    run.state["verify_round"] = 1
+    run.save()
+
+    orch2, backend2, _ = make(repo, {})
+    out = asyncio.run(orch2.resume(run_id, accept_failures=True))
+    assert (out.status, out.exit_code) == ("done", 0)
+    assert backend2.requests == []
+    assert not any(k.startswith("accept-") for k in keys(orch2))
+
+
+def test_accept_failures_skips_review_once_gated_path_reverted(repo):
+    (repo / ".github" / "workflows").mkdir(parents=True)
+    out = {**impl(), "changed": []}
+    orch, _ = make_editing(
+        repo,
+        {"implement": [out] * 3, "test": [TEST_FAIL] * 3, "review": [REVIEW_OK]},
+        [{".github/workflows/x.yml": "on: push\n"}],
+        size="S",
+    )
+    first = go(orch)
+    assert first.status == "needs_human"
+    run = RunStore(repo).load(first.run_id)
+    run.state["stages"] = [e for e in run.state["stages"] if e["stage"] != "review"]
+    run.save()
+    (repo / ".github" / "workflows" / "x.yml").unlink()
+
+    orch2, backend2, _ = make(repo, {"review": [REVIEW_OK]})
+    out2 = asyncio.run(orch2.resume(first.run_id, accept_failures=True))
+    assert (out2.status, out2.exit_code) == ("done", 0)
+    assert backend2.requests == []
+    assert not any(k.startswith("accept-") for k in keys(orch2))
+
+
+def test_accept_failures_review_stage_failure_stops_run(repo):
+    review = {**REVIEW_OK, "unverified": [UNVERIFIED_ITEM]}
+    run_id = _gated_failing_run(repo, {"review": [review]}, size="S")
+    run = RunStore(repo).load(run_id)
+    run.state["stages"] = [e for e in run.state["stages"] if e["stage"] != "review"]
+    run.save()
+
+    err = StageResult(subtype="error_during_execution", is_error=True, errors=["boom"])
+    orch2, backend2, _ = make(repo, {"review": [err]})
+    out = asyncio.run(orch2.resume(run_id, accept_failures=True))
+    assert (out.status, out.exit_code) == ("failed", 1)
+    assert seq(backend2) == [("review", "reviewer")]
+    assert not RunStore(repo).load(run_id).state.get("accepted_failures")
 
 
 def test_plan_gate_replaces_stale_gate_plan(repo):
