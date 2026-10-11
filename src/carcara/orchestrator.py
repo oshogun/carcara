@@ -949,6 +949,7 @@ class Orchestrator:
             if triage_only:
                 run.state["triage_only"] = True
             self._record_issue(run)
+            self._carry_unverified(run)
             if self.urutau is not None:
                 stopped = await self._urutau_start(run)
                 if stopped is not None:
@@ -1191,6 +1192,40 @@ class Orchestrator:
         urutau.setdefault("sent_items", {})
         urutau.setdefault("last", None)
         run.save()
+
+    def _carry_unverified(self, run: Run) -> None:
+        """Copy the open unverified items of the previous run on the same issue
+        and repo into this new run, so its record_run keeps them on the card.
+
+        Resolved items and probe results are not carried. The previous run's
+        state already holds what it carried, so one run back is enough.
+        """
+        state = run.state
+        issue = state.get("issue")
+        if issue is None:
+            return
+        repo = (state.get("urutau") or {}).get("repo")
+        prev = self.store.find_previous_issue_run(issue, repo, exclude_run_id=run.id)
+        if prev is None:
+            return
+        carried = [
+            {"id": i["id"], "kind": i["kind"], "text": i["text"], "carried_from": prev.id}
+            for i in prev.state.get("unverified") or []
+            if isinstance(i, dict) and not i.get("resolved") and i.get("id") and i.get("text")
+        ]
+        if not carried:
+            return
+        numbers = [
+            int(i["id"][1:]) for i in carried if re.fullmatch(r"U\d+", str(i["id"])) is not None
+        ]
+        state["unverified"] = carried
+        state["unverified_next"] = max(
+            int(state.get("unverified_next", 1)),
+            int(prev.state.get("unverified_next", 1)),
+            max(numbers, default=0) + 1,
+        )
+        run.save()
+        run.event("unverified_carried", **{"from": prev.id, "count": len(carried)})
 
     def _new_urutau_run(self, run: Run) -> None:
         """Start a new Urutau run (``<run.id>-rN``): the previous one has ended."""
@@ -2251,6 +2286,9 @@ class Orchestrator:
             entry = {"id": ids[n], "kind": item["kind"], "text": item["text"]}
             if item.get("probe"):
                 entry["probe"] = item["probe"]
+            carried_from = (prior.get(ids[n]) or {}).get("carried_from")
+            if carried_from:
+                entry["carried_from"] = carried_from
             recorded.append(entry)
         state["unverified_next"] = counter
         state["unverified"] = recorded
@@ -2808,6 +2846,11 @@ def _urutau_report_lines(state: dict[str, Any]) -> list[str]:
                 f"{k}={open_.get(k, 0)}" for k in ("external", "normative", "untested")
             )
     lines.append(line)
+    carried: dict[str, int] = {}
+    for item in state.get("unverified") or []:
+        if isinstance(item, dict) and item.get("carried_from") and not item.get("resolved"):
+            carried[item["carried_from"]] = carried.get(item["carried_from"], 0) + 1
+    lines.extend(f"carried from {src}: {n}" for src, n in carried.items())
     return lines
 
 

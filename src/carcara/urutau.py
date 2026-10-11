@@ -484,6 +484,7 @@ def build_inventory(
     findings: list[str] = []
     current: dict[str, str] = {}  # local id -> urutau id
     capped = 0
+    capped_carried = 0
 
     for item in items:
         local = str(item.get("id", ""))
@@ -499,6 +500,7 @@ def build_inventory(
             continue
         if len(sent) >= MAX_ITEMS:
             capped += 1
+            capped_carried += bool(item.get("carried_from"))
             if old is not None:
                 current[local] = old
             continue
@@ -550,4 +552,6 @@ def build_inventory(
         findings.append(
             f"{capped} unverified item(s) not sent: Urutau keeps at most {MAX_ITEMS} per run"
         )
+    if capped_carried:
+        findings.append(f"{capped_carried} of them carried from an earlier run")
     return unverified, withdrawn, probes, findings, sent

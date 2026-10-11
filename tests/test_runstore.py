@@ -289,3 +289,41 @@ def test_take_over_restores_replaced_lock(tmp_path, monkeypatch):
     assert exc.value.run_id == "racer"
     assert store.lock_path.read_text(encoding="utf-8") == live
     assert not list(store.base.glob(".active.json.*"))
+
+
+# -- previous run on the same issue -------------------------------------------
+
+
+def _issue_run(store, run_id, issue=7, repo="acme/widgets", unverified=()):
+    run = store.create("t", "balanced", "abc", run_id=run_id)
+    run.state["issue"] = issue
+    run.state["urutau"]["repo"] = repo
+    if unverified is not None:
+        run.state["unverified"] = list(unverified)
+    run.save()
+    return run
+
+
+def test_find_previous_issue_run(tmp_path):
+    store = RunStore(tmp_path)
+    assert store.find_previous_issue_run(7, "acme/widgets") is None
+    _issue_run(store, "r1", unverified=[{"id": "U1"}])
+    _issue_run(store, "r2", repo="ACME/Widgets")
+    _issue_run(store, "r3", unverified=None)  # predates the inventory
+    old = _issue_run(store, "r4", unverified=None)
+    del old.state["urutau"]  # a run from before Urutau reporting
+    old.state["unverified"] = []
+    old.save()
+    _issue_run(store, "r5", issue=8)
+    _issue_run(store, "r6", repo="other/repo")
+    (store.root / "r7").mkdir()
+    (store.root / "r7" / "state.json").write_text("{not json")
+    _issue_run(store, "r8")
+
+    assert store.find_previous_issue_run(7, "acme/widgets").id == "r8"
+    assert store.find_previous_issue_run(7, "acme/widgets", exclude_run_id="r8").id == "r2"
+    _write_lock(store, {"pid": os.getpid(), "run_id": "r8"})
+    assert store.find_previous_issue_run(7, "acme/widgets").id == "r2"
+    assert store.find_previous_issue_run(7, "acme/widgets", exclude_run_id="r2").id == "r1"
+    assert store.find_previous_issue_run(8, "acme/widgets").id == "r5"
+    assert store.find_previous_issue_run(9, "acme/widgets") is None

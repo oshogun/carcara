@@ -197,6 +197,19 @@ def test_inventory_cap():
     unv, _, _, findings, sent = build_inventory(_state(items))
     assert len(unv) == 20 and len(sent) == 20
     assert any("not sent" in f for f in findings)
+    assert not any("carried" in f for f in findings)
+
+
+def test_inventory_cap_counts_carried_items():
+    items = [{"id": f"U{i}", "kind": "external", "text": f"t{i}"} for i in range(1, 21)]
+    items += [{"id": "U21", "kind": "normative", "text": "n", "carried_from": "r1"}]
+    items += [{"id": "U22", "kind": "external", "text": "x"}]
+    unv, _, _, findings, _ = build_inventory(_state(items))
+    assert len(unv) == 20
+    assert findings[-2:] == [
+        "2 unverified item(s) not sent: Urutau keeps at most 20 per run",
+        "1 of them carried from an earlier run",
+    ]
 
 
 # --- client ---

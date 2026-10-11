@@ -590,3 +590,127 @@ def test_ultra_inventory_comes_only_from_merge_review(repo):
     assert end["areas"] == plain_end["areas"]
     assert end["files"] == plain_end["files"]
     assert orch.run_state.state["unverified_reviews"] == ["review", "fix-1:review"]
+
+
+CARRY_REVIEW = {
+    **REVIEW_OK,
+    "unverified": [
+        {"id": "U1", "kind": "external", "text": "ext item"},
+        {"id": "U2", "kind": "normative", "text": "norm item"},
+        {"id": "U3", "kind": "untested", "text": "untested item"},
+        {"id": "U4", "kind": "external", "text": "probed away"},
+    ],
+}
+
+
+def _reviewed_first_run(repo):
+    log: list = []
+    script = {"implement": [impl()], "test": [TEST_OK], "review": [CARRY_REVIEW]}
+    orch, _ = make(repo, script, log=log, size="S", review_small=True)
+    assert asyncio.run(orch.run("do it")).status == "done"
+    prev = orch.run_state
+    prev.state["unverified"][3]["resolved"] = True
+    prev.save()
+    return prev
+
+
+def _open_counts(respond_log):
+    def respond(name, args):
+        if name == "get_board":
+            return ok({"repo": "acme/widgets", "buckets": []})
+        data = sample("record_run-start.output.json")
+        counts = {"external": 0, "normative": 0, "untested": 0}
+        for item in args.get("unverified", []):
+            counts[item["kind"]] += 1
+        respond_log.append(counts)
+        return ok(
+            {**data, "runId": args["runId"], "status": args["status"], "unverifiedOpen": counts}
+        )
+
+    return respond
+
+
+def test_fix_round_run_resends_open_items_from_previous_run(repo):
+    prev = _reviewed_first_run(repo)
+    log: list = []
+    orch, _ = make(repo, S_SCRIPT, log=log, respond=_open_counts([]))
+    out = asyncio.run(orch.run("fix round"))
+    assert out.status == "done"
+    start, end = record_calls(log)
+    assert not INVENTORY_KEYS & start.keys()
+    assert end["runId"] == out.run_id != prev.id
+    assert [(i["id"], i["text"]) for i in end["unverified"]] == [
+        ("U1", "ext item"),
+        ("U2", "norm item"),
+        ("U3", "untested item"),
+    ]
+    last = orch.run_state.state["urutau"]["last"]
+    assert last["unverified_open"] == {"external": 1, "normative": 1, "untested": 1}
+    assert f"carried from {prev.id}: 3" in out.report_text
+
+
+def test_review_in_new_run_drops_and_rewords_carried_items(repo):
+    _reviewed_first_run(repo)
+    second = {
+        **REVIEW_OK,
+        "unverified": [{"id": "U3", "kind": "untested", "text": "untested item, reworded"}],
+    }
+    log: list = []
+    orch, _ = make(
+        repo,
+        {"implement": [impl()], "test": [TEST_OK], "review": [second]},
+        log=log,
+        size="S",
+        review_small=True,
+    )
+    out = asyncio.run(orch.run("fix round"))
+    assert out.status == "done"
+    end = record_calls(log)[-1]
+    assert [(i["id"], i["text"]) for i in end["unverified"]] == [
+        ("U5", "untested item, reworded"),
+    ]
+    assert "withdrawn" not in end
+
+
+def test_carried_items_sent_then_withdrawn_within_new_run(repo):
+    _reviewed_first_run(repo)
+    second = {**REVIEW_OK, "unverified": [{"id": "N", "kind": "untested", "text": "fresh"}]}
+    log: list = []
+    orch, _ = make(
+        repo,
+        {"explore": [EXPLORE], "plan": [PLAN]},
+        log=log,
+        gate=AutoGate(decision="defer"),
+        size="L",
+    )
+    out = asyncio.run(orch.run("fix round"))
+    assert out.status == "awaiting_approval"
+    pause = record_calls(log)[-1]
+    assert [i["id"] for i in pause["unverified"]] == ["U1", "U2", "U3"]
+
+    log2: list = []
+    orch2, _ = make(
+        repo,
+        {"implement": [impl(), impl()], "test": [TEST_OK], "review": [second]},
+        log=log2,
+    )
+    assert asyncio.run(orch2.resume(out.run_id)).status == "done"
+    end = record_calls(log2)[-1]
+    assert [i["text"] for i in end["unverified"]] == ["fresh"]
+    # Urutau cannot withdraw a normative item already sent in this run; carcara
+    # stops listing it, so the next run on the issue does not carry it.
+    assert sorted(end["withdrawn"]) == ["U1", "U3"]
+    state = orch2.run_state.state
+    assert [i["id"] for i in state["unverified"]] == ["U5"]
+
+
+def test_triage_only_run_sends_carried_items(repo):
+    prev = _reviewed_first_run(repo)
+    log: list = []
+    orch, _ = make(repo, {"triage": [TRIAGE_S]}, log=log, triage_only=True)
+    out = asyncio.run(orch.run("triage"))
+    end = record_calls(log)[-1]
+    assert end["status"] == "plan_only"
+    assert [i["id"] for i in end["unverified"]] == ["U1", "U2", "U3"]
+    assert {i["carried_from"] for i in orch.run_state.state["unverified"]} == {prev.id}
+    assert out.run_id != prev.id

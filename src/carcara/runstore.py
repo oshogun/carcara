@@ -474,3 +474,29 @@ class RunStore:
         if not self.root.is_dir():
             return []
         return sorted(p.name for p in self.root.iterdir() if (p / "state.json").is_file())
+
+    def find_previous_issue_run(
+        self, issue: int, repo: str | None, exclude_run_id: str | None = None
+    ) -> Run | None:
+        """The newest other run on ``issue`` in ``repo`` that has an unverified
+        inventory; runs from before the inventory existed are skipped. Never the
+        excluded run or the run holding the active lock; unreadable runs are skipped."""
+        holder = self.active()
+        skip = {exclude_run_id, holder["run_id"] if holder is not None else None}
+        want = (repo or "").lower()
+        for run_id in reversed(self.list_runs()):
+            if run_id in skip:
+                continue
+            try:
+                run = self.load(run_id)
+            except RunStoreError:
+                continue
+            state = run.state
+            if not isinstance(state, dict) or state.get("issue") != issue:
+                continue
+            urutau = state.get("urutau") or {}
+            if not isinstance(urutau, dict) or (urutau.get("repo") or "").lower() != want:
+                continue
+            if "unverified" in state:
+                return run
+        return None

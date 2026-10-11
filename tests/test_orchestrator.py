@@ -3979,3 +3979,98 @@ def test_plan_prompt_mentions_depends_on_only_in_ultra(repo):
     assert "Steps may list depends_on" in plan_req.prompt
     assert plan_req.output_schema == SCHEMAS["plan-ultra"]
     assert "depends_on" in plan_req.output_schema["properties"]["steps"]["items"]["properties"]
+
+
+CARRY_FIRST = _review(
+    unverified=[
+        {"id": "U1", "kind": "external", "text": "ext item"},
+        {"id": "U2", "kind": "normative", "text": "norm item"},
+        {"id": "U3", "kind": "untested", "text": "untested item"},
+    ]
+)
+
+
+def _issue_make(repo, script, **opts):
+    opts.setdefault("followup_timeout_s", TEST_FOLLOWUP_TIMEOUT_S)
+    options = RunOptions(issue=7, repo="acme/widgets", **opts)
+    backend = FakeBackend(script)
+    return Orchestrator(backend, PROFILE, str(repo), RunStore(repo), AutoGate(), options)
+
+
+def _carry_runs(repo, second_review=None):
+    script = {"implement": [impl()], "test": [TEST_OK], "review": [CARRY_FIRST]}
+    orch = _issue_make(repo, script, size="S", review_small=True)
+    assert go(orch).status == "done"
+    script = {"implement": [impl()], "test": [TEST_OK]}
+    if second_review is not None:
+        script["review"] = [second_review]
+    orch2 = _issue_make(repo, script, size="S", review_small=second_review is not None)
+    return orch, orch2
+
+
+def test_carried_normative_item_retired_when_review_omits_it(repo):
+    second = _review(unverified=[{"id": "X", "kind": "untested", "text": "new item"}])
+    first, orch = _carry_runs(repo, second)
+    assert go(orch).status == "done"
+    state = orch.run_state.state
+    assert [(i["id"], i["text"], i.get("carried_from")) for i in state["unverified"]] == [
+        ("U4", "new item", None),
+    ]
+    assert state["unverified_next"] == 5
+    report = (orch.run_state.dir / "report.md").read_text()
+    assert "carried from" not in report
+
+
+def test_carried_normative_item_kept_when_review_lists_it(repo):
+    second = _review(unverified=[{"id": "U2", "kind": "normative", "text": "norm item"}])
+    first, orch = _carry_runs(repo, second)
+    assert go(orch).status == "done"
+    state = orch.run_state.state
+    assert [(i["id"], i.get("carried_from")) for i in state["unverified"]] == [
+        ("U2", first.run_state.id),
+    ]
+    report = (orch.run_state.dir / "report.md").read_text()
+    assert f"carried from {first.run_state.id}: 1" in report
+
+
+def test_carried_items_keep_ids_and_next_id_is_fresh(repo):
+    second = _review(
+        unverified=[
+            {"id": "Z", "kind": "external", "text": "ext item"},
+            {"id": "U9", "kind": "untested", "text": "fresh"},
+        ]
+    )
+    first, orch = _carry_runs(repo, second)
+    assert go(orch).status == "done"
+    state = orch.run_state.state
+    assert [(i["id"], i.get("carried_from")) for i in state["unverified"]] == [
+        ("U1", first.run_state.id),
+        ("U4", None),
+    ]
+    events = [json.loads(e) for e in (orch.run_state.dir / "events.jsonl").read_text().splitlines()]
+    carried = [e for e in events if e["event"] == "unverified_carried"]
+    assert carried == [{**carried[0], "from": first.run_state.id, "count": 3}]
+
+
+def test_carry_skips_resolved_and_resume_does_not_repeat(repo):
+    first, orch = _carry_runs(repo)
+    prev = first.run_state
+    prev.state["unverified"][0]["resolved"] = True
+    prev.save()
+    out = go(orch)
+    assert out.status == "done"
+    state = orch.run_state.state
+    assert [i["id"] for i in state["unverified"]] == ["U2", "U3"]
+    orch.run_state.set_status("needs_human", "x")
+    orch3, _, _ = make(repo, {"implement": [impl()], "test": [TEST_OK]}, size="S")
+    asyncio.run(orch3.resume(out.run_id))
+    assert [i["id"] for i in orch3.run_state.state["unverified"]] == ["U2", "U3"]
+    events = (orch3.run_state.dir / "events.jsonl").read_text()
+    assert events.count("unverified_carried") == 1
+
+
+def test_no_previous_run_no_carry(repo):
+    orch = _issue_make(repo, {"implement": [impl()], "test": [TEST_OK]}, size="S")
+    assert go(orch).status == "done"
+    assert "unverified" not in orch.run_state.state
+    assert "unverified_carried" not in (orch.run_state.dir / "events.jsonl").read_text()
