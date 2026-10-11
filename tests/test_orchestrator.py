@@ -300,6 +300,90 @@ def test_plan_only(repo):
     assert gate.plans == []
 
 
+def test_triage_only_runs_single_stage(repo):
+    orch, backend, _ = make(repo, {"triage": [TRIAGE_S]}, triage_only=True)
+    out = go(orch)
+    assert (out.status, out.exit_code) == ("triaged", 0)
+    assert seq(backend) == [("triage", None)]
+    state = orch.run_state.state
+    assert (state["triage_range"], state["uncertainty_kind"]) == ("S", "none")
+    assert state["size"] == "S" and state["triage_only"] is True
+
+
+def _porcelain(repo):
+    return subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+
+def test_triage_only_ignores_dirty_tree(repo):
+    (repo / "a.py").write_text("dirty\n")
+    (repo / "new.py").write_text("y\n")
+    before = _porcelain(repo)
+    orch, _, _ = make(repo, {"triage": [TRIAGE_S]}, triage_only=True)
+    out = go(orch)
+    assert out.status == "triaged"
+    assert _porcelain(repo) == before
+    assert (repo / "a.py").read_text() == "dirty\n" and (repo / "new.py").read_text() == "y\n"
+    refs = subprocess.run(
+        ["git", "for-each-ref", "refs/carcara/"], cwd=repo, capture_output=True, text=True
+    ).stdout
+    assert refs == ""
+    assert "base_pinned" not in (orch.run_state.dir / "events.jsonl").read_text()
+
+
+def test_triage_only_releases_lock(repo):
+    orch, _, _ = make(repo, {"triage": [TRIAGE_S]}, triage_only=True)
+    assert go(orch).status == "triaged"
+    assert orch.store.active() is None and not orch.store.lock_path.exists()
+    orch2, _, _ = make(repo, {"triage": [TRIAGE_S]}, triage_only=True)
+    assert go(orch2).status == "triaged"
+
+
+@pytest.mark.parametrize("opts", [{"size": "S"}, {"plan_only": True}])
+def test_triage_only_rejects_size_or_plan_only(repo, opts):
+    orch, backend, _ = make(repo, {"triage": [TRIAGE_S]}, triage_only=True, **opts)
+    with pytest.raises(OrchestratorError, match="--triage-only"):
+        go(orch)
+    assert backend.requests == []
+
+
+def test_triage_only_triage_failure_is_failed(repo):
+    orch, _, _ = make(repo, {"triage": []}, triage_only=True)
+    out = go(orch)
+    assert (out.status, out.exit_code) == ("failed", 1)
+    assert orch.store.active() is None
+
+
+def test_resume_refuses_triaged_run(repo):
+    orch, _, _ = make(repo, {"triage": [TRIAGE_S]}, triage_only=True)
+    out = go(orch)
+    orch2, backend2, _ = make(repo, {"implement": [impl()], "test": [TEST_OK]})
+    with pytest.raises(OrchestratorError, match="cannot be resumed"):
+        asyncio.run(orch2.resume(out.run_id))
+    assert backend2.requests == []
+
+
+@pytest.mark.parametrize("status", ["failed", "running"])
+def test_resume_refuses_unfinished_triage_only_run(repo, status):
+    # A triage-only run that failed or crashed mid-run never pinned a base or checked the tree.
+    orch, _, _ = make(repo, {"triage": []}, triage_only=True)
+    out = go(orch)
+    assert out.status == "failed"
+    if status == "running":
+        orch.run_state.set_status("running")
+    orch2, backend2, _ = make(
+        repo, {"triage": [TRIAGE_S], "implement": [impl()], "test": [TEST_OK]}
+    )
+    with pytest.raises(OrchestratorError, match="cannot be resumed"):
+        asyncio.run(orch2.resume(out.run_id))
+    assert backend2.requests == []
+
+
 def test_fix_loop_success(repo):
     orch, backend, _ = make(
         repo,
@@ -1086,7 +1170,11 @@ def review_prompt(backend):
     return next(r.prompt for r in backend.requests if r.stage == "review")
 
 
-def test_dirty_repo_snapshot_base_shows_only_carcara_edits(repo):
+def test_dirty_repo_snapshot_base_shows_only_carcara_edits(repo, tmp_path, monkeypatch):
+    # Private temp dir: concurrent carcara runs sharing /tmp must not leak in.
+    private_tmp = tmp_path / "tmp"
+    private_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(private_tmp))
     (repo / ".env").write_text("TRACKED_SECRET=1\n")
     git(repo, "add", ".env")
     git(repo, "commit", "-q", "-m", "env")

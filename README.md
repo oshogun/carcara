@@ -290,6 +290,7 @@ and `extent` values.
 | `--use-api-key` | let the CLI use `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` (pay-per-token API billing) instead of your subscription login |
 | `--dry-run` | show stages, models and tools without calling Claude |
 | `--plan-only` | stop after the plan |
+| `--triage-only` | run only triage and record its size, range and uncertainty kind (about one triage stage of cost, versus explore + plan for `--plan-only`); needs no clean tree and changes no code; Urutau records it as `plan_only` with the triage rationale; cannot be combined with `--size`, `--plan-only` or `--resume` |
 | `--resume RUN_ID` / `--list` | continue a stored run / list stored runs |
 | `--reject` | with `--resume`: reject the plan awaiting approval |
 | `--feedback TEXT` | with `--resume`: re-plan with this feedback, or guide a needs_human retry; `-` reads stdin |
@@ -328,7 +329,7 @@ in the state.
 
 | Exit code | Meaning |
 |---|---|
-| 0 | done (or plan-only) |
+| 0 | done (or plan-only / triaged) |
 | 1 | error |
 | 3 | awaiting plan approval |
 | 4 | needs human (e.g. tests still failing after the fix loop) |

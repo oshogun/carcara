@@ -443,6 +443,8 @@ def filter_areas(areas: Any) -> list[str]:
 
 
 def urutau_status(run_status: str, state: Mapping[str, Any]) -> str:
+    if run_status == "triaged":
+        return "plan_only"  # record_run's status enum is frozen
     return "rejected" if run_status == "failed" and state.get("plan_rejected") else run_status
 
 

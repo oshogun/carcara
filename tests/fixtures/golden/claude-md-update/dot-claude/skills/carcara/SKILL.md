@@ -38,7 +38,12 @@ heredoc (never in shell arguments):
 When the request is a GitHub issue ("work on issue 42"), use
 `carcara run --allow-dirty --issue 42` instead: it takes the task from the
 issue (a heredoc, if given, is appended as extra instructions) and reports
-the run to Urutau when `URUTAU_MCP_TOKEN` is set.
+the run to Urutau when `URUTAU_MCP_TOKEN` is set. To only size an issue
+("triage issue 42", get its size range onto the card), use
+`carcara run --issue 42 --triage-only`: it runs just the triage stage (about
+$0.07 instead of $0.30-0.60 for `--plan-only`), needs no clean tree, changes
+no code, and Urutau shows it as plan_only with the triage rationale. It cannot
+be combined with `--size` or `--plan-only`.
 
 Never add `--yes`, `--accept-failures` or `--use-api-key` yourself. The first
 stderr line is `carcara: run <id> started (profile <name>)`; remember the id.
@@ -49,7 +54,8 @@ when it finishes.
 Take the exit code of the background `carcara run`, read
 `carcara status <id> --json` (its `exit_code` / `status` agree), and branch:
 - **0 done** (or plan_only): summarise the report - files changed, tests,
-  review verdict, estimated cost - and mention `carcara diff <id>`.
+  review verdict, estimated cost - and mention `carcara diff <id>`. For
+  **triaged** (`--triage-only`), report the size, range and uncertainty kind.
 - **3 awaiting_approval**: show the output of `carcara status <id> --plan`, then
   ask the user (AskUserQuestion): approve / request changes / reject. The
   plan's `Gate:` line says why it stopped. A low-verifiability gate after

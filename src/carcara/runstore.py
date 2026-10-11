@@ -25,6 +25,7 @@ STATUSES = (
     "failed",
     "done",
     "plan_only",
+    "triaged",
 )
 
 

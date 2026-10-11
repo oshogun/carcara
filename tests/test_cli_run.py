@@ -13,6 +13,7 @@ from carcara.profiles import load_profile
 from carcara.roles import get_role, model_for
 from carcara.runstore import RunStore
 
+TRIAGE = {"size": "M", "rationale": "multi", "triageRange": "S-M", "uncertaintyKind": "untested"}
 EXPLORE = {"summary": "found", "findings": [{"path": "a.py", "line": 1, "fact": "x"}]}
 PLAN = {
     "goal": "do the thing",
@@ -1098,6 +1099,57 @@ def test_issue_flag_errors(repo, fake, capsys):
     assert "--issue cannot be combined with --resume" in capsys.readouterr().err
     with pytest.raises(SystemExit):
         run(repo, "--issue", "0")
+
+
+def test_dry_run_triage_only_single_row(repo, monkeypatch, no_token, capsys):
+    monkeypatch.setattr(cli, "_gh_issue", lambda *a: pytest.fail("gh called in dry-run"))
+    args = ["--dry-run", "--triage-only", "--issue", "5", "--repo", "octo/repo"]
+    assert run(repo, *args) == 0
+    out = capsys.readouterr().out
+    assert "issue #5 (octo/repo); Urutau reporting: off" in out
+    rows = [ln.split()[0] for ln in out.splitlines() if ln.startswith("  ")]
+    assert rows == ["stage", "triage"]
+    for word in ("implement", "explore", "gate", "size S:"):
+        assert word not in out
+    assert "triage-only: stops after triage" in out
+    assert not (repo / ".carcara").exists()
+
+
+@pytest.mark.parametrize(
+    "extra,message",
+    [
+        (["--size", "S"], "--size skips triage"),
+        (["--plan-only"], "--plan-only"),
+        (["--resume", "r1"], "--resume"),
+    ],
+)
+@pytest.mark.parametrize("dry", [False, True])
+def test_triage_only_conflicts(repo, capsys, extra, message, dry):
+    args = ["x", "--triage-only", *extra, *(["--dry-run"] if dry else [])]
+    if "--resume" in extra:
+        args.remove("x")
+    assert run(repo, *args) == 1
+    err = capsys.readouterr().err
+    assert "--triage-only" in err and message in err
+
+
+def test_triage_only_passes_option(repo, fake, monkeypatch):
+    from carcara.orchestrator import Orchestrator
+
+    seen = []
+    real_init = Orchestrator.__init__
+
+    def spy(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        seen.append(self.options.triage_only)
+
+    monkeypatch.setattr(Orchestrator, "__init__", spy)
+    (repo / "dirty.txt").write_text("untracked\n")
+    fake({"triage": [TRIAGE]})
+    assert run(repo, "tiny", "--triage-only") == 0
+    assert seen == [True]
+    (run_id,) = RunStore(repo).list_runs()
+    assert _state(repo, run_id)["status"] == "triaged"
 
 
 def test_dry_run_issue_shows_urutau_state(repo, monkeypatch, no_token, capsys):

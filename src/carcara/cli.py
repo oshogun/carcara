@@ -96,6 +96,11 @@ def _add_run_parser(sub: Any) -> None:
     run.add_argument("--approve-plan", action="store_true", help="gate M-sized plans too")
     run.add_argument("--plan-only", action="store_true", help="stop after the plan")
     run.add_argument(
+        "--triage-only",
+        action="store_true",
+        help="run only triage and record its size/range; no code changes",
+    )
+    run.add_argument(
         "--dry-run", action="store_true", help="print the stage table without calling the backend"
     )
     run.add_argument(
@@ -366,6 +371,14 @@ def _dry_run(profile: Any, ns: argparse.Namespace, cwd: str, origin: str) -> str
             repo = "? (pass --repo owner/name)"
         on = "on" if _urutau_config(ns) is not None else "off"
         out.append(f"issue #{ns.issue} ({repo}); Urutau reporting: {on}")
+    if ns.triage_only:
+        req = build_request("triage", None, profile, "", cwd)
+        tools = ",".join(req.allowed_tools) or "-"
+        out.append(f"\n  {'stage':<10} {'role':<12} {'model':<24} {'mode':<12} tools")
+        mode = req.permission_mode
+        out.append(f"  {'triage':<10} {'main':<12} {req.model:<24} {mode:<12} {tools}")
+        out.append("\n(triage-only: stops after triage; Urutau sees plan_only)")
+        return "\n".join(out) + "\n"
     for size in (ns.size,) if ns.size else SIZES:
         out.append(f"\nsize {size}:")
         rows: list[tuple[str, str | None]] = [] if ns.size else [("triage", None)]
@@ -795,6 +808,24 @@ def _run_main(ns: argparse.Namespace) -> int:
     if os.environ.get(STAGE_ENV_VAR):
         _err("nested carcara run inside a carcara stage is not allowed")
         return 1
+    if ns.triage_only:
+        if ns.size:
+            _err("--triage-only and --size cannot be combined: --size skips triage")
+            return 1
+        clash = [
+            flag
+            for flag, on in (
+                ("--plan-only", ns.plan_only),
+                ("--resume", ns.resume),
+                ("--reject", ns.reject),
+                ("--feedback", ns.feedback is not None),
+                ("--accept-failures", ns.accept_failures),
+            )
+            if on
+        ]
+        if clash:
+            _err(f"--triage-only cannot be combined with {', '.join(clash)}")
+            return 1
     flag_error = _check_resume_flags(ns)
     if flag_error:
         _err(flag_error)
@@ -863,6 +894,7 @@ def _run_main(ns: argparse.Namespace) -> int:
             ultra=ns.ultra,
             approve_plan=ns.approve_plan,
             plan_only=ns.plan_only,
+            triage_only=ns.triage_only,
             max_budget_usd=ns.max_budget_usd,
             allow_dirty=ns.allow_dirty,
             project_settings=ns.project_settings,

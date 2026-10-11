@@ -74,6 +74,7 @@ _RUN_OPTS: dict[str, str | None] = {
     "--allow-dirty": None,
     "--reject": None,
     "--plan-only": None,
+    "--triage-only": None,
     "--dry-run": None,
     "--list": None,
     "--review": None,

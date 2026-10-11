@@ -269,6 +269,7 @@ SKILL_TASK = "carcara run --allow-dirty - <<'CARCARA_TASK'\nfix the --yes bug\nC
         "carcara run --resume 20260102-000000-bbbb --reject",
         "carcara run --resume 20260102-000000-bbbb",
         'carcara run --size M --plan-only -p quality - <<"EOF"\nx\nEOF',
+        "carcara run --issue 5 --triage-only",
     ],
 )
 def test_bash_safe_carcara_forms_allowed(project, command):

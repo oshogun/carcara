@@ -74,6 +74,7 @@ from carcara.urutau import (
 EXIT_CODES = {
     "done": 0,
     "plan_only": 0,
+    "triaged": 0,
     "failed": 1,
     "awaiting_approval": 3,
     "needs_human": 4,
@@ -103,7 +104,7 @@ MAX_EXTENT_AREAS = 10
 URUTAU_HEARTBEAT_SECONDS = 600.0
 MAX_FINDINGS_CHARS = 4000
 # record_run statuses that end the Urutau run; a resume after one needs a new runId.
-_URUTAU_TERMINAL = ("done", "failed", "rejected", "plan_only")
+_URUTAU_TERMINAL = ("done", "failed", "rejected", "plan_only", "triaged")
 _URUTAU_RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _COMMIT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
@@ -254,6 +255,8 @@ class RunOptions:
     review_small: bool = False
     approve_plan: bool = False
     plan_only: bool = False
+    # Run only triage (no code changes): skips the dirty-tree check and base pin.
+    triage_only: bool = False
     max_budget_usd: float | None = None
     allow_dirty: bool = False
     project_settings: bool = False
@@ -746,8 +749,15 @@ def _check_resume_flags(
     feedback: str | None,
     accept_failures: bool,
     gate: dict[str, Any] | None = None,
+    triage_only: bool = False,
 ) -> None:
     """Validate --reject/--feedback/--accept-failures against the run status."""
+    if triage_only or status == "triaged":
+        # No base was pinned and the tree was not checked: never continue into code
+        # changes, whether the triage-only run finished, failed or crashed mid-run.
+        raise OrchestratorError(
+            "a --triage-only run cannot be resumed; start a new run for the issue"
+        )
     if feedback and status == "awaiting_approval" and (gate or {}).get("stage") == "post-implement":
         raise OrchestratorError(
             "--feedback cannot revise implemented changes awaiting approval; use --yes or --reject"
@@ -814,7 +824,10 @@ class Orchestrator:
             )
         base_sha = proc.stdout.strip()
         require_toplevel(self.cwd)
-        if not self.options.allow_dirty:
+        triage_only = self.options.triage_only
+        if triage_only and (self.options.size or self.options.plan_only):
+            raise OrchestratorError("--triage-only cannot be combined with --size or --plan-only")
+        if not self.options.allow_dirty and not triage_only:
             dirty = _dirty_entries(self.cwd)
             if dirty:
                 raise OrchestratorError(
@@ -846,16 +859,19 @@ class Orchestrator:
             run.state["ultra"] = self.options.ultra
             # Snapshot: a resume uses this, not a re-read of .carcara/config.json.
             run.state["project_config"] = self.config.to_dict()
+            if triage_only:
+                run.state["triage_only"] = True
             self._record_issue(run)
             if self.urutau is not None:
                 stopped = await self._urutau_start(run)
                 if stopped is not None:
                     return stopped
-            try:
-                self._pin_base(run, snapshot=self.options.allow_dirty)
-            except OrchestratorError as exc:
-                run.set_status("failed", str(exc))
-                raise
+            if not triage_only:  # triage changes no code: no diff base needed
+                try:
+                    self._pin_base(run, snapshot=self.options.allow_dirty)
+                except OrchestratorError as exc:
+                    run.set_status("failed", str(exc))
+                    raise
             return await self._drive(run)
         finally:
             self.store.release_lock(run.id)
@@ -871,7 +887,14 @@ class Orchestrator:
         require_toplevel(self.cwd)
         run = self._load(run_id)
         status = run.state["status"]
-        _check_resume_flags(status, reject, feedback, accept_failures, run.state.get("gate"))
+        _check_resume_flags(
+            status,
+            reject,
+            feedback,
+            accept_failures,
+            run.state.get("gate"),
+            bool(run.state.get("triage_only")),
+        )
         if status == "done":
             report = run.read_report() or self._report(run)
             return RunOutcome("done", 0, report, run.id)
@@ -881,7 +904,14 @@ class Orchestrator:
             run = self._load(run_id)
             self._restore_config(run)
             status = run.state["status"]
-            _check_resume_flags(status, reject, feedback, accept_failures, run.state.get("gate"))
+            _check_resume_flags(
+                status,
+                reject,
+                feedback,
+                accept_failures,
+                run.state.get("gate"),
+                bool(run.state.get("triage_only")),
+            )
             if status == "done":
                 report = run.read_report() or self._report(run)
                 return RunOutcome("done", 0, report, run.id)
@@ -1163,7 +1193,12 @@ class Orchestrator:
         if shas and all(isinstance(s, str) and _COMMIT_SHA_RE.match(s) for s in shas):
             payload["mergeShas"] = list(shas)[:20]
         findings: list[str] = []
-        if status == "plan_only":
+        if status == "plan_only" and state.get("status") == "triaged":
+            triage = next(
+                (e["output"] for e in reversed(state["stages"]) if e["stage"] == "triage"), None
+            )
+            findings.extend(_triage_findings(state, triage or {}))
+        elif status == "plan_only":
             plan = next(
                 (e["output"] for e in reversed(state["stages"]) if e["stage"] == "plan"), None
             )
@@ -1585,6 +1620,8 @@ class Orchestrator:
         if run.state.get("size") != size:
             run.state["size"] = size
             run.save()
+        if self.options.triage_only:
+            return "triaged", None
 
         implements: list[dict[str, Any]] = []
         review_on = True
@@ -2418,6 +2455,17 @@ def _plan_findings(plan: dict[str, Any]) -> list[str]:
         lines.append("Acceptance:")
         lines.extend(f"- {item}" for item in acceptance)
     return lines
+
+
+def _triage_findings(state: dict[str, Any], triage: dict[str, Any]) -> list[str]:
+    """triaged findings: size, range and uncertainty, then the triage rationale."""
+    header = (
+        f"Triage: size {triage.get('size') or state.get('size') or '?'}, "
+        f"range {state.get('triage_range') or '?'}, "
+        f"uncertainty {state.get('uncertainty_kind') or '?'}."
+    )
+    rationale = str(triage.get("rationale") or "").strip()
+    return [f"{header} {rationale}" if rationale else header]
 
 
 async def _in_daemon_thread(fn: Callable[[], Any]) -> Any:

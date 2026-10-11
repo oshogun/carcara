@@ -23,7 +23,7 @@ from test_orchestrator import (
 )
 
 from carcara.backend import FakeBackend
-from carcara.orchestrator import AutoGate, Orchestrator, RunOptions
+from carcara.orchestrator import MAX_FINDINGS_CHARS, AutoGate, Orchestrator, RunOptions
 from carcara.runstore import RunStore
 from carcara.urutau import ToolReply, UrutauClient, UrutauConfig, UrutauError
 
@@ -234,6 +234,72 @@ def test_plan_only_sends_plan_goal(repo):
     assert asyncio.run(orch.run("do it")).status == "plan_only"
     last = record_calls(log)[-1]
     assert last["status"] == "plan_only" and last["findings"].startswith("Plan: g")
+
+
+def terminal_respond(name, args):
+    if name == "record_run" and args["status"] != "running":
+        return ok(sample("record_run-done-with-probe.output.json"))
+    return default_respond(name, args)
+
+
+def test_triage_only_claims_then_reports_plan_only(repo):
+    log: list = []
+    orch, backend = make(
+        repo, {"triage": [TRIAGE_S]}, log=log, respond=terminal_respond, triage_only=True
+    )
+    out = asyncio.run(orch.run("do it"))
+    assert (out.status, out.exit_code) == ("triaged", 0)
+    assert len(backend.requests) == 1
+    calls = record_calls(log)
+    assert [c["status"] for c in calls] == ["running", "plan_only"]
+    last = calls[-1]
+    assert set(last) <= ALLOWED
+    assert (last["triageRange"], last["uncertaintyKind"]) == ("S", "none")
+    assert last["findings"] == "Triage: size S, range S, uncertainty none. small"
+    urutau = orch.run_state.state["urutau"]["last"]
+    assert urutau["status"] == "plan_only" and urutau["claim_held"] is False
+
+
+def test_triage_only_findings_truncated_and_never_empty(repo):
+    log: list = []
+    long = {**TRIAGE_S, "rationale": "x" * 9000}
+    orch, _ = make(repo, {"triage": [long]}, log=log, triage_only=True)
+    assert asyncio.run(orch.run("do it")).status == "triaged"
+    findings = record_calls(log)[-1]["findings"]
+    assert findings.startswith("Triage:") and len(findings) == MAX_FINDINGS_CHARS
+
+    log2: list = []
+    bare = {**TRIAGE_S, "rationale": "  "}
+    orch2, _ = make(repo, {"triage": [bare]}, log=log2, triage_only=True)
+    assert asyncio.run(orch2.run("again")).status == "triaged"
+    assert record_calls(log2)[-1]["findings"] == "Triage: size S, range S, uncertainty none."
+
+
+def test_triage_only_claim_conflict_runs_no_stage(repo):
+    log: list = []
+
+    def respond(name, args):
+        if name == "record_run":
+            return err(sample("record_run-claimed-by-other-run.error.json"))
+        return default_respond(name, args)
+
+    orch, backend = make(repo, {"triage": [TRIAGE_S]}, log=log, respond=respond, triage_only=True)
+    out = asyncio.run(orch.run("do it"))
+    assert (out.status, out.exit_code) == ("failed", 1)
+    assert backend.requests == []
+
+
+def test_run_after_triaged_run_gets_new_run_id(repo):
+    log: list = []
+    orch, _ = make(repo, {"triage": [TRIAGE_S]}, log=log, triage_only=True)
+    first = asyncio.run(orch.run("do it"))
+    log2: list = []
+    orch2, _ = make(repo, S_SCRIPT, log=log2)
+    second = asyncio.run(orch2.run("do it"))
+    assert second.status == "done"
+    assert {c["runId"] for c in record_calls(log)} == {first.run_id}
+    assert {c["runId"] for c in record_calls(log2)} == {second.run_id}
+    assert first.run_id != second.run_id
 
 
 def test_pause_and_resume(repo):
