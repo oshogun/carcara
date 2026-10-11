@@ -19,6 +19,9 @@
   `ruby -i` edits into `.git`, `.carcara`, `.claude` or outside the repo, and
   interpreter `-c`/`-e`/`--eval`/`eval` code that names those directories
   (#19). The gaps that remain are listed in README "Known risks".
+- M/L runs whose diff touches a gated low-verifiability path now also get a
+  review (and an `unverified` inventory) when the fix loop ends with failing
+  tests or the run is finished with `--accept-failures`, as S runs do (#41).
 
 ### Added
 - `carcara run --ultra` fans out the read-only roles. A `scope` stage picks

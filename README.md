@@ -242,7 +242,10 @@ prompt starts with `Gate: <reason>`, and `state.json` records
 When the verifiability gate fires, review runs whatever the size (the split
 review under `--ultra`), so the change gets an `unverified` inventory. The
 report's `review:` line then ends with `(forced: verifiability gate)`, and
-`state.json` records `review_reason`. Review is still skipped when tests fail.
+`state.json` records `review_reason`. While the current diff touches a gated
+path, review runs once even when the fix loop ends with failing tests (or before
+`--accept-failures` finishes the run), on S, M and L runs alike; its findings
+are informational.
 A gate from an earlier fix round of the same run keeps forcing review.
 
 On a TTY you are prompted; `--yes` auto-approves; without a TTY the run stops with

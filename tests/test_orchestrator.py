@@ -1769,6 +1769,79 @@ def test_accept_failures_review_stage_failure_stops_run(repo):
     assert not RunStore(repo).load(run_id).state.get("accepted_failures")
 
 
+@pytest.mark.parametrize("size", ["M", "L"])
+def test_accept_failures_medium_gated_path_has_review_and_inventory(repo, size):
+    from carcara.urutau import build_inventory
+
+    review = {**REVIEW_OK, "unverified": [UNVERIFIED_ITEM]}
+    plan = {**PLAN, "steps": [{"id": "s1", "files": ["src/carcara/policy.py"], "change": "x"}]}
+    script = {
+        "explore": [EXPLORE],
+        "plan": [plan],
+        "implement": [impl("src/carcara/policy.py")] * 3,
+        "test": [TEST_FAIL] * 3,
+        "review": [review],
+    }
+    orch, backend, _ = make(repo, script, size=size)
+    first = go(orch)
+    assert first.status == "needs_human"
+    assert orch.run_state.state["review_reason"] is None
+    assert seq(backend)[-1] == ("review", "reviewer")
+    assert keys(orch)[-1] == "fix-2:review"
+
+    orch2, backend2, _ = make(repo, {})
+    out = asyncio.run(orch2.resume(first.run_id, accept_failures=True))
+    assert (out.status, out.exit_code) == ("done", 0)
+    assert backend2.requests == []
+    state = orch2.run_state.state
+    assert [e["key"] for e in state["stages"] if e["stage"] == "review"] == ["fix-2:review"]
+    assert [i["text"] for i in build_inventory(state)[0]] == ["policy denies sed -i"]
+
+
+def test_accept_failures_medium_runs_missing_gated_review(repo):
+    review = {**REVIEW_OK, "unverified": [UNVERIFIED_ITEM]}
+    plan = {**PLAN, "steps": [{"id": "s1", "files": ["src/carcara/policy.py"], "change": "x"}]}
+    script = {
+        "explore": [EXPLORE],
+        "plan": [plan],
+        "implement": [impl("src/carcara/policy.py")] * 3,
+        "test": [TEST_FAIL] * 3,
+        "review": [review],
+    }
+    orch, _, _ = make(repo, script, size="M")
+    run_id = go(orch).run_id
+    run = RunStore(repo).load(run_id)
+    run.state["stages"] = [e for e in run.state["stages"] if e["stage"] != "review"]
+    for key in ("unverified", "unverified_reviews", "unverified_next"):
+        run.state.pop(key, None)
+    run.save()
+
+    orch2, backend2, _ = make(repo, {"review": [review]})
+    out = asyncio.run(orch2.resume(run_id, accept_failures=True))
+    assert (out.status, out.exit_code) == ("done", 0)
+    assert seq(backend2) == [("review", "reviewer")]
+    assert keys(orch2)[-1] == "accept-0:review"
+    assert [i["id"] for i in orch2.run_state.state["unverified"]] == ["U1"]
+
+
+def test_medium_ungated_tests_fail_skips_review(repo):
+    script = {
+        "explore": [EXPLORE],
+        "plan": [PLAN],
+        "implement": [impl()] * 3,
+        "test": [TEST_FAIL] * 3,
+    }
+    orch, backend, _ = make(repo, script, size="M")
+    first = go(orch)
+    assert first.status == "needs_human"
+    assert "review" not in [s for s, _ in seq(backend)]
+
+    orch2, backend2, _ = make(repo, {})
+    out = asyncio.run(orch2.resume(first.run_id, accept_failures=True))
+    assert (out.status, out.exit_code) == ("done", 0)
+    assert backend2.requests == []
+
+
 def test_plan_gate_replaces_stale_gate_plan(repo):
     orch, _, _ = make(
         repo,

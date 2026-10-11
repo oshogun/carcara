@@ -1882,6 +1882,18 @@ class Orchestrator:
             run.save()
         return True
 
+    def _gate_fired_for_diff(self, run: Run) -> bool:
+        """True when the current diff touches a gated path that a gate covered,
+        whatever the size (review_reason is set only when review was forced,
+        i.e. on S runs). A size/flag/revision plan gate also covers the plan's
+        gated paths, recorded in gate_approved_paths."""
+        flagged = match_paths(self._changed_paths(run), self.config.verifiability_paths, self.cwd)
+        if not flagged:
+            return False
+        if (run.state.get("gate") or {}).get("trigger") == "verifiability":
+            return True
+        return bool(set(flagged) & set(run.state.get("gate_approved_paths", ())))
+
     def _inventory_prompt(self, run: Run) -> str:
         """Reviewer instructions for the `unverified` assumptions inventory."""
         parts = [_UNVERIFIED_INSTRUCTIONS]
@@ -2131,9 +2143,7 @@ class Orchestrator:
     async def _accept_review(self, run: Run) -> None:
         """Before --accept-failures finishes a run: the forced review, if the
         current verify round has none yet and the diff still touches a gated path."""
-        if not run.state.get("review_reason"):
-            return
-        if not match_paths(self._changed_paths(run), self.config.verifiability_paths, self.cwd):
+        if not self._gate_fired_for_diff(run):
             return
         rnd = int(run.state.get("verify_round", 0))
         prefix = f"retry-{rnd}:"
@@ -2233,7 +2243,7 @@ class Orchestrator:
         if not failing:
             return None, fixes
         await recheck_gate()
-        if review is None and review_on and run.state.get("review_reason"):
+        if review is None and review_on and self._gate_fired_for_diff(run):
             # A gated change still gets reviewed (and its unverified inventory
             # recorded) even though tests fail; the findings are informational.
             if run.stage(f"{last_prefix}review") is None:
