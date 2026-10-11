@@ -44,5 +44,6 @@ run`); 0.3.0 regenerated the success cases from the Python installer (new
 `CLAUDE.md`, S-size delegation in `sdlc.md`, new final hint). The error cases
 and `-l` output are unchanged 0.1.0 values. The uninstall work (#9) added
 the `.carcara/install.json` manifest line and hash to the success cases. #39
-updated the `test-runner.md` hashes (rules on how to run commands). Regenerate it with a script that
+updated the `test-runner.md` hashes (rules on how to run commands), and #40
+the `reviewer.md` hashes (major findings need a reason). Regenerate it with a script that
 replays each scenario, and review the diff before committing.

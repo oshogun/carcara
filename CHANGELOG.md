@@ -22,6 +22,12 @@
 - M/L runs whose diff touches a gated low-verifiability path now also get a
   review (and an `unverified` inventory) when the fix loop ends with failing
   tests or the run is finished with `--accept-failures`, as S runs do (#41).
+- `--ultra`: a dimension or merged review finding rated major or blocker now
+  needs a `reason` (correctness, security, goal_defeating or
+  low_verifiability), as refuter raises do since #34 (#40). Without one it is
+  capped at minor and listed as an `untested` unverified item instead of
+  starting a fix round. A missing test for the behaviour the task asks for
+  stays serious as `goal_defeating`. The reviewer agent template says so too.
 
 ### Added
 - `carcara run --ultra` fans out the read-only roles. A `scope` stage picks

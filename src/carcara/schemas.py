@@ -58,6 +58,10 @@ _UNVERIFIED: dict[str, Any] = {
     ),
 }
 
+# Why a finding is major or higher (review findings and refuter raises alike);
+# "none" when it is not or no floor reason applies (such a rating is capped at minor).
+FINDING_REASONS = ("none", "goal_defeating", "low_verifiability", "security", "correctness")
+
 MAX_SCOPE_AREAS = 4
 # Ultra: at most this many merged review findings are refuted per round.
 MAX_REFUTERS = 6
@@ -79,8 +83,9 @@ _REVIEW: dict[str, Any] = _obj(
                     "line": _INT,
                     "issue": _STR,
                     "fix": _STR,
+                    "reason": {"type": "string", "enum": list(FINDING_REASONS)},
                 },
-                optional=("line",),
+                optional=("line", "reason"),
             )
         ),
         "unverified": _UNVERIFIED,
@@ -93,12 +98,8 @@ _REFUTE: dict[str, Any] = _obj(
         "severity": {"type": "string", "enum": ["blocker", "major", "minor", "nit"]},
         "goal_defeating": _BOOL,
         "low_verifiability": _BOOL,
-        # Why the re-rated severity is major or higher; "none" when it is not or no
-        # floor reason applies (such a raise is capped at minor).
-        "raise_reason": {
-            "type": "string",
-            "enum": ["none", "goal_defeating", "low_verifiability", "security", "correctness"],
-        },
+        # Why the re-rated severity is major or higher (see FINDING_REASONS).
+        "raise_reason": {"type": "string", "enum": list(FINDING_REASONS)},
         "rationale": _STR,
         # Diff lines showing the finding is wrong; empty means no citation.
         "evidence": _arr(

@@ -12,6 +12,8 @@ Rules:
   surrounding code only where needed to judge correctness.
 - Report only real problems: bugs, security vulnerabilities, data loss,
   broken edge cases, missing tests for new behaviour, plan/acceptance gaps.
+- A major or blocker needs a correctness, security or goal-defeating reason;
+  a missing test for an edge case is minor, or an `untested` item.
 - Ignore style, formatting and personal preference.
 - Do not edit files.
 - Inventory what the change assumes but no test verifies, as unverified

@@ -30,7 +30,7 @@ from carcara.profiles import load_profile
 from carcara.project_config import DEFAULT_VERIFIABILITY_PATHS, parse_project_config
 from carcara.roles import model_for
 from carcara.runstore import RunStore
-from carcara.schemas import SCHEMAS
+from carcara.schemas import MAX_UNVERIFIED, MAX_UNVERIFIED_TEXT, SCHEMAS
 
 PROFILE = load_profile("balanced")
 
@@ -2798,8 +2798,19 @@ def _refute(
     }
 
 
-def _finding(severity, issue="bug"):
-    return {"severity": severity, "path": "a.py", "issue": issue, "fix": "fix it"}
+def _finding(severity, issue="bug", reason=None):
+    # By default a major-or-higher finding names a floor reason so it is not capped.
+    finding = {"severity": severity, "path": "a.py", "issue": issue, "fix": "fix it"}
+    if reason is None and severity in ("major", "blocker"):
+        reason = "correctness"
+    if reason is not None:
+        finding["reason"] = reason
+    return finding
+
+
+def _raised(issue="bug"):
+    # A minor finding a refuter raised to major: it keeps the merge's (absent) reason.
+    return {**_finding("minor", issue), "severity": "major"}
 
 
 def test_ultra_review_splits_into_dimensions_and_merges(repo):
@@ -2954,7 +2965,7 @@ def test_ultra_refute_escalates_goal_defeating_minor_and_starts_fix_round(repo):
     out = go(orch)
     assert out.status == "done"
     entry = orch.run_state.stage("review")
-    assert entry["output"]["findings"] == [_finding("major", BYPASS)]
+    assert entry["output"]["findings"] == [_raised(BYPASS)]
     assert entry["output"]["verdict"] == "request_changes"
     assert entry["original_output"] == review
     assert [e["stage"] for e in orch.run_state.state["stages"]].count("review") == 2
@@ -3033,6 +3044,178 @@ def test_refute_rules_cap_test_gaps():
 
     assert "raise_reason" in _REFUTE_RULES
     assert "missing or weak test is a test gap, at most minor" in _REFUTE_RULES
+
+
+GAP = "no test for an empty input"
+
+
+def test_ultra_untested_major_without_reason_is_capped_to_untested(repo):
+    # Issue #40: a reasonless missing-test major is listed untested, not fixed.
+    from carcara.orchestrator import _extent
+
+    gap = {**_finding("minor", GAP), "severity": "major"}  # no reason
+    review = {**REVIEW_MAJOR, "findings": [gap]}
+    script = {
+        "implement": [impl()],
+        "test": [TEST_OK],
+        "review-dim:correctness": [REVIEW_OK],
+        "review-dim:security": [REVIEW_OK],
+        "review-dim:tests": [review],
+        "review": [review],
+        "review-refute:0": [_refute("major", raise_reason="none")],
+    }
+    orch, backend = make_editing(repo, script, [EDIT], **_ultra_s())
+    out = go(orch)
+    assert out.status == "done"
+    assert "fix-1:implement" not in keys(orch)
+    assert _extent(orch.run_state)["fix_rounds"] == 0
+    entry = orch.run_state.stage("review")
+    assert entry["original_output"] == review
+    stored = entry["output"]
+    assert stored["verdict"] == "approve"
+    assert stored["findings"] == [{**gap, "severity": "minor", "capped": True}]
+    assert stored["unverified"] == [{"kind": "untested", "text": f"a.py: {GAP}"}]
+    assert orch.run_state.state["unverified"] == [
+        {"id": "U1", "kind": "untested", "text": f"a.py: {GAP}"}
+    ]
+    (event,) = _events(orch, "review_severity_capped")
+    assert event["count"] == 1 and event["findings"] == [{"index": 0, "before": "major"}]
+    refute_req = next(r for r in backend.requests if r.key == "review-refute:0")
+    assert '"severity":"minor"' in refute_req.prompt
+    assert "1 majors capped (no reason)" in out.report_text
+    assert "untested 1" in out.report_text
+
+
+@pytest.mark.parametrize("reason", ["goal_defeating", "correctness"])
+def test_ultra_major_with_reason_still_fixes(repo, reason):
+    review = {**REVIEW_MAJOR, "findings": [_finding("major", GAP, reason)]}
+    refutes = {"review-refute:0": [_refute("major")]}
+    orch, _ = _refute_run(repo, review, refutes, fixes=1)
+    out = go(orch)
+    assert out.status == "done"
+    assert "fix-1:implement" in keys(orch)
+    assert _events(orch, "review_severity_capped") == []
+    assert "capped" not in out.report_text
+
+
+def test_ultra_capped_finding_refuter_justified_raise_restores(repo):
+    gap = {**_finding("minor", GAP), "severity": "major"}
+    review = {**REVIEW_MAJOR, "findings": [gap]}
+    refutes = {"review-refute:0": [_refute("major", raise_reason="security")]}
+    orch, _ = _refute_run(repo, review, refutes, fixes=1)
+    out = go(orch)
+    assert out.status == "done"
+    assert "fix-1:implement" in keys(orch)
+    stored = orch.run_state.stage("review")["output"]
+    assert stored["verdict"] == "request_changes"
+    assert stored["findings"] == [{**gap, "capped": True}]
+    # Serious again, so not an untested item.
+    assert stored["unverified"] == []
+    (event,) = _events(orch, "review_rerated")
+    assert event["changes"][0]["before"] == "minor" and event["changes"][0]["after"] == "major"
+
+
+def test_ultra_capped_finding_disproved_is_not_listed_untested(repo):
+    gap = {**_finding("minor", GAP), "severity": "major"}
+    review = {**REVIEW_MAJOR, "findings": [gap]}
+    refutes = {"review-refute:0": [_refute("nit", disproved=True)]}
+    orch, _ = _refute_run(repo, review, refutes)
+    assert go(orch).status == "done"
+    stored = orch.run_state.stage("review")["output"]
+    assert stored["findings"] == [] and stored["unverified"] == []
+
+
+def test_non_ultra_review_major_without_reason_unchanged(repo):
+    orch, _, _ = make(
+        repo,
+        {
+            "implement": [impl(), impl()],
+            "test": [TEST_OK, TEST_OK],
+            "review": [REVIEW_MAJOR, REVIEW_OK],
+        },
+        size="S",
+        review_small=True,
+    )
+    assert go(orch).status == "done"
+    assert "fix-1:implement" in keys(orch)
+    assert _events(orch, "review_severity_capped") == []
+
+
+def test_ultra_prompts_require_finding_reason(repo):
+    from carcara.orchestrator import _FINDING_REASON_RULE
+
+    script = {
+        "implement": [impl()],
+        "test": [TEST_OK],
+        "review-dim": [REVIEW_OK] * 3,
+        "review": [REVIEW_OK],
+    }
+    orch, backend, _ = make(repo, script, **_ultra_s())
+    assert go(orch).status == "done"
+    prompts = [r.prompt for r in backend.requests if r.stage in ("review-dim", "review")]
+    assert len(prompts) == 4 and all(_FINDING_REASON_RULE in p for p in prompts)
+    assert "with its `reason`" in prompts[-1]
+    assert "edge case is minor" in next(p for p in prompts if "ONLY for tests" in p)
+
+
+def test_ultra_gated_review_on_failing_tests_records_capped_untested(repo):
+    # #36/#41: the forced review on failing tests caps a reasonless major too.
+    gap = {**_finding("minor", GAP), "severity": "major", "path": "src/carcara/policy.py"}
+    review = {**REVIEW_MAJOR, "findings": [gap]}
+    orch, _, _ = make(
+        repo,
+        {
+            "implement": [impl("src/carcara/policy.py")] * 3,
+            "test": [TEST_FAIL] * 3,
+            "review-dim": [REVIEW_OK] * 3,
+            "review": [review],
+            "review-refute": [_refute("minor")],
+        },
+        **_ultra_s(),
+    )
+    out = go(orch)
+    assert out.status == "needs_human"
+    stored = orch.run_state.stage("fix-2:review")["output"]
+    assert stored["verdict"] == "approve" and stored["findings"][0]["severity"] == "minor"
+    (item,) = orch.run_state.state["unverified"]
+    assert item["kind"] == "untested" and GAP in item["text"]
+
+
+def test_cap_review_findings():
+    from carcara.orchestrator import _cap_review_findings, _justified_severity
+
+    assert _justified_severity("major", None) == ("minor", True)
+    assert _justified_severity("blocker", "none") == ("minor", True)
+    for reason in ("correctness", "security", "goal_defeating", "low_verifiability"):
+        assert _justified_severity("major", reason) == ("major", False)
+    assert _justified_severity("major", "none", goal_defeating=True) == ("major", False)
+    assert _justified_severity("major", "none", low_verifiability=True) == ("major", False)
+    assert _justified_severity("minor", None) == ("minor", False)
+    assert _justified_severity("nit", None) == ("nit", False)
+
+    bare = {**_finding("minor", GAP), "severity": "major"}
+    kept = [_finding("major", "k"), _finding("minor", "m"), _finding("nit", "n")]
+    review = {"verdict": "request_changes", "findings": [bare, *kept], "unverified": []}
+    capped, which = _cap_review_findings(review)
+    assert which == [{"index": 0, "before": "major"}]
+    assert capped["findings"] == [{**bare, "severity": "minor", "capped": True}, *kept]
+    assert capped["verdict"] == "request_changes"  # the justified major survives
+    assert capped["unverified"] == [{"kind": "untested", "text": f"a.py: {GAP}"}]
+    assert review["findings"][0]["severity"] == "major" and review["unverified"] == []
+    only, _ = _cap_review_findings({**review, "findings": [{**bare, "reason": "none"}]})
+    assert only["verdict"] == "approve"
+    assert _cap_review_findings({**review, "findings": kept}) == ({**review, "findings": kept}, [])
+
+    # Text truncated; repeats of an existing untested text skipped; none past the cap.
+    long = {**bare, "issue": "x" * 300}
+    out, _ = _cap_review_findings({**review, "findings": [long]})
+    assert len(out["unverified"][0]["text"]) == MAX_UNVERIFIED_TEXT
+    prior = [{"id": "U1", "kind": "untested", "text": f"A.PY:  {GAP}"}]
+    out, _ = _cap_review_findings({**review, "findings": [bare, bare], "unverified": prior})
+    assert out["unverified"] == prior
+    full = [{"id": f"U{i}", "kind": "normative", "text": str(i)} for i in range(MAX_UNVERIFIED)]
+    out, _ = _cap_review_findings({**review, "findings": [bare], "unverified": full})
+    assert out["unverified"] == full
 
 
 def test_ultra_refute_low_verifiability_escalates(repo):
@@ -3400,7 +3583,7 @@ def test_apply_refutations():
     adjusted, changes = _apply_refutations(review, results)
     assert adjusted == {
         "verdict": "request_changes",
-        "findings": [_finding("major", "a"), _finding("major", "b")],
+        "findings": [_raised("a"), _finding("major", "b")],
         "unverified": review["unverified"],
     }
     assert changes == [
@@ -3525,7 +3708,7 @@ def test_apply_refutations_serious_disproves():
     # second refuter agrees.
     bypass = _refute("nit", disproved=True, goal=True)
     kept, changes = _apply_refutations(minor, {0: bypass}, None, diff)
-    assert kept["findings"] == [_finding("major")] and kept["verdict"] == "request_changes"
+    assert kept["findings"] == [_raised()] and kept["verdict"] == "request_changes"
     assert changes[0]["basis"] == "kept_unverified"
     gone, changes = _apply_refutations(minor, {0: bypass}, {0: disproved}, diff)
     assert gone["findings"] == [] and changes[0]["basis"] == "second_refuter"

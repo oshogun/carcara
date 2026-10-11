@@ -4,6 +4,7 @@ from carcara.profiles import load_profile
 from carcara.resources import templates_root
 from carcara.roles import Role, RoleError, load_roles, model_for, parse_role, to_agent_definition
 from carcara.schemas import (
+    FINDING_REASONS,
     MAX_SCOPE_AREAS,
     MAX_UNVERIFIED,
     MAX_UNVERIFIED_TEXT,
@@ -112,6 +113,23 @@ def test_review_dim_schema_matches_review():
     ok = {"verdict": "approve", "findings": [], "unverified": []}
     assert validate("review-dim", ok) == []
     assert validate("review-dim", {**ok, "verdict": "maybe"})
+
+
+def test_review_finding_reason():
+    finding = {"severity": "major", "path": "a.py", "issue": "i", "fix": "f"}
+    review = {"verdict": "approve", "findings": [finding], "unverified": []}
+    assert validate("review", review) == []
+    assert FINDING_REASONS == (
+        "none",
+        "goal_defeating",
+        "low_verifiability",
+        "security",
+        "correctness",
+    )
+    for reason in FINDING_REASONS:
+        reasoned = {**review, "findings": [{**finding, "reason": reason}]}
+        assert validate("review", reasoned) == []
+    assert validate("review", {**review, "findings": [{**finding, "reason": "tests"}]})
 
 
 def test_review_refute_schema():

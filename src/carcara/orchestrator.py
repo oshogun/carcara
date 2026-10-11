@@ -61,6 +61,7 @@ from carcara.schemas import (
     MAX_SCOPE_AREAS,
     MAX_SECOND_REFUTERS,
     MAX_UNVERIFIED,
+    MAX_UNVERIFIED_TEXT,
     UNVERIFIED_KINDS,
 )
 from carcara.urutau import (
@@ -147,8 +148,19 @@ _UNVERIFIED_INSTRUCTIONS = (
 _REVIEW_DIMS = {
     "correctness": "logic errors, broken behaviour, edge cases and regressions.",
     "security": "injection, secrets, unsafe input handling and permission issues.",
-    "tests": "missing or weak tests for the changed behaviour.",
+    "tests": "missing or weak tests for the changed behaviour; a test gap for an edge "
+    "case is minor unless it covers the behaviour the task asks for.",
 }
+
+# Ultra mode: the reason a dimension or merged finding of major or higher must give
+# (enforced in code by _cap_review_findings).
+_FINDING_REASON_RULE = (
+    "Every major or blocker finding must set `reason`: correctness (wrong behaviour in "
+    "the shipped code), security, goal_defeating (including a missing or weak test for "
+    "the behaviour the task asks for) or low_verifiability. Any other major or blocker "
+    "is capped at minor and listed as an untested item; a missing test for an edge "
+    "case is minor."
+)
 
 # Severity floor shared by the merge and refute prompts (enforced in code too).
 _SEVERITY_FLOOR = (
@@ -184,23 +196,33 @@ _SEVERITY_RANK = {"blocker": 3, "major": 2, "minor": 1, "nit": 0}
 _RAISE_REASONS = frozenset({"goal_defeating", "low_verifiability", "security", "correctness"})
 
 
-def _refuter_severity(res: dict[str, Any]) -> tuple[str, bool]:
-    """The refuter's effective severity, and whether an unjustified raise was capped.
+def _justified_severity(
+    severity: str,
+    reason: str | None,
+    goal_defeating: bool = False,
+    low_verifiability: bool = False,
+) -> tuple[str, bool]:
+    """The effective severity, and whether an unjustified major-or-higher was capped.
 
     A rating of major or higher counts only with a floor reason: a goal-defeating or
-    low-verifiability flag, or a security/correctness raise_reason; otherwise it is
-    capped at minor (outputs without raise_reason are capped too).
+    low-verifiability flag, or a reason in _RAISE_REASONS; otherwise it is capped at
+    minor (a missing reason counts as "none").
     """
-    severity = res["severity"]
     if _SEVERITY_RANK[severity] < _SEVERITY_RANK["major"]:
         return severity, False
-    if (
-        res.get("goal_defeating")
-        or res.get("low_verifiability")
-        or res.get("raise_reason", "none") in _RAISE_REASONS
-    ):
+    if goal_defeating or low_verifiability or (reason or "none") in _RAISE_REASONS:
         return severity, False
     return "minor", True
+
+
+def _refuter_severity(res: dict[str, Any]) -> tuple[str, bool]:
+    """The refuter's effective severity, and whether an unjustified raise was capped."""
+    return _justified_severity(
+        res["severity"],
+        res.get("raise_reason"),
+        bool(res.get("goal_defeating")),
+        bool(res.get("low_verifiability")),
+    )
 
 
 # Appended to a stage's prompt when retrying after it returned no structured output.
@@ -654,6 +676,51 @@ def _apply_refutations(
         findings.append(finding)
     verdict = "request_changes" if any(_serious(f) for f in findings) else "approve"
     return {**review, "verdict": verdict, "findings": findings}, changes
+
+
+def _with_untested(review: dict[str, Any]) -> dict[str, Any]:
+    """The review with an `untested` unverified item for each capped, non-serious finding.
+
+    Items repeating an existing untested text are skipped, and none are added past
+    MAX_UNVERIFIED; ids are left to _record_unverified.
+    """
+    items = [dict(i) for i in review.get("unverified", [])]
+    seen = {_norm_text(i["text"]) for i in items if i["kind"] == "untested"}
+    for finding in review["findings"]:
+        if not finding.get("capped") or _serious(finding):
+            continue
+        text = f"{finding['path']}: {finding['issue']}"[:MAX_UNVERIFIED_TEXT]
+        if len(items) >= MAX_UNVERIFIED or _norm_text(text) in seen:
+            continue
+        seen.add(_norm_text(text))
+        items.append({"kind": "untested", "text": text})
+    return {**review, "unverified": items}
+
+
+def _cap_review_findings(
+    review: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Cap review findings rated major or higher without a floor `reason` at minor.
+
+    Like a refuter raise (see _justified_severity), a dimension or merged finding
+    is serious only with a reason; a capped one is marked capped=True and listed as
+    an `untested` unverified item instead of starting a fix round. The verdict is
+    recomputed when anything was capped.
+
+    Returns (capped copy, capped findings as {index, before}).
+    """
+    findings: list[dict[str, Any]] = []
+    capped: list[dict[str, Any]] = []
+    for index, finding in enumerate(review["findings"]):
+        severity, was_capped = _justified_severity(finding["severity"], finding.get("reason"))
+        if was_capped:
+            capped.append({"index": index, "before": finding["severity"]})
+            finding = {**finding, "severity": severity, "capped": True}
+        findings.append(finding)
+    if not capped:
+        return review, capped
+    verdict = "request_changes" if any(_serious(f) for f in findings) else "approve"
+    return _with_untested({**review, "verdict": verdict, "findings": findings}), capped
 
 
 def _slug(text: str) -> str:
@@ -2232,7 +2299,7 @@ class Orchestrator:
         def dim_prompt(dim: str) -> Callable[[], str]:
             return lambda: (
                 f"Task: {task}\n\nReview this change ONLY for {dim}: {_REVIEW_DIMS[dim]} "
-                f"Report only real issues.\n\n{shared()}"
+                f"Report only real issues. {_FINDING_REASON_RULE}\n\n{shared()}"
             )
 
         outs = await self._parallel(
@@ -2247,15 +2314,18 @@ class Orchestrator:
             return (
                 f"Task: {task}\n\nDimension review findings (JSON):\n{_dumps(found)}\n\n"
                 "Verify each finding against the code, drop false positives, merge "
-                "duplicates; keep any finding you cannot disprove. Re-check each "
-                f"severity: {_SEVERITY_FLOOR} Give the overall verdict.\n\n{shared()}"
+                "duplicates; keep any finding you cannot disprove, with its `reason`. "
+                f"Re-check each severity: {_SEVERITY_FLOOR} {_FINDING_REASON_RULE} "
+                f"Give the overall verdict.\n\n{shared()}"
             )
 
         key = f"{prefix}review"
         review = await self._stage(key, "review", "reviewer", "review", merge_prompt)
         # Refute from the original merge so a resume picks the same candidates/keys.
         entry = run.stage(key) or {}
-        merged = entry.get("original_output", review)
+        original = entry.get("original_output", review)
+        # Reasonless majors are capped before refuting: only a justified raise restores them.
+        merged, severity_capped = _cap_review_findings(original)
         candidates = _refute_candidates(merged["findings"])
         applied = key in run.state.get("refuted_reviews", [])
         if not applied and (
@@ -2307,6 +2377,18 @@ class Orchestrator:
         if not applied:
             # Only once per review: a resume finds the amended output stored.
             adjusted, changes = _apply_refutations(merged, results, second, diff_lines)
+            if severity_capped:
+                # Untested items only for capped findings that survived below major.
+                adjusted = _with_untested(
+                    {**adjusted, "unverified": original.get("unverified", [])}
+                )
+                run.state.setdefault("severity_capped", {})[key] = severity_capped
+                run.event(
+                    "review_severity_capped",
+                    key=key,
+                    count=len(severity_capped),
+                    findings=severity_capped,
+                )
             changes = [{"key": f"{prefix}review-refute:{c['index']}", **c} for c in changes]
             run.state.setdefault("refutations", []).extend(changes)
             run.state.setdefault("refuted_reviews", []).append(key)
@@ -2544,6 +2626,7 @@ class Orchestrator:
             keys = ", ".join(e["key"] for e in par)
             lines.append(f"Parallel stages: {keys} (${par_cost:.2f})")
         changes = state.get("refutations") or []
+        no_reason = sum(len(v) for v in (state.get("severity_capped") or {}).values())
         if changes:
             # Second-round refuters re-check the same findings: count first-round only.
             checked = sum(1 for e in stages if e["stage"] == "review-refute")
@@ -2572,7 +2655,11 @@ class Orchestrator:
                 line += f", {kept} kept unverified"
             if capped := sum(1 for c in changes if c.get("capped")):
                 line += f", {capped} raises capped"
+            if no_reason:
+                line += f", {no_reason} majors capped (no reason)"
             lines.append(line)
+        elif no_reason:
+            lines.append(f"Review: {no_reason} majors capped (no reason)")
         lines += [
             f"est. cost: {costs}",
             f"total est. cost: ${state['totals']['cost_usd']:.2f} "

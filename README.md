@@ -370,6 +370,13 @@ in the state.
   false positives and merges duplicates. The merge is the review that counts:
   the fix loop, the report's `review:` line, unverified assumptions and Urutau
   data come only from it. Fix rounds use the same split (`fix-1:review-dim:*`).
+  A dimension or merged finding of major or higher needs the same kind of
+  floor reason, in its `reason` field: `correctness`, `security`,
+  `goal_defeating` (this includes a missing test for the behaviour the task
+  asks for) or `low_verifiability`. Without one it is capped at minor and
+  listed as an `untested` unverified item, so a missing test for an edge
+  case does not start a fix round (#40). The plain (non-ultra) review is
+  unchanged.
 - **Refute.** After the merge, up to 6 non-nit findings (most severe first)
   each get a parallel `review-refute:N` stage. The refuter tries to disprove
   the finding against the diff and re-rates its severity. Severities are only
@@ -378,6 +385,8 @@ in the state.
   major. A refuter's rating of major or higher counts only with a floor
   reason in `raise_reason` (goal-defeating, low-verifiability, a security
   defect or a correctness defect); without one the raise is capped at minor.
+  A merged finding capped for lacking a `reason` is refuted at minor, so only
+  such a justified raise makes it serious again.
   A missing or weak test is at most minor unless the untested path is
   goal-defeating or hard to verify, so test gaps alone do not start fix
   rounds. Refuters still never lower a severity (open question U3 from #22).
@@ -403,7 +412,9 @@ line and, when refuters changed anything, a
 `Refutation: N checked, N re-rated, N disproved` line. It adds
 `(N escalated)` after the re-rated count when refuters raised severities, and
 `N raises capped` when unjustified raises were capped (also logged as a
-`review_raise_capped` event). `--dry-run --ultra`
+`review_raise_capped` event). Merged majors capped for lacking a reason add
+`N majors capped (no reason)` to that line (or a `Review:` line of their
+own), and are logged as a `review_severity_capped` event. `--dry-run --ultra`
 shows the extra rows.
 
 ### Tool policy
