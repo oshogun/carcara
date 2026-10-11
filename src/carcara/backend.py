@@ -30,7 +30,9 @@ SDK notes (claude-agent-sdk 0.2.x):
 
 from __future__ import annotations
 
+import asyncio
 import os
+import time
 import warnings
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -92,6 +94,10 @@ class NoStructuredOutput(BackendError):
     """The stage finished without emitting its structured output."""
 
 
+class StageTimeout(BackendError):
+    """The stage ran past its wall-clock limit (``StageRequest.timeout_s``)."""
+
+
 class BackendUnavailable(BackendError):
     """The backend cannot run at all (e.g. Claude Code CLI missing)."""
 
@@ -118,6 +124,10 @@ class StageRequest:
     # The orchestrator's stage key (e.g. ``review-dim:security``); lets
     # FakeBackend script parallel siblings of one stage individually.
     key: str | None = None
+    # Session to resume (a follow-up in the same conversation) instead of a fresh one.
+    resume: str | None = None
+    # Wall-clock limit in seconds; None means no limit.
+    timeout_s: float | None = None
 
 
 @dataclass
@@ -131,6 +141,9 @@ class StageResult:
     subtype: str = "success"
     is_error: bool = False
     errors: list[str] = field(default_factory=list)
+    # Why the attempt stopped (from the ResultMessage, or "timeout"), and how long it took.
+    stop_reason: str | None = None
+    duration_ms: int | None = None
 
 
 def build_request(
@@ -146,6 +159,7 @@ def build_request(
     unrestricted_bash: bool = False,
     key: str | None = None,
     schema: str | None = None,
+    timeout_s: float | None = None,
 ) -> StageRequest:
     """Assemble a stage request; ``role=None`` means the main model with no tools.
 
@@ -184,6 +198,7 @@ def build_request(
         env={STAGE_ENV_VAR: role_name or "main"},
         unrestricted_bash=unrestricted_bash,
         key=key,
+        timeout_s=timeout_s,
     )
 
 
@@ -246,6 +261,9 @@ class SdkBackend:
                     request.role, request.cwd, unrestricted_bash=unrestricted
                 )
             )
+        extra: dict[str, Any] = {}
+        if request.resume is not None:
+            extra["resume"] = request.resume
         return sdk.ClaudeAgentOptions(
             model=request.model,
             allowed_tools=list(request.allowed_tools),
@@ -260,6 +278,7 @@ class SdkBackend:
             hooks={"PreToolUse": [sdk.HookMatcher(matcher=None, hooks=[hook])]},
             can_use_tool=can_use_tool,
             env=dict(request.env),
+            **extra,
         )
 
     async def run_stage(self, request: StageRequest) -> StageResult:
@@ -270,15 +289,36 @@ class SdkBackend:
 
         options = self.build_options(request)
         result_msg: Any = None
+        session_id: str | None = None
         hidden = URUTAU_ENV_VARS + (() if self.use_api_key else API_KEY_ENV_VARS)
+        started = time.monotonic()
+
+        async def consume() -> None:
+            nonlocal result_msg, session_id
+            async for message in sdk.query(prompt=request.prompt, options=options):
+                if self.on_message is not None:
+                    self.on_message(message)
+                if session_id is None:
+                    session_id = _session_id_of(message)
+                if isinstance(message, sdk.ResultMessage):
+                    result_msg = message
+
         try:
             with _without_env(hidden), warnings.catch_warnings():
                 warnings.simplefilter("ignore", sdk.CanUseToolShadowedWarning)
-                async for message in sdk.query(prompt=request.prompt, options=options):
-                    if self.on_message is not None:
-                        self.on_message(message)
-                    if isinstance(message, sdk.ResultMessage):
-                        result_msg = message
+                # wait_for rather than asyncio.timeout: the latter needs Python 3.11.
+                await asyncio.wait_for(consume(), request.timeout_s)
+        except asyncio.TimeoutError as exc:
+            partial = StageResult(
+                session_id=session_id,
+                subtype="error_timeout",
+                is_error=True,
+                stop_reason="timeout",
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+            raise StageTimeout(
+                f"stage {request.stage}: timed out after {request.timeout_s:g}s", partial
+            ) from exc
         except sdk.CLINotFoundError as exc:
             raise BackendUnavailable(
                 "Claude Code CLI not found; install it "
@@ -297,6 +337,16 @@ class SdkBackend:
         return result
 
 
+def _session_id_of(message: Any) -> str | None:
+    """The session id a streamed message carries (the init SystemMessage has it in data)."""
+    sid = getattr(message, "session_id", None)
+    if sid is None:
+        data = getattr(message, "data", None)
+        if isinstance(data, dict):
+            sid = data.get("session_id")
+    return sid if isinstance(sid, str) and sid else None
+
+
 def _to_result(result_msg: Any) -> StageResult:
     subtype = result_msg.subtype
     return StageResult(
@@ -309,6 +359,8 @@ def _to_result(result_msg: Any) -> StageResult:
         subtype=subtype,
         is_error=bool(result_msg.is_error) or str(subtype or "").startswith("error"),
         errors=list(result_msg.errors or []),
+        stop_reason=getattr(result_msg, "stop_reason", None),
+        duration_ms=getattr(result_msg, "duration_ms", None),
     )
 
 

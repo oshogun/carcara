@@ -42,6 +42,9 @@ Accepted limitations:
   resolved by the orchestrator before the run and passed to ``decide`` as
   ``unrestricted_bash``, so a stage cannot turn it on. There is no
   per-project test-command allowlist yet.
+- test-runner Bash additionally may not use ``run_in_background`` or
+  ``until``/``while`` loops that ``sleep`` (``_has_sleep_poll_loop``): the
+  runner used to background the suite and poll forever. Same opt-out.
 
 Read-only Bash (explorer/reviewer) is a strict allowlist: the command prefix
 must be in ``READ_ONLY_PREFIXES`` (git status/diff/log/show, ls, rg, grep,
@@ -1272,6 +1275,61 @@ def _check_unrestricted_bash(command: str, cwd: str | None, depth: int = 0) -> D
     return None
 
 
+# Shell keywords that may precede a command word in a segment.
+_LEADING_KEYWORDS = frozenset({"do", "then", "else", "elif", "!", "{", "if", "time"})
+
+
+def _has_sleep_poll_loop(command: str, depth: int = 0) -> bool:
+    """True if ``command`` has an ``until``/``while`` loop whose body runs ``sleep``.
+
+    Heuristic: tracks loop nesting by keyword across ``_shell_segments`` (for/
+    select loops count too, so a sleep after their ``done`` is not flagged) and
+    recurses into ``sh -c``/``eval`` code. Unparseable text is not a loop.
+    """
+    segments = _shell_segments(command)
+    if segments is None:
+        return False
+    loops: list[bool] = []  # one entry per open loop: is it until/while?
+    for _op, tokens in segments:
+        argv, _ = _split_redirects(tokens)
+        while argv and argv[0] in _LEADING_KEYWORDS:
+            argv = argv[1:]
+        if argv and argv[0] in ("until", "while", "for", "select"):
+            loops.append(argv[0] in ("until", "while"))
+            argv = argv[1:]
+            while argv and argv[0] in _LEADING_KEYWORDS:
+                argv = argv[1:]
+        if argv and argv[0] == "done":
+            if loops:
+                loops.pop()
+            continue
+        argv = _strip_wrappers(argv)
+        if not argv:
+            continue
+        cmd = posixpath.basename(argv[0])
+        if cmd == "sleep" and any(loops):
+            return True
+        if (cmd in _SHELLS or cmd == "eval") and depth < _MAX_SHELL_NESTING:
+            if any(_has_sleep_poll_loop(c, depth + 1) for c in _interpreter_code(cmd, argv[1:])):
+                return True
+    return False
+
+
+def _check_test_runner_bash(command: str, tool_input: Mapping[str, Any]) -> Decision | None:
+    """Deny backgrounded commands and sleep poll loops for test-runner; None if fine."""
+    if tool_input.get("run_in_background"):
+        return _deny(
+            "test-runner must run commands in the foreground (run_in_background is not "
+            "allowed); use `timeout N <cmd>`"
+        )
+    if _has_sleep_poll_loop(command):
+        return _deny(
+            "poll/sleep loops are not allowed for test-runner; "
+            "run the command once in the foreground"
+        )
+    return None
+
+
 def decide(
     role: Role | str,
     tool_name: str,
@@ -1319,6 +1377,8 @@ def decide(
             return _check_read_only_bash(command, cwd)
         if not unrestricted_bash:
             denied = _check_unrestricted_bash(command, cwd)
+            if denied is None and name == "test-runner":
+                denied = _check_test_runner_bash(command, tool_input)
             if denied:
                 return denied
     return ALLOW

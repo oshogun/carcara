@@ -725,6 +725,90 @@ def test_can_use_tool_honours_unrestricted_bash():
     assert isinstance(asyncio.run(cb("Bash", push, None)), PermissionResultAllow)
 
 
+# --- test-runner: no backgrounding, no sleep poll loops ---------------------
+
+_BACKGROUND_REASON = (
+    "test-runner must run commands in the foreground (run_in_background is not "
+    "allowed); use `timeout N <cmd>`"
+)
+_POLL_REASON = (
+    "poll/sleep loops are not allowed for test-runner; run the command once in the foreground"
+)
+_POLL_LOOPS = [
+    "until jobs | grep -q Done; do sleep 5; done",
+    "while pgrep pytest; do sleep 2; done",
+    "until grep -q passed out.log\ndo\n  sleep 5\ndone",
+    "until ps aux | grep -q pytest | grep -v grep; do sleep 5; done",
+    'bash -c "while true; do sleep 1; done"',
+    "until x; do for i in 1; do :; done; sleep 2; done",
+    "eval 'while true; do sleep 1; done'",
+    "while x; do timeout 5 sleep 1; done",
+    "until x; do /bin/sleep 1; done",
+    "( until x; do sleep 1; done )",
+]
+
+
+def test_test_runner_denies_run_in_background():
+    decision = decide(
+        "test-runner", "Bash", {"command": "pytest -q", "run_in_background": True}, CWD
+    )
+    assert not decision.allow and decision.reason == _BACKGROUND_REASON
+
+
+@pytest.mark.parametrize("command", _POLL_LOOPS)
+def test_test_runner_denies_sleep_poll_loops(command):
+    decision = decide("test-runner", "Bash", {"command": command}, CWD)
+    assert not decision.allow and decision.reason == _POLL_REASON
+
+
+@pytest.mark.parametrize(
+    "tool_input",
+    [
+        {"command": "pytest -q"},
+        {"command": "timeout 600 pytest -q"},
+        {"command": "timeout 900 .venv/bin/pytest -x"},
+        {"command": "for f in a b; do echo $f; done"},
+        {"command": "for f in a b; do echo $f; done; sleep 1"},
+        {"command": "sleep 1"},
+        {"command": "while read l; do echo $l; done < f; sleep 1"},
+        {"command": "pytest -q", "run_in_background": False},
+    ],
+)
+def test_test_runner_allows_foreground_commands(tool_input):
+    assert allowed("test-runner", "Bash", tool_input)
+
+
+@pytest.mark.parametrize(
+    "tool_input",
+    [{"command": "pytest -q", "run_in_background": True}] + [{"command": c} for c in _POLL_LOOPS],
+)
+def test_test_runner_bash_rules_scoped_and_bypassable(tool_input):
+    assert allowed("implementer", "Bash", tool_input)
+    assert decide("test-runner", "Bash", tool_input, CWD, unrestricted_bash=True).allow
+
+
+def test_hook_and_can_use_tool_deny_run_in_background():
+    from claude_agent_sdk import PermissionResultDeny
+
+    bg = {"command": "pytest -q", "run_in_background": True}
+    hook = make_pre_tool_use_hook("test-runner", CWD)
+    out = asyncio.run(hook(_hook_input("Bash", bg), None, None))
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    res = asyncio.run(make_can_use_tool("test-runner", CWD)("Bash", bg, None))
+    assert isinstance(res, PermissionResultDeny)
+
+
+def test_hook_and_can_use_tool_deny_sleep_poll_loop():
+    from claude_agent_sdk import PermissionResultDeny
+
+    loop = {"command": _POLL_LOOPS[0]}
+    hook = make_pre_tool_use_hook("test-runner", CWD)
+    out = asyncio.run(hook(_hook_input("Bash", loop), None, None))
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    res = asyncio.run(make_can_use_tool("test-runner", CWD)("Bash", loop, None))
+    assert isinstance(res, PermissionResultDeny)
+
+
 # --- StructuredOutput / Glob path / secret-glob regressions ----------------
 
 

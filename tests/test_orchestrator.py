@@ -7,8 +7,18 @@ import types
 
 import pytest
 
-from carcara.backend import BackendError, FakeBackend, NoStructuredOutput, StageResult
+from carcara.backend import (
+    BackendError,
+    FakeBackend,
+    NoStructuredOutput,
+    StageResult,
+    StageTimeout,
+)
 from carcara.orchestrator import (
+    _REPORT_RESULTS_FOLLOWUP,
+    DEFAULT_FOLLOWUP_MAX_TURNS,
+    DEFAULT_STAGE_TIMEOUT_S,
+    FOLLOWUP_TIMEOUT_S,
     AutoGate,
     Orchestrator,
     OrchestratorError,
@@ -80,7 +90,12 @@ def repo(tmp_path, monkeypatch):
     return path
 
 
+# Tests never wait on the real follow-up timer.
+TEST_FOLLOWUP_TIMEOUT_S = 0.05
+
+
 def make(repo, script, gate=None, costs=None, **opts):
+    opts.setdefault("followup_timeout_s", TEST_FOLLOWUP_TIMEOUT_S)
     backend = FakeBackend(script, costs)
     gate = gate or AutoGate()
     orch = Orchestrator(backend, PROFILE, str(repo), RunStore(repo), gate, RunOptions(**opts))
@@ -772,13 +787,22 @@ class _FailingBackend(FakeBackend):
 
     spent = 0.008
     fails: int | None = None
+    # None (no session to resume) skips the follow-up: the old full-retry path.
+    session_id: str | None = None
 
     async def run_stage(self, request):
         if request.stage == "test" and (self.fails is None or self.fails > 0):
             if self.fails is not None:
                 self.fails -= 1
             self.requests.append(request)
-            spent = StageResult(cost_usd=self.spent, usage={"input_tokens": 7}, num_turns=4)
+            spent = StageResult(
+                cost_usd=self.spent,
+                usage={"input_tokens": 7},
+                num_turns=4,
+                session_id=self.session_id,
+                stop_reason="end_turn",
+                duration_ms=1234,
+            )
             raise NoStructuredOutput("stage test: no structured output", spent)
         return await super().run_stage(request)
 
@@ -862,11 +886,176 @@ def test_failed_stage_cost_on_stage_error_event(repo):
     for error in errors:
         assert error["cost_usd"] == pytest.approx(0.008)
         assert error["num_turns"] == 4 and "uncounted" not in error
+        assert error["subtype"] == "success" and error["stop_reason"] == "end_turn"
+        assert error["duration_ms"] == 1234 and "followup" not in error
     attempts = orch.run_state.state["failed_attempts"]
     assert len(attempts) == 2
     for attempt in attempts:
         assert attempt["key"] == "test" and attempt["counted"] is True
         assert attempt["error"] == "stage test: no structured output"
+        assert attempt["subtype"] == "success" and attempt["stop_reason"] == "end_turn"
+        assert attempt["num_turns"] == 4 and attempt["duration_ms"] == 1234
+
+
+def _followup_orch(repo, script, fails=None, costs=None):
+    backend = _FailingBackend(script, costs or {"implement": 0.01})
+    backend.fails = fails
+    backend.session_id = "sess-test"
+    orch = Orchestrator(
+        backend,
+        PROFILE,
+        str(repo),
+        RunStore(repo),
+        AutoGate(),
+        RunOptions(size="S", followup_timeout_s=TEST_FOLLOWUP_TIMEOUT_S),
+    )
+    return orch, backend
+
+
+def test_test_stage_followup_harvests_result_without_rerun(repo):
+    orch, backend = _followup_orch(
+        repo, {"implement": [impl()], "test": [TEST_OK]}, fails=1, costs={"test": 0.002}
+    )
+    out = asyncio.run(orch.run("do it"))
+    assert (out.status, out.exit_code) == ("done", 0)
+    first, followup = [r for r in backend.requests if r.stage == "test"]
+    assert first.resume is None and first.max_turns == 50
+    assert followup.resume == "sess-test" and followup.max_turns == DEFAULT_FOLLOWUP_MAX_TURNS == 3
+    assert followup.prompt == _REPORT_RESULTS_FOLLOWUP
+    assert "Do not run any more commands" in followup.prompt
+    (event,) = _events(orch, "stage_followup")
+    assert event["key"] == "test" and event["session_id"] == "sess-test"
+    assert _events(orch, "stage_retry") == []
+    completed = [e for e in _events(orch, "stage_completed") if e["key"] == "test"]
+    assert completed[0]["followup"] is True
+    # The failed attempt plus the follow-up.
+    assert orch.run_state.state["totals"]["cost_usd"] == pytest.approx(0.01)
+
+
+def test_test_stage_failed_followup_stops_without_rerun(repo):
+    orch, backend = _followup_orch(repo, {"implement": [impl()]})
+    out = asyncio.run(orch.run("do it"))
+    assert (out.status, out.exit_code) == ("failed", 1)
+    assert out.run_id is not None
+    tests = [r for r in backend.requests if r.stage == "test"]
+    assert [r.resume for r in tests] == [None, "sess-test"]
+    assert _events(orch, "stage_retry") == []
+    first, second = _events(orch, "stage_error")
+    assert "followup" not in first and second["followup"] is True
+    attempts = orch.run_state.state["failed_attempts"]
+    assert [a.get("followup", False) for a in attempts] == [False, True]
+    orch2, backend2, _ = make(repo, {"test": [TEST_OK]})
+    assert asyncio.run(orch2.resume(out.run_id)).status == "done"
+    assert backend2.requests[0].resume is None
+
+
+def test_non_test_stage_failed_followup_keeps_nudge_retry(repo):
+    missing = NoStructuredOutput(
+        "stage implement: no structured output", StageResult(session_id="sess-impl")
+    )
+    again = NoStructuredOutput("stage implement: no structured output", StageResult())
+    orch, backend, _ = make(
+        repo, {"implement": [missing, again, impl()], "test": [TEST_OK]}, size="S"
+    )
+    out = go(orch)
+    assert out.status == "done"
+    first, followup, retry = [r for r in backend.requests if r.stage == "implement"]
+    assert followup.resume == "sess-impl" and followup.prompt == _REPORT_RESULTS_FOLLOWUP
+    assert retry.resume is None and "MUST call the StructuredOutput tool" in retry.prompt
+    assert len(_events(orch, "stage_followup")) == 1
+    assert len(_events(orch, "stage_retry")) == 1
+
+
+def test_missing_session_id_skips_followup(repo):
+    missing = NoStructuredOutput("stage implement: no structured output", StageResult())
+    orch, backend, _ = make(repo, {"implement": [missing, impl()], "test": [TEST_OK]}, size="S")
+    assert go(orch).status == "done"
+    assert all(r.resume is None for r in backend.requests)
+    assert _events(orch, "stage_followup") == []
+    assert len(_events(orch, "stage_retry")) == 1
+
+
+def test_test_stage_timeout_triggers_followup(repo):
+    partial = StageResult(
+        session_id="sess-t", subtype="error_timeout", is_error=True, stop_reason="timeout"
+    )
+    timeout = StageTimeout("stage test: timed out after 900s", partial)
+    orch, backend, _ = make(repo, {"implement": [impl()], "test": [timeout, TEST_OK]}, size="S")
+    assert go(orch).status == "done"
+    first, followup = [r for r in backend.requests if r.stage == "test"]
+    assert followup.resume == "sess-t" and followup.timeout_s == TEST_FOLLOWUP_TIMEOUT_S
+    (error,) = _events(orch, "stage_error")
+    assert error["stop_reason"] == "timeout" and error["uncounted"] is True
+    (attempt,) = orch.run_state.state["failed_attempts"]
+    assert attempt["counted"] is False and attempt["stop_reason"] == "timeout"
+
+
+def test_interrupted_followup_records_failure(repo):
+    missing = NoStructuredOutput(
+        "stage test: no structured output", StageResult(session_id="sess-t", cost_usd=0.2)
+    )
+    orch, backend, _ = make(
+        repo, {"implement": [impl()], "test": [missing, KeyboardInterrupt()]}, size="S"
+    )
+    with pytest.raises(KeyboardInterrupt):
+        go(orch)
+    assert [r.resume for r in backend.requests if r.stage == "test"] == [None, "sess-t"]
+    first, second = _events(orch, "stage_error")
+    assert "followup" not in first
+    assert second["followup"] is True and second["uncounted"] is True
+    assert second["error"] == "KeyboardInterrupt()"
+    attempts = orch.run_state.state["failed_attempts"]
+    assert [a.get("followup", False) for a in attempts] == [False, True]
+    assert attempts[1]["counted"] is False
+
+
+def test_followup_over_budget_stops_as_budget_exceeded(repo):
+    missing = NoStructuredOutput(
+        "stage test: no structured output", StageResult(session_id="sess-t", cost_usd=0.2)
+    )
+    over = StageResult(subtype="error_max_budget_usd", is_error=True, cost_usd=0.1)
+    orch, backend, _ = make(
+        repo, {"implement": [impl()], "test": [missing, over]}, size="S", max_budget_usd=1.0
+    )
+    out = go(orch)
+    assert out.status == "budget_exceeded"
+    assert [r.resume for r in backend.requests if r.stage == "test"] == [None, "sess-t"]
+    first, second = _events(orch, "stage_error")
+    assert second["followup"] is True and second["subtype"] == "error_max_budget_usd"
+    assert orch.run_state.state["totals"]["cost_usd"] == pytest.approx(0.3)
+
+
+def test_parallel_followup_over_share_reports_share_exhausted(repo):
+    missing = NoStructuredOutput(
+        "no structured output", StageResult(session_id="sess-a", cost_usd=0.1)
+    )
+    over = StageResult(subtype="error_max_budget_usd", is_error=True, cost_usd=0.4)
+    script = {"review-dim:a": [missing, over], "review-dim:b": [_dim("b")]}
+    orch, backend, _ = make(repo, script, max_budget_usd=1.0)
+    orch.run_state = RunStore(repo).create("t", "balanced", "sha")
+    with pytest.raises(_Stop) as stop:
+        asyncio.run(orch._parallel(_parallel_specs(["a", "b"])))
+    assert stop.value.status == "budget_exceeded"
+    assert stop.value.message.startswith("parallel share exhausted for review-dim:a")
+    assert [r.resume for r in backend.requests if r.key == "review-dim:a"] == [None, "sess-a"]
+
+
+def test_stage_timeout_defaults_and_override(repo):
+    orch, backend, _ = make(repo, {"implement": [impl()], "test": [TEST_OK]}, size="S")
+    assert go(orch).status == "done"
+    timeouts = {r.stage: r.timeout_s for r in backend.requests}
+    assert DEFAULT_STAGE_TIMEOUT_S["test"] == 900
+    assert timeouts == {"implement": None, "test": 900}
+    orch2, backend2, _ = make(
+        repo,
+        {"implement": [impl()], "test": [TEST_OK]},
+        size="S",
+        stage_timeout_s={"implement": 60, "test": 30},
+    )
+    assert go(orch2).status == "done"
+    assert {r.stage: r.timeout_s for r in backend2.requests} == {"implement": 60, "test": 30}
+    assert RunOptions().followup_timeout_s == FOLLOWUP_TIMEOUT_S == 120.0
+    assert orch.options.followup_timeout_s == TEST_FOLLOWUP_TIMEOUT_S
 
 
 def test_is_error_stage_cost_on_event_and_failed_attempts(repo):

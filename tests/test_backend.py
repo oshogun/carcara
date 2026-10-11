@@ -10,8 +10,10 @@ from carcara.backend import (
     BackendError,
     BackendUnavailable,
     FakeBackend,
+    NoStructuredOutput,
     SdkBackend,
     StageResult,
+    StageTimeout,
     build_request,
 )
 from carcara.policy import KNOWN_TOOLS, STRUCTURED_OUTPUT_TOOL
@@ -33,7 +35,9 @@ IMPLEMENT_OK = {
 REVIEW_OK = {"verdict": "approve", "findings": [], "unverified": []}
 
 
-def result_message(structured=None, subtype="success", is_error=False, cost=0.12, errors=None):
+def result_message(
+    structured=None, subtype="success", is_error=False, cost=0.12, errors=None, stop_reason=None
+):
     return ResultMessage(
         subtype=subtype,
         duration_ms=1,
@@ -46,6 +50,7 @@ def result_message(structured=None, subtype="success", is_error=False, cost=0.12
         result="done",
         structured_output=structured,
         errors=errors,
+        stop_reason=stop_reason,
     )
 
 
@@ -385,3 +390,52 @@ def test_unrestricted_bash_reaches_policy_callbacks(monkeypatch, flag):
     assert (out == {}) is flag
     res = asyncio.run(opts.can_use_tool("Bash", push["tool_input"], None))
     assert isinstance(res, PermissionResultAllow if flag else PermissionResultDeny)
+
+
+def test_result_carries_stop_reason_and_duration(monkeypatch):
+    install_query(monkeypatch, [result_message(REVIEW_OK, stop_reason="end_turn")])
+    req = build_request("review", ROLES["reviewer"], PROFILE, "p", CWD)
+    result = run(SdkBackend(), req)
+    assert result.stop_reason == "end_turn" and result.duration_ms == 1
+
+
+def test_no_structured_output_result_carries_stop_reason(monkeypatch):
+    install_query(monkeypatch, [result_message(None, stop_reason="end_turn")])
+    req = build_request("review", ROLES["reviewer"], PROFILE, "p", CWD)
+    with pytest.raises(NoStructuredOutput) as info:
+        run(SdkBackend(), req)
+    res = info.value.result
+    assert res.stop_reason == "end_turn" and res.duration_ms == 1
+    assert res.session_id == "sess-1" and res.num_turns == 3
+
+
+def test_resume_only_set_when_requested():
+    from dataclasses import replace
+
+    req = build_request("review", ROLES["reviewer"], PROFILE, "p", CWD)
+    assert SdkBackend().build_options(req).resume is None
+    opts = SdkBackend().build_options(replace(req, resume="sess-9"))
+    assert opts.resume == "sess-9"
+
+
+def test_build_request_timeout():
+    assert build_request("test", ROLES["test-runner"], PROFILE, "p", CWD).timeout_s is None
+    req = build_request("test", ROLES["test-runner"], PROFILE, "p", CWD, timeout_s=900)
+    assert req.timeout_s == 900
+
+
+def test_timeout_raises_stage_timeout_with_session(monkeypatch):
+    from claude_agent_sdk import SystemMessage
+
+    async def fake_query(*, prompt, options=None, transport=None):
+        yield SystemMessage(subtype="init", data={"session_id": "sess-init"})
+        await asyncio.sleep(5)
+        yield result_message(IMPLEMENT_OK)
+
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+    req = build_request("test", ROLES["test-runner"], PROFILE, "p", CWD, timeout_s=0.05)
+    with pytest.raises(StageTimeout, match="timed out after 0.05s") as info:
+        run(SdkBackend(), req)
+    res = info.value.result
+    assert res.session_id == "sess-init" and res.stop_reason == "timeout"
+    assert res.is_error and res.duration_ms is not None and res.duration_ms >= 50

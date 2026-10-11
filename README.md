@@ -323,6 +323,24 @@ cost: it is flagged as uncounted (`stage_error` with `"uncounted": true` in
 `events.jsonl`, `uncounted_stages` in `carcara status --json`, and a note on
 the report's total line), and the cap may be exceeded by that unknown amount.
 
+**Stage stops and follow-ups.** Each `stage_error` event (and each entry in
+`failed_attempts` in `state.json`) records why the attempt stopped: `subtype`,
+`stop_reason`, `num_turns` and `duration_ms`. The test stage has a wall-clock
+limit of 900 s (`RunOptions.stage_timeout_s`); other stages have none. A timed-out
+attempt has `stop_reason: "timeout"` and its cost is uncounted. When a stage
+ends without structured output, or times out, carcara sends one cheap follow-up
+in the same session (at most 3 turns and 120 s, `RunOptions.followup_timeout_s`) asking for the results it already
+has. That attempt is logged as a `stage_followup` event. If the follow-up returns a
+result, the stage completes (`stage_completed` with `"followup": true`) and the work is not
+repeated. If it fails, its `stage_error` carries `"followup": true`. The test
+stage then stops as `failed` (resume with `carcara run --resume`). Other stages
+that are missing their output get one full retry.
+
+The test-runner's Bash is further restricted: calls with `run_in_background`
+and `until`/`while` loops that `sleep` are denied, so it runs each command once
+in the foreground (under `timeout`) instead of polling a background job.
+`--unrestricted-bash` lifts these rules along with the rest of the deny-list.
+
 **Run directory.** Each run is stored in `.carcara/runs/<id>/`: `state.json`,
 `events.jsonl` (append-only log) and `report.md`. The base commit is recorded
 in the state.

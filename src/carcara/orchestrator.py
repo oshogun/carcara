@@ -40,7 +40,9 @@ from carcara.backend import (
     Backend,
     BackendError,
     NoStructuredOutput,
+    StageRequest,
     StageResult,
+    StageTimeout,
     build_request,
 )
 from carcara.probes import run_probes
@@ -94,6 +96,12 @@ DEFAULT_MAX_TURNS: dict[str, int] = {
     "review": 30,
     "docs": 30,
 }
+
+# Per-stage wall-clock limits in seconds, keyed by pipeline step name; unlisted: none.
+DEFAULT_STAGE_TIMEOUT_S: dict[str, float] = {"test": 900}
+# The "report the results you have" follow-up after a stage ended without a result.
+DEFAULT_FOLLOWUP_MAX_TURNS = 3
+FOLLOWUP_TIMEOUT_S = 120.0
 
 MAX_FIX_ITERATIONS = 2
 DIFF_CAP = 20_000
@@ -202,6 +210,14 @@ _STRUCTURED_OUTPUT_NUDGE = (
     " stage's output schema."
 )
 
+# Sent in the same session when a stage ended (or timed out) without a result.
+_REPORT_RESULTS_FOLLOWUP = (
+    "Your previous turn ended without a result. Do not run any more commands. Call the"
+    " StructuredOutput tool now, exactly once, with the results you already have. If you"
+    " have none, report what you observed and mark anything you could not confirm as"
+    " failed or unknown."
+)
+
 # Appended to the test stage's prompt when retrying after it ran out of turns.
 _MAX_TURNS_NUDGE = (
     "\n\nYour previous attempt at this stage ran out of turns. Do not investigate or"
@@ -266,6 +282,10 @@ class RunOptions:
     # Not persisted: a resume gets the Bash deny-list back unless the flag is given again.
     unrestricted_bash: bool = False
     max_turns: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_MAX_TURNS))
+    # Wall-clock limit per pipeline step; steps not listed have none.
+    stage_timeout_s: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_STAGE_TIMEOUT_S))
+    # Wall-clock limit for the "report the results you have" follow-up.
+    followup_timeout_s: float = FOLLOWUP_TIMEOUT_S
     # GitHub issue the task came from (``--issue``) and its ``owner/name`` repo.
     issue: int | None = None
     repo: str | None = None
@@ -1329,26 +1349,143 @@ class Orchestrator:
         model: str,
         result: StageResult | None,
         error: str,
+        *,
+        counted: bool = True,
+        followup: bool = False,
     ) -> dict[str, Any]:
         """Record an errored attempt (its cost is already in the totals, if known).
 
-        Returns the cost fields for the ``stage_error`` event.
+        ``counted=False`` marks a result whose cost is unknown (a timed-out attempt).
+        Returns the cost and stop-reason fields for the ``stage_error`` event.
         """
+        extra: dict[str, Any] = {"followup": True} if followup else {}
         if result is None:
-            run.record_failed_attempt(key, stage, role_name, model, error, None, None, 0, False)
-            return {"cost_usd": None, "uncounted": True}
+            run.record_failed_attempt(
+                key, stage, role_name, model, error, None, None, 0, False, followup=followup
+            )
+            return {"cost_usd": None, "uncounted": True, **extra}
+        reason = {
+            "subtype": result.subtype,
+            "stop_reason": result.stop_reason,
+            "duration_ms": result.duration_ms,
+        }
         run.record_failed_attempt(
             key,
             stage,
             role_name,
             model,
             error,
-            result.cost_usd,
-            result.usage,
+            result.cost_usd if counted else None,
+            result.usage if counted else None,
             result.num_turns,
-            True,
+            counted,
+            followup=followup,
+            **reason,
         )
-        return {"cost_usd": result.cost_usd, "usage": result.usage, "num_turns": result.num_turns}
+        if not counted:
+            return {
+                "cost_usd": None,
+                "uncounted": True,
+                "num_turns": result.num_turns,
+                **reason,
+                **extra,
+            }
+        return {
+            "cost_usd": result.cost_usd,
+            "usage": result.usage,
+            "num_turns": result.num_turns,
+            **reason,
+            **extra,
+        }
+
+    async def _followup(
+        self,
+        run: Run,
+        key: str,
+        request: StageRequest,
+        session_id: str,
+        reason: str,
+        max_budget_usd: float | None,
+        budget_stop: str,
+    ) -> tuple[StageResult | None, float]:
+        """Resume ``session_id`` once, asking for the results the stage already has.
+
+        Returns the follow-up's result if it produced valid structured output (its
+        cost is not yet in the totals), else None after recording the failure;
+        plus what the follow-up spent. A follow-up that runs out of budget stops
+        the run as ``budget_exceeded`` with ``budget_stop`` as the message.
+        """
+        run.event("stage_followup", key=key, session_id=session_id, reason=reason)
+        followup = replace(
+            request,
+            prompt=_REPORT_RESULTS_FOLLOWUP,
+            resume=session_id,
+            max_turns=DEFAULT_FOLLOWUP_MAX_TURNS,
+            max_budget_usd=max_budget_usd,
+            timeout_s=self.options.followup_timeout_s,
+        )
+        run.event(
+            "stage_started",
+            key=key,
+            stage=request.stage,
+            role=request.role,
+            model=request.model,
+            followup=True,
+        )
+        try:
+            result = await self.backend.run_stage(followup)
+        except BackendError as exc:
+            counted = exc.result is not None and not isinstance(exc, StageTimeout)
+            spent = 0.0
+            if counted:
+                failed = exc.result
+                run.add_cost(failed.cost_usd, failed.usage, failed.num_turns)
+                spent = failed.cost_usd or 0.0
+            cost = self._record_failure(
+                run,
+                key,
+                request.stage,
+                request.role,
+                request.model,
+                exc.result,
+                str(exc),
+                counted=counted,
+                followup=True,
+            )
+            run.event("stage_error", key=key, error=str(exc), **cost)
+            return None, spent
+        except BaseException as exc:
+            # Interrupt or unexpected error: the follow-up's spend is unknown.
+            cost = self._record_failure(
+                run,
+                key,
+                request.stage,
+                request.role,
+                request.model,
+                None,
+                repr(exc),
+                followup=True,
+            )
+            run.event("stage_error", key=key, error=repr(exc), **cost)
+            raise
+        if result.is_error:
+            run.add_cost(result.cost_usd, result.usage, result.num_turns)
+            detail = "; ".join(result.errors) or f"error result (subtype {result.subtype})"
+            cost = self._record_failure(
+                run,
+                key,
+                request.stage,
+                request.role,
+                request.model,
+                result,
+                f"follow-up failed: {detail}",
+                followup=True,
+            )
+            run.event("stage_error", key=key, error=detail, **cost)
+            if result.subtype == "error_max_budget_usd":
+                raise _Stop("budget_exceeded", budget_stop)
+            return None, result.cost_usd or 0.0
+        return result, result.cost_usd or 0.0
 
     async def _stage(
         self,
@@ -1388,18 +1525,26 @@ class Orchestrator:
             "resume to retry it with the remaining budget"
         )
         capped = False
+
+        def budget_left() -> float | None:
+            nonlocal capped
+            if self.options.max_budget_usd is None:
+                return None
+            remaining = round(self.options.max_budget_usd - run.state["totals"]["cost_usd"], 6)
+            if remaining <= 0:
+                raise _Stop("budget_exceeded", f"budget exhausted before stage {key}")
+            if budget_cap is not None:
+                share = round(budget_cap - spent, 6)
+                if share <= 0:
+                    raise _Stop("budget_exceeded", share_exhausted)
+                capped = share < remaining
+                remaining = min(remaining, share)
+            return remaining
+
+        followup_used = False
+        harvested = False
         for attempt in range(2):
-            remaining: float | None = None
-            if self.options.max_budget_usd is not None:
-                remaining = round(self.options.max_budget_usd - run.state["totals"]["cost_usd"], 6)
-                if remaining <= 0:
-                    raise _Stop("budget_exceeded", f"budget exhausted before stage {key}")
-                if budget_cap is not None:
-                    share = round(budget_cap - spent, 6)
-                    if share <= 0:
-                        raise _Stop("budget_exceeded", share_exhausted)
-                    capped = share < remaining
-                    remaining = min(remaining, share)
+            remaining = budget_left()
             request = build_request(
                 stage,
                 role,
@@ -1412,21 +1557,50 @@ class Orchestrator:
                 unrestricted_bash=self.options.unrestricted_bash,
                 key=key,
                 schema="plan-ultra" if stage == "plan" and self._ultra() else None,
+                timeout_s=self.options.stage_timeout_s.get(turns_key),
             )
             run.event("stage_started", key=key, stage=stage, role=role_name, model=request.model)
             try:
                 result = await self.backend.run_stage(request)
             except BackendError as exc:
                 # Count whatever the stage spent (e.g. a result with missing or
-                # invalid structured output); with no StageResult the cost is unknown.
-                if exc.result is not None:
+                # invalid structured output); with no StageResult, or after a
+                # timeout cut the stage off, the cost is unknown.
+                counted = exc.result is not None and not isinstance(exc, StageTimeout)
+                if counted:
                     failed = exc.result
                     run.add_cost(failed.cost_usd, failed.usage, failed.num_turns)
                     spent += failed.cost_usd or 0.0
                 cost = self._record_failure(
-                    run, key, stage, role_name, request.model, exc.result, str(exc)
+                    run, key, stage, role_name, request.model, exc.result, str(exc), counted=counted
                 )
                 run.event("stage_error", key=key, error=str(exc), **cost)
+                session_id = exc.result.session_id if exc.result is not None else None
+                if (
+                    isinstance(exc, (NoStructuredOutput, StageTimeout))
+                    and session_id
+                    and not followup_used
+                ):
+                    # Ask the same session for what it has instead of redoing the work.
+                    followup_used = True
+                    followup_budget = budget_left()
+                    followed, followup_cost = await self._followup(
+                        run,
+                        key,
+                        request,
+                        session_id,
+                        str(exc),
+                        followup_budget,
+                        share_exhausted if capped else f"budget exhausted during stage {key}",
+                    )
+                    spent += followup_cost
+                    if followed is not None:
+                        result = followed
+                        harvested = True
+                        break
+                    if stage == "test":
+                        # Don't rerun the whole suite; `carcara run --resume` retries it.
+                        raise _Stop("failed", f"stage {key} failed: {exc}") from exc
                 if isinstance(exc, NoStructuredOutput) and attempt == 0:
                     # A missing result is usually a one-off slip: retry once.
                     run.event("stage_retry", key=key, reason=str(exc))
@@ -1448,7 +1622,7 @@ class Orchestrator:
                 cost = self._record_failure(
                     run, key, stage, role_name, request.model, result, "ran out of turns"
                 )
-                run.event("stage_error", key=key, subtype=result.subtype, **cost)
+                run.event("stage_error", key=key, **cost)
                 if attempt == 0:
                     run.event("stage_retry", key=key, reason="ran out of turns")
                     nudge = _MAX_TURNS_NUDGE
@@ -1465,7 +1639,7 @@ class Orchestrator:
             cost = self._record_failure(
                 run, key, stage, role_name, request.model, result, "budget exhausted"
             )
-            run.event("stage_error", key=key, subtype=result.subtype, **cost)
+            run.event("stage_error", key=key, **cost)
             if capped:
                 raise _Stop("budget_exceeded", share_exhausted)
             raise _Stop("budget_exceeded", f"budget exhausted during stage {key}")
@@ -1476,7 +1650,7 @@ class Orchestrator:
                 or f"error result (subtype {result.subtype})"
             )
             cost = self._record_failure(run, key, stage, role_name, request.model, result, detail)
-            run.event("stage_error", key=key, subtype=result.subtype, errors=result.errors, **cost)
+            run.event("stage_error", key=key, errors=result.errors, **cost)
             raise _Stop("failed", f"stage {key} failed: {detail}")
 
         output = result.structured
@@ -1499,7 +1673,12 @@ class Orchestrator:
             result.num_turns,
             result.session_id,
         )
-        run.event("stage_completed", key=key, cost_usd=result.cost_usd)
+        run.event(
+            "stage_completed",
+            key=key,
+            cost_usd=result.cost_usd,
+            **({"followup": True} if harvested else {}),
+        )
         return output
 
     async def _parallel(
@@ -2548,6 +2727,7 @@ def _urutau_report_lines(state: dict[str, Any]) -> list[str]:
 __all__ = [
     "AutoGate",
     "DEFAULT_MAX_TURNS",
+    "DEFAULT_STAGE_TIMEOUT_S",
     "EXIT_CODES",
     "Gate",
     "Orchestrator",

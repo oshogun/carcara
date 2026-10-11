@@ -177,21 +177,30 @@ class Run:
         usage: dict[str, Any] | None,
         num_turns: int,
         counted: bool,
+        *,
+        subtype: str | None = None,
+        stop_reason: str | None = None,
+        duration_ms: int | None = None,
+        followup: bool = False,
     ) -> None:
         """Remember an errored stage attempt; its cost (if known) is added separately."""
-        self.state.setdefault("failed_attempts", []).append(
-            {
-                "key": key,
-                "stage": stage,
-                "role": role,
-                "model": model,
-                "error": error if len(error) <= 500 else error[:497] + "...",
-                "cost_usd": cost_usd if counted else None,
-                "usage": usage,
-                "num_turns": num_turns,
-                "counted": counted,
-            }
-        )
+        attempt: dict[str, Any] = {
+            "key": key,
+            "stage": stage,
+            "role": role,
+            "model": model,
+            "error": error if len(error) <= 500 else error[:497] + "...",
+            "cost_usd": cost_usd if counted else None,
+            "usage": usage,
+            "num_turns": num_turns,
+            "counted": counted,
+            "subtype": subtype,
+            "stop_reason": stop_reason,
+            "duration_ms": duration_ms,
+        }
+        if followup:
+            attempt["followup"] = True
+        self.state.setdefault("failed_attempts", []).append(attempt)
         if not counted:
             totals = self.state["totals"]
             totals["uncounted_stages"] = int(totals.get("uncounted_stages", 0)) + 1
