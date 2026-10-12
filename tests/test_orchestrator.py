@@ -4215,6 +4215,13 @@ def _issue_make(repo, script, **opts):
     return Orchestrator(backend, PROFILE, str(repo), RunStore(repo), AutoGate(), options)
 
 
+@pytest.fixture
+def ordered_run_ids(monkeypatch):
+    """Run ids that sort in creation order (real ids made in one second may not)."""
+    counter = iter(range(1, 1000))
+    monkeypatch.setattr(RunStore, "new_run_id", staticmethod(lambda: f"run-{next(counter):03d}"))
+
+
 def _carry_runs(repo, second_review=None):
     script = {"implement": [impl()], "test": [TEST_OK], "review": [CARRY_FIRST]}
     orch = _issue_make(repo, script, size="S", review_small=True)
@@ -4474,3 +4481,30 @@ def test_resume_ignores_stale_summary_and_summarises_fresh_results(repo):
     summaries = [r for r in backend2.requests if r.key == "test-summary"]
     assert len(summaries) == 1 and "fresh" in summaries[0].prompt
     assert orch2.run_state.stage("test")["output"]["failures"] == fresh["failures"]
+
+
+@pytest.mark.usefixtures("ordered_run_ids")
+def test_run_that_carried_nothing_still_records_empty_inventory(repo):
+    first, orch = _carry_runs(repo)
+    prev = first.run_state
+    for item in prev.state["unverified"]:
+        item["resolved"] = True
+    prev.save()
+    assert go(orch).status == "done"
+    second = orch.run_state
+    assert second.state["unverified"] == []
+    assert "unverified_carried" not in (second.dir / "events.jsonl").read_text()
+    # The next run stops at the run that carried nothing, not the older one.
+    found = RunStore(repo).find_previous_issue_run(7, "acme/widgets", exclude_run_id="x")
+    assert found.id == second.id
+
+
+def test_carry_without_urutau_reads_no_card(repo):
+    first, orch = _carry_runs(repo)
+    assert orch.urutau is None
+    assert go(orch).status == "done"
+    state = orch.run_state.state
+    assert [i["id"] for i in state["unverified"]] == ["U1", "U2", "U3"]
+    assert "carry_check" not in (state.get("urutau") or {})
+    report = (orch.run_state.dir / "report.md").read_text()
+    assert "resolved on Urutau" not in report and "unreachable" not in report

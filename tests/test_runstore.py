@@ -327,3 +327,10 @@ def test_find_previous_issue_run(tmp_path):
     assert store.find_previous_issue_run(7, "acme/widgets", exclude_run_id="r2").id == "r1"
     assert store.find_previous_issue_run(8, "acme/widgets").id == "r5"
     assert store.find_previous_issue_run(9, "acme/widgets") is None
+
+
+def test_find_previous_issue_run_stops_at_empty_inventory(tmp_path):
+    store = RunStore(tmp_path)
+    _issue_run(store, "r1", unverified=[{"id": "U1", "kind": "external", "text": "x"}])
+    _issue_run(store, "r2", unverified=[])  # carried nothing: everything was resolved
+    assert store.find_previous_issue_run(7, "acme/widgets").id == "r2"

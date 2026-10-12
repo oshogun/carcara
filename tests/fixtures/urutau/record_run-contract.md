@@ -121,3 +121,10 @@ the top level carries `humanWaitLimit` (hours) and `waitingOnHuman` (each waitin
 measured from the moment the run entered its waiting status, is shown red; sending the same waiting
 status again does not restart that time, a different waiting status does. Costs, fix rounds, files, areas and merge
 SHAs are stored for reports and shown nowhere on the board.
+
+**Assumed by carcara, not yet in §18** (issue #46): before a new run carries the previous run's
+open unverified items, carcara reads the card's items from `get_board` and drops those a person
+resolved. It expects `card.unverified` (or, failing that, `card.lastRun.unverifiedItems`) as a list
+of `{id, kind, text, status | resolved}`, where an item is resolved when `resolved` is `true` or
+`status` is `resolved`, `closed` or `done` (see `get_board-card-unverified.json`). A card without
+either list is treated as "unchecked": carcara carries the items unchanged and says so in its report.

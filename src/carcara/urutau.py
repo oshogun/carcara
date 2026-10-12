@@ -272,6 +272,7 @@ class RecordResult:
 
 
 _SETUP_CODES = ("repo-not-allowed", "no-board", "run-id-taken", "call-stopped")
+_RESOLVED_STATUSES = ("resolved", "closed", "done")
 
 
 class UrutauClient:
@@ -291,6 +292,8 @@ class UrutauClient:
         self._factory = transport_factory
         self._sleep = sleep
         self._transport: Transport | None = None
+        # One board read shared by get_card_unverified and get_estimate at run start.
+        self._card_cache: tuple[dict[str, Any] | None] | None = None
 
     def __repr__(self) -> str:
         return (
@@ -355,7 +358,56 @@ class UrutauClient:
         )
 
     async def get_estimate(self) -> dict[str, Any] | None:
-        """The card's {size, confidence} from get_board, or None when the issue has none.
+        """The card's {size, confidence} from get_board, or None when the issue has none."""
+        card = await self._get_card()
+        if card is None or not isinstance(card.get("estimate"), dict):
+            return None
+        est = card["estimate"]
+        return {"size": est.get("size"), "confidence": est.get("confidence")}
+
+    async def get_card_unverified(self) -> list[dict[str, Any]] | None:
+        """The card's unverified items as ``{id, kind, text, resolved}``.
+
+        None when the issue has no card or the card lists no items (an older
+        Urutau). Reads ``card.unverified``, else ``card.lastRun.unverifiedItems``;
+        an item is resolved when ``resolved`` is true or its ``status`` is
+        resolved/closed/done. The board read is kept for the next get_estimate.
+        """
+        card = await self._get_card(keep=True)
+        if card is None:
+            return None
+        items = card.get("unverified")
+        if not isinstance(items, list):
+            last = card.get("lastRun")
+            items = last.get("unverifiedItems") if isinstance(last, dict) else None
+        if not isinstance(items, list):
+            return None
+        out: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                continue
+            kind, text = item.get("kind"), item.get("text")
+            out.append(
+                {
+                    "id": item["id"],
+                    "kind": kind if isinstance(kind, str) else None,
+                    "text": text if isinstance(text, str) else "",
+                    "resolved": item.get("resolved") is True
+                    or item.get("status") in _RESOLVED_STATUSES,
+                }
+            )
+        return out
+
+    async def _get_card(self, *, keep: bool = False) -> dict[str, Any] | None:
+        """This issue's card, or None. A kept read serves the next call once, then is dropped."""
+        cached, self._card_cache = self._card_cache, None
+        card = cached[0] if cached is not None else await self._read_card()
+        if keep:
+            self._card_cache = (card,)
+        return card
+
+    async def _read_card(self) -> dict[str, Any] | None:
+        """Page get_board for this issue's card.
 
         The first call returns every bucket; buckets with ``more`` are then paged
         one at a time, since Urutau only accepts ``offset`` with exactly one bucket.
@@ -381,10 +433,7 @@ class UrutauClient:
                     break
                 seen += count
                 more = any(b.get("more") is True for b in page)
-        if card is None or not isinstance(card.get("estimate"), dict):
-            return None
-        est = card["estimate"]
-        return {"size": est.get("size"), "confidence": est.get("confidence")}
+        return card
 
 
 def _buckets(data: Any) -> list[dict[str, Any]]:

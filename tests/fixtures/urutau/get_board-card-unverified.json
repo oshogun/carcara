@@ -1,0 +1,29 @@
+{
+  "number": 7,
+  "title": "Crash on save",
+  "state": "open",
+  "estimate": null,
+  "lastRun": {
+    "status": "done",
+    "unverifiedOpen": {
+      "external": 1,
+      "normative": 0,
+      "untested": 0
+    },
+    "runId": "c-20261008-0001"
+  },
+  "unverified": [
+    {
+      "id": "U1",
+      "kind": "external",
+      "text": "ext item",
+      "status": "open"
+    },
+    {
+      "id": "U2",
+      "kind": "normative",
+      "text": "norm item",
+      "status": "resolved"
+    }
+  ]
+}

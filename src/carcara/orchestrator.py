@@ -1019,7 +1019,7 @@ class Orchestrator:
             if triage_only:
                 run.state["triage_only"] = True
             self._record_issue(run)
-            self._carry_unverified(run)
+            await self._carry_unverified(run)
             if self.urutau is not None:
                 stopped = await self._urutau_start(run)
                 if stopped is not None:
@@ -1263,12 +1263,21 @@ class Orchestrator:
         urutau.setdefault("last", None)
         run.save()
 
-    def _carry_unverified(self, run: Run) -> None:
+    async def _carry_unverified(self, run: Run) -> None:
         """Copy the open unverified items of the previous run on the same issue
         and repo into this new run, so its record_run keeps them on the card.
 
-        Resolved items and probe results are not carried. The previous run's
-        state already holds what it carried, so one run back is enough.
+        Resolved items and probe results are not carried, nor items a person
+        resolved on the Urutau card since (read once here; if Urutau cannot be
+        read, the items are carried as-is and the report says so).
+
+        Carrying chains run to run through each run's own state: a run that
+        failed before review keeps its carried copies and passes them on, and a
+        run that found a previous run but carried nothing still records an empty
+        inventory, so the next run stops at it instead of reaching further back.
+        ``carried_from`` names the run an item was taken from, not the run it
+        started in. Every hop rechecks the card, so an item resolved at any
+        point in the chain is dropped for good.
         """
         state = run.state
         issue = state.get("issue")
@@ -1283,19 +1292,64 @@ class Orchestrator:
             for i in prev.state.get("unverified") or []
             if isinstance(i, dict) and not i.get("resolved") and i.get("id") and i.get("text")
         ]
-        if not carried:
-            return
+        dropped: list[dict[str, Any]] = []
+        if carried and self.urutau is not None:
+            carried, dropped = await self._drop_resolved_on_card(run, prev, carried)
+        state.setdefault("unverified", [])
+        # Number new items past every carried or dropped id, even when nothing is
+        # carried: a new U1 would otherwise share its id with a resolved card entry.
         numbers = [
-            int(i["id"][1:]) for i in carried if re.fullmatch(r"U\d+", str(i["id"])) is not None
+            int(i["id"][1:])
+            for i in carried + dropped
+            if re.fullmatch(r"U\d+", str(i["id"])) is not None
         ]
-        state["unverified"] = carried
         state["unverified_next"] = max(
             int(state.get("unverified_next", 1)),
             int(prev.state.get("unverified_next", 1)),
             max(numbers, default=0) + 1,
         )
+        if not carried:
+            run.save()
+            return
+        state["unverified"] = carried
         run.save()
-        run.event("unverified_carried", **{"from": prev.id, "count": len(carried)})
+        run.event(
+            "unverified_carried",
+            **{"from": prev.id, "count": len(carried), "dropped_resolved": len(dropped)},
+        )
+
+    async def _drop_resolved_on_card(
+        self, run: Run, prev: Run, items: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """(items to carry, items dropped as resolved on the card); records ``carry_check``."""
+        assert self.urutau is not None
+        urutau = run.state.setdefault("urutau", {})
+        try:
+            card_items = await self.urutau.get_card_unverified()
+        except Exception as exc:  # noqa: BLE001 - carrying goes on without the card
+            run.event("warning", source="urutau", code=_err_code(exc), message=_err_msg(exc))
+            urutau["carry_check"] = {"status": "unreachable", "message": _err_msg(exc)}
+            return items, []
+        if card_items is None:
+            urutau["carry_check"] = {"status": "unchecked"}
+            return items, []
+        by_id: dict[str, list[dict[str, Any]]] = {}
+        for c in card_items:
+            by_id.setdefault(c["id"], []).append(c)
+        resolved_text = {(c["kind"], _norm_text(c["text"])) for c in card_items if c["resolved"]}
+        sent = (prev.state.get("urutau") or {}).get("sent_items") or {}
+        keep: list[dict[str, Any]] = []
+        dropped: list[dict[str, Any]] = []
+        for item in items:
+            uids = [k for k, v in sent.items() if (v or {}).get("local_id") == item["id"]]
+            matched = [c for uid in [*uids, item["id"]] for c in by_id.get(uid, [])]
+            if matched:
+                resolved = any(c["resolved"] for c in matched)
+            else:
+                resolved = (item["kind"], _norm_text(item["text"])) in resolved_text
+            (dropped if resolved else keep).append(item)
+        urutau["carry_check"] = {"status": "ok", "dropped": len(dropped), "from": prev.id}
+        return keep, dropped
 
     def _new_urutau_run(self, run: Run) -> None:
         """Start a new Urutau run (``<run.id>-rN``): the previous one has ended."""
@@ -3199,6 +3253,16 @@ def _urutau_report_lines(state: dict[str, Any]) -> list[str]:
         if isinstance(item, dict) and item.get("carried_from") and not item.get("resolved"):
             carried[item["carried_from"]] = carried.get(item["carried_from"], 0) + 1
     lines.extend(f"carried from {src}: {n}" for src, n in carried.items())
+    check = urutau.get("carry_check") or {}
+    if check.get("status") == "ok" and check.get("dropped"):
+        lines.append(f"dropped {check['dropped']} item(s) resolved on Urutau")
+    elif check.get("status") == "unreachable":
+        lines.append(
+            "Urutau unreachable when carrying; carried unverified items as-is "
+            f"({check.get('message') or 'no detail'})"
+        )
+    elif check.get("status") == "unchecked":
+        lines.append("Urutau card has no unverified item list; carried as-is")
     return lines
 
 

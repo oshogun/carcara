@@ -20,6 +20,7 @@ from test_orchestrator import (
     TRIAGE_S,
     _refute,
     impl,
+    ordered_run_ids,  # noqa: F401 - pytest fixture
 )
 
 from carcara.backend import FakeBackend
@@ -716,3 +717,191 @@ def test_triage_only_run_sends_carried_items(repo):
     assert [i["id"] for i in end["unverified"]] == ["U1", "U2", "U3"]
     assert {i["carried_from"] for i in orch.run_state.state["unverified"]} == {prev.id}
     assert out.run_id != prev.id
+
+
+def _card_respond(items, *, board_error=None):
+    """get_board shows issue 7's card with ``items`` (None: no item list); record_run as usual."""
+    record = _open_counts([])
+
+    def respond(name, args):
+        if name != "get_board":
+            return record(name, args)
+        if board_error is not None:
+            return board_error
+        card = dict(sample("get_board-card.json"))
+        if items is not None:
+            card["unverified"] = items
+        return ok({"repo": "acme/widgets", "buckets": [{"id": "doing", "cards": [card]}]})
+
+    return respond
+
+
+def _events(orch) -> list[dict[str, Any]]:
+    text = (orch.run_state.dir / "events.jsonl").read_text()
+    return [json.loads(line) for line in text.splitlines()]
+
+
+def _sent_ids(log) -> set[str]:
+    return {i["id"] for c in record_calls(log) for i in c.get("unverified", [])}
+
+
+def test_item_resolved_on_card_is_not_carried_or_resent(repo):
+    prev = _reviewed_first_run(repo)
+    items = [
+        {"id": "U1", "kind": "external", "text": "ext item", "status": "resolved"},
+        {"id": "U2", "kind": "normative", "text": "norm item", "status": "open"},
+    ]
+    log: list = []
+    orch, _ = make(repo, S_SCRIPT, log=log, respond=_card_respond(items))
+    out = asyncio.run(orch.run("fix round"))
+    assert out.status == "done"
+    # One board read serves both the carry check and the estimate.
+    assert [n for n, _ in log] == ["get_board", "record_run", "record_run"]
+    state = orch.run_state.state
+    assert [i["id"] for i in state["unverified"]] == ["U2", "U3"]
+    assert state["unverified_next"] == 5
+    assert "U1" not in _sent_ids(log)
+    assert state["urutau"]["carry_check"] == {"status": "ok", "dropped": 1, "from": prev.id}
+    carried = [e for e in _events(orch) if e["event"] == "unverified_carried"]
+    assert carried[0]["count"] == 2 and carried[0]["dropped_resolved"] == 1
+    assert "dropped 1 item(s) resolved on Urutau" in out.report_text
+    assert f"carried from {prev.id}: 2" in out.report_text
+
+
+def test_item_resolved_on_card_matched_by_sent_id_or_text(repo):
+    prev = _reviewed_first_run(repo)
+    sent = prev.state["urutau"]["sent_items"]
+    sent["U1-r1"] = {**sent.pop("U1"), "withdrawn": False}
+    prev.save()
+    items = [
+        {"id": "U1-r1", "kind": "external", "text": "ext item, as sent", "resolved": True},
+        {"id": "Z3", "kind": "untested", "text": "  Untested   ITEM ", "status": "done"},
+        {"id": "U2", "kind": "normative", "text": "norm item", "resolved": False},
+    ]
+    log: list = []
+    orch, _ = make(repo, S_SCRIPT, log=log, respond=_card_respond(items))
+    out = asyncio.run(orch.run("fix round"))
+    assert out.status == "done"
+    assert [i["id"] for i in orch.run_state.state["unverified"]] == ["U2"]
+    assert _sent_ids(log) == {"U2"}
+    assert "dropped 2 item(s) resolved on Urutau" in out.report_text
+
+
+@pytest.mark.parametrize(
+    "board_error",
+    [err({"error": "server-error", "message": "boom"}), ToolReply(True, None, "bad schema")],
+)
+def test_unreachable_urutau_carries_as_is_and_says_so(repo, board_error):
+    prev = _reviewed_first_run(repo)
+    log: list = []
+    orch, _ = make(repo, S_SCRIPT, log=log, respond=_card_respond([], board_error=board_error))
+    out = asyncio.run(orch.run("fix round"))
+    assert out.status == "done"
+    state = orch.run_state.state
+    assert [i["id"] for i in state["unverified"]] == ["U1", "U2", "U3"]
+    assert _sent_ids(log) == {"U1", "U2", "U3"}
+    assert state["urutau"]["carry_check"]["status"] == "unreachable"
+    assert any(e["event"] == "warning" and e.get("source") == "urutau" for e in _events(orch))
+    assert "Urutau unreachable when carrying; carried unverified items as-is" in out.report_text
+    assert f"carried from {prev.id}: 3" in out.report_text
+    assert TOKEN not in run_files(orch)
+
+
+def test_card_without_item_list_carries_as_is(repo):
+    _reviewed_first_run(repo)
+    log: list = []
+    orch, _ = make(repo, S_SCRIPT, log=log, respond=_card_respond(None))
+    out = asyncio.run(orch.run("fix round"))
+    assert out.status == "done"
+    assert [n for n, _ in log] == ["get_board", "record_run", "record_run"]
+    assert _sent_ids(log) == {"U1", "U2", "U3"}
+    assert orch.run_state.state["urutau"]["carry_check"] == {"status": "unchecked"}
+    assert "Urutau card has no unverified item list; carried as-is" in out.report_text
+
+
+@pytest.mark.usefixtures("ordered_run_ids")
+def test_carry_chains_through_run_that_failed_before_review(repo):
+    first = _reviewed_first_run(repo)
+    resolved = [{"id": "U1", "kind": "external", "text": "ext item", "status": "resolved"}]
+    log2: list = []
+    orch2, _ = make(repo, {}, log=log2, respond=_card_respond(resolved), size="S")
+    assert asyncio.run(orch2.run("fix round")).status != "done"
+    second = orch2.run_state
+    assert [i["id"] for i in second.state["unverified"]] == ["U2", "U3"]
+
+    # The card no longer lists U1 at all: only run 2's state keeps it away.
+    log3: list = []
+    orch3, _ = make(repo, S_SCRIPT, log=log3, respond=_card_respond(None))
+    out = asyncio.run(orch3.run("fix round again"))
+    assert out.status == "done"
+    state = orch3.run_state.state
+    assert [(i["id"], i["carried_from"]) for i in state["unverified"]] == [
+        ("U2", second.id),
+        ("U3", second.id),
+    ]
+    assert "U1" not in _sent_ids(log3)
+    assert first.id not in out.report_text
+
+
+@pytest.mark.usefixtures("ordered_run_ids")
+def test_run_that_dropped_every_item_ends_the_chain(repo):
+    _reviewed_first_run(repo)
+    resolved = [
+        {"id": u, "kind": k, "text": t, "resolved": True}
+        for u, k, t in [
+            ("U1", "external", "ext item"),
+            ("U2", "normative", "norm item"),
+            ("U3", "untested", "untested item"),
+        ]
+    ]
+    log2: list = []
+    orch2, _ = make(repo, {}, log=log2, respond=_card_respond(resolved), size="S")
+    assert asyncio.run(orch2.run("fix round")).status != "done"
+    assert orch2.run_state.state["unverified"] == []
+    assert "dropped 3 item(s) resolved on Urutau" in (orch2.run_state.dir / "report.md").read_text()
+
+    log3: list = []
+    orch3, _ = make(repo, S_SCRIPT, log=log3, respond=_card_respond(None))
+    out = asyncio.run(orch3.run("fix round again"))
+    assert out.status == "done"
+    assert orch3.run_state.state["unverified"] == []
+    assert "carry_check" not in orch3.run_state.state["urutau"]
+    assert _sent_ids(log3) == set()
+    assert not any(e["event"] == "unverified_carried" for e in _events(orch3))
+    # Nothing to carry: no extra board read before the usual start call.
+    assert [n for n, _ in log3] == ["get_board", "record_run", "record_run"]
+
+
+@pytest.mark.usefixtures("ordered_run_ids")
+def test_new_item_after_every_carried_item_resolved_gets_fresh_id(repo):
+    _reviewed_first_run(repo)
+    resolved = [
+        {"id": u, "kind": k, "text": t, "resolved": True}
+        for u, k, t in [
+            ("U1", "external", "ext item"),
+            ("U2", "normative", "norm item"),
+            ("U3", "untested", "untested item"),
+        ]
+    ]
+    second = {**REVIEW_OK, "unverified": [{"id": "N", "kind": "untested", "text": "fresh"}]}
+    log2: list = []
+    orch2, _ = make(
+        repo,
+        {"implement": [impl()], "test": [TEST_OK], "review": [second]},
+        log=log2,
+        respond=_card_respond(resolved),
+        size="S",
+        review_small=True,
+    )
+    assert asyncio.run(orch2.run("fix round")).status == "done"
+    new_ids = [i["id"] for i in orch2.run_state.state["unverified"]]
+    assert new_ids == ["U5"]
+    assert _sent_ids(log2) == {"U5"}
+
+    # The card keeps the resolved U1..U3; the new open item must not match them.
+    card = [*resolved, {"id": "U5", "kind": "untested", "text": "fresh", "status": "open"}]
+    log3: list = []
+    orch3, _ = make(repo, S_SCRIPT, log=log3, respond=_card_respond(card))
+    assert asyncio.run(orch3.run("fix round again")).status == "done"
+    assert [i["id"] for i in orch3.run_state.state["unverified"]] == ["U5"]
+    assert _sent_ids(log3) == {"U5"}
