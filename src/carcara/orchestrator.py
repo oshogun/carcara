@@ -880,6 +880,11 @@ def _card_text(text: str) -> str:
     return _norm_text(text)
 
 
+def _urutau_run_id(run: Run) -> str:
+    """The Urutau run id ``run`` records under (record_run's ``runId``)."""
+    return (run.state.get("urutau") or {}).get("run_id") or run.id
+
+
 def _implement_paths(run: Run) -> list[str]:
     """Unique changed paths across all implement stages, in order."""
     paths: list[str] = []
@@ -1289,7 +1294,12 @@ class Orchestrator:
         Resolved items and probe results are not carried, nor items closed on
         the Urutau card since: resolved by a probe or accepted by a person (read
         once here; if Urutau cannot be read, or returns no item list, the items
-        are carried as-is and the report says so).
+        are carried as-is and the report says so). Urutau shows only a card's
+        latest run and item ids are reused across runs, so items are matched
+        only when the card's last run id is the previous run's Urutau run id;
+        otherwise (a run recorded from another checkout, or a previous run that
+        failed before record_run, so the card still shows an older run) they are
+        carried as-is and the report says the card shows a different run.
 
         Carrying chains run to run through each run's own state: a run that
         failed before review keeps its carried copies and passes them on, and a
@@ -1351,18 +1361,27 @@ class Orchestrator:
         prefix of the item's text that is at least ``_CARD_PREFIX_MIN`` long and
         that no other carried item of that kind shares. Otherwise the item is
         carried: re-sending is the safe failure, dropping the wrong item is not.
+
+        Items are matched only when the card's last run is the previous run's
+        Urutau run: ids are per run and reused, so on any other run id (or none)
+        every item is carried and ``carry_check`` is ``other_run``.
         """
         assert self.urutau is not None
         urutau = run.state.setdefault("urutau", {})
         try:
-            card_items = await self.urutau.get_card_unverified()
+            card = await self.urutau.get_card_unverified()
         except Exception as exc:  # noqa: BLE001 - carrying goes on without the card
             run.event("warning", source="urutau", code=_err_code(exc), message=_err_msg(exc))
             urutau["carry_check"] = {"status": "unreachable", "message": _err_msg(exc)}
             return items, []
-        if card_items is None:
+        if card is None:
             urutau["carry_check"] = {"status": "unchecked"}
             return items, []
+        if card.run_id is None or card.run_id != _urutau_run_id(prev):
+            # Item ids are per run and reused: another run's U3 is a different item.
+            urutau["carry_check"] = {"status": "other_run", "card_run_id": card.run_id}
+            return items, []
+        card_items = card.items
         by_id: dict[str, list[dict[str, Any]]] = {}
         for c in card_items:
             by_id.setdefault(c["id"], []).append(c)
@@ -1467,7 +1486,7 @@ class Orchestrator:
         payload: dict[str, Any] = {
             "repo": self.urutau.repo,
             "issue": self.urutau.issue,
-            "runId": (state.get("urutau") or {}).get("run_id") or run.id,
+            "runId": _urutau_run_id(run),
             "status": status,
             "observedBy": EXTENT_RULE_VERSION,
         }
@@ -3324,6 +3343,11 @@ def _urutau_report_lines(state: dict[str, Any]) -> list[str]:
         )
     elif check.get("status") == "unchecked":
         lines.append("Urutau card has no unverified item list; carried as-is")
+    elif check.get("status") == "other_run":
+        lines.append(
+            f"Urutau card shows a different run ({check.get('card_run_id') or 'none'}); "
+            "carried unverified items as-is"
+        )
     return lines
 
 

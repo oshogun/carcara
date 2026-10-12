@@ -271,6 +271,14 @@ class RecordResult:
     message: str = ""
 
 
+@dataclass(frozen=True)
+class CardUnverified:
+    """A card's last run id and its unverified items (see get_card_unverified)."""
+
+    run_id: str | None
+    items: list[dict[str, Any]]
+
+
 _SETUP_CODES = ("repo-not-allowed", "no-board", "run-id-taken", "call-stopped")
 # Closed item states on a card (urutau CardUnverifiedItemJson): resolved by a
 # probe, or accepted by a person. Any other status counts as open.
@@ -368,20 +376,23 @@ class UrutauClient:
         est = card["estimate"]
         return {"size": est.get("size"), "confidence": est.get("confidence")}
 
-    async def get_card_unverified(self) -> list[dict[str, Any]] | None:
-        """The card's unverified items as ``{id, kind, text, status, resolved}``.
+    async def get_card_unverified(self) -> CardUnverified | None:
+        """The card's last run id and unverified items as ``{id, kind, text, status, resolved}``.
 
-        Reads ``card.lastRun.unverifiedItems`` from a get_board read made with
-        ``includeUnverifiedItems``; ``resolved`` is true for status resolved or
-        accepted. None when the issue has no card, no last run, or no item list
-        (an older Urutau that ignores the flag). The read is kept for the next
-        get_estimate.
+        Reads ``card.lastRun.runId`` and ``card.lastRun.unverifiedItems`` from a
+        get_board read made with ``includeUnverifiedItems``; ``resolved`` is true
+        for status resolved or accepted. get_board shows only the latest run per
+        card, and item ids are per run and reused across runs, so callers must
+        check ``run_id`` (None when the card has no runId) before matching items.
+        None when the issue has no card, no last run, or no item list (an older
+        Urutau that ignores the flag). The read is kept for the next get_estimate.
         """
         card = await self._get_card(keep=True, include_unverified=True)
         last = card.get("lastRun") if card is not None else None
         items = last.get("unverifiedItems") if isinstance(last, dict) else None
         if not isinstance(items, list):
             return None
+        run_id = last.get("runId") if isinstance(last, dict) else None
         out: list[dict[str, Any]] = []
         for item in items:
             if not isinstance(item, dict) or not all(
@@ -398,7 +409,7 @@ class UrutauClient:
                     "resolved": status in _RESOLVED_STATUSES,
                 }
             )
-        return out
+        return CardUnverified(run_id if isinstance(run_id, str) else None, out)
 
     async def _get_card(
         self, *, keep: bool = False, include_unverified: bool = False

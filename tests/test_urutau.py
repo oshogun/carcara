@@ -388,7 +388,9 @@ def test_get_card_unverified_reads_open_resolved_and_accepted_items():
     items.append({"id": "U9", "kind": "external", "text": None, "status": "open"})
     items.append("junk")
     client, log, _, _ = make_client([ok(board(bucket("doing", [card])))])
-    assert run(client.get_card_unverified()) == [
+    result = run(client.get_card_unverified())
+    assert result.run_id == "c-20261008-0001"
+    assert result.items == [
         {"id": "U1", "kind": "external", "text": "ext item", "status": "open", "resolved": False},
         {
             "id": "U2",
@@ -425,12 +427,25 @@ def test_get_card_unverified_unknown_status_counts_as_open():
         ],
     }
     client, _, _, _ = make_client([ok(board(bucket("doing", [card])))])
-    items = run(client.get_card_unverified())
+    items = run(client.get_card_unverified()).items
     assert [(i["id"], i["resolved"]) for i in items] == [
         ("U1", False),
         ("U2", False),
         ("U3", False),
     ]
+
+
+@pytest.mark.parametrize("run_id", ["absent", None, 7])
+def test_get_card_unverified_without_string_run_id_keeps_items(run_id):
+    card = sample("get_board-card-unverified.json")
+    last = {k: v for k, v in card["lastRun"].items() if k != "runId"}
+    if run_id != "absent":
+        last["runId"] = run_id
+    card["lastRun"] = last
+    client, _, _, _ = make_client([ok(board(bucket("doing", [card])))])
+    result = run(client.get_card_unverified())
+    assert result.run_id is None
+    assert [i["id"] for i in result.items] == ["U1", "U2", "U3", "U4"]
 
 
 def test_get_card_unverified_none_without_card_or_list():
@@ -454,7 +469,7 @@ def test_get_card_unverified_pages_buckets():
     first = board(bucket("todo", [other], more=True))
     second = board(bucket("todo", [card], offset=1))
     client, log, _, _ = make_client([ok(first), ok(second)])
-    assert [i["id"] for i in run(client.get_card_unverified())] == ["U1", "U2", "U3", "U4"]
+    assert [i["id"] for i in run(client.get_card_unverified()).items] == ["U1", "U2", "U3", "U4"]
     assert len(log) == 2
     assert all(args["includeUnverifiedItems"] is True for _, args in log)
     assert log[1][1]["buckets"] == ["todo"] and log[1][1]["offset"] == 1
@@ -483,11 +498,11 @@ def test_unflagged_kept_read_does_not_serve_the_carry_check():
     script = [ok(board(bucket("doing", [plain]))), ok(board(bucket("doing", [card])))]
     client, log, _, _ = make_client(script[1:])
     client._card_cache = (plain, False)  # as if an estimate read had been kept
-    assert len(run(client.get_card_unverified())) == 4
+    assert len(run(client.get_card_unverified()).items) == 4
     assert [args.get("includeUnverifiedItems") for _, args in log] == [True]
     client, log, _, _ = make_client(script)
     assert run(client.get_estimate()) is None
-    assert len(run(client.get_card_unverified())) == 4
+    assert len(run(client.get_card_unverified()).items) == 4
     assert [args.get("includeUnverifiedItems") for _, args in log] == [None, True]
 
 

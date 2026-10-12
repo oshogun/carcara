@@ -126,14 +126,25 @@ SHAs are stored for reports and shown nowhere on the board.
 `CardUnverifiedItemJson`): `get_board` called with `includeUnverifiedItems: true` adds
 `card.lastRun.unverifiedItems`, a list of `{id, kind, text, status}` with `status` one of `open`,
 `resolved` (a probe closed it) or `accepted` (a person accepted it); withdrawn items are left out
-(see `get_board-card-unverified.json`). Only carcara's carry check sends the flag, on the first call
+(see `get_board-card-unverified.json`). Confirmed with the Urutau maintainer: the call is
+`get_board({repo, includeUnverifiedItems: true, buckets?})`; `lastRun.runId` is the Urutau run id;
+`lastRun.unverifiedItems` is `[{id, kind, text, status}]` with `status` `open|resolved|accepted`; the
+key is absent without the flag and `[]` when the run has none; ids are exactly what `record_run`
+received, so they are per run and reused across runs; `get_board` shows only the latest run per
+card; text is cut to 280 characters and a run keeps at most 20 items. Only carcara's carry check
+sends the flag, on the first call
 and every paged call; estimate reads do not, so they stay small. Before a new run carries the
 previous run's open unverified items, carcara drops those that are `resolved` or `accepted` on the
-card. Urutau cleans and caps `id` and `text` for display (`cleanText`, `DISPLAY_CAPS`: a cut text
+card, but only when `lastRun.runId` equals the Urutau run id the previous run recorded under (its
+`urutau.run_id`, else its own id). Any other run id, or none, means the card shows another run
+(recorded from another checkout, or the previous run failed before `record_run`), whose `U3` is a
+different item: carcara carries every item as-is, records "other_run" and its report says the card
+shows a different run. Urutau cleans and caps `id` and `text` for display (`cleanText`, `DISPLAY_CAPS`: a cut text
 ends in `…`), so carcara matches by id first (the uid it sent, then the item's id). Only an item with
 no id on the card falls back to its text: a closed card item of the same kind matches when the texts
 are equal after normalising, or when the card text, without its `…`, is a prefix of the item's text
 of at least 24 characters that no other carried item of that kind shares. Anything else is carried,
 since re-sending is the safe failure. A card without the list (an older Urutau that ignores the
-flag) is "unchecked", and an unreachable Urutau is "unreachable": carcara carries the items
-unchanged and says so in its report.
+flag) is "unchecked", an unreachable Urutau is "unreachable", and a card showing another run is
+"other_run": in each case carcara carries the items unchanged and says so in its report; a checked
+card is "ok".
