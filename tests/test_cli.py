@@ -16,7 +16,7 @@ def test_version_flag(capsys):
 
 
 def test_version_is_0_2_0():
-    assert __version__ == "0.3.0"
+    assert __version__ == "1.0.0"
 
 
 def test_distribution_name_and_script():

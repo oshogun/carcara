@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 1.0.0
+
+carcara now runs natively on Windows (#12); CI tests windows-latest
+alongside Linux.
 
 ### Changed
 - The PyPI distribution is now named `carcara-sdlc` (`carcara` is taken on
@@ -39,6 +42,26 @@
   that needs evidence or a second refuter, otherwise it is kept as an
   unverified item. The reviewer template requires `reason` on every major or
   blocker.
+- A run whose plan or implementation touches a low-verifiability path now
+  gets a review whatever its size (#23); S runs no longer need `--review`.
+  Why review ran is recorded as `review_reason` in the state, the report and
+  `carcara status`.
+- The verifiability gate and the forced-review check now run again after
+  every implement round, not only the first (#37). Paths a human already
+  approved (`gate_approved_paths`) do not gate again; new ones do.
+- The test stage runs the test commands itself, each as a subprocess with a
+  hard wall-clock timeout, and calls a model only to summarise failures
+  (#43). Commands come from `test_commands` in `.carcara/config.json`
+  (per-command timeout `test_timeout_s`) or are discovered from
+  `pyproject.toml`; the test-runner agent remains the fallback when no
+  commands are known.
+- The implementer and test-runner Bash deny-list now also refuses
+  `git commit` and other ref-moving git commands (reset, stash, tag, merge,
+  rebase, pull, branch -f/-d/-m, ...) and `git -c alias.*` (#21). Nested
+  `bash -c`/`eval` code is checked recursively.
+- `--ultra`: a refuter that raises a finding to major or blocker must give
+  a security or correctness `raise_reason`; otherwise the raise is capped at
+  minor (#34).
 
 ### Added
 - `carcara runs prune` deletes old run directories under `.carcara/runs/`
@@ -132,6 +155,24 @@
   followed with it). Interactive gates send `awaiting_approval` while they
   wait; resuming a run Urutau already saw end reports under `<run id>-rN`.
   See "Urutau integration" in the README.
+- Native Windows support (#12): `.gitattributes` keeps text files LF,
+  profiles accept CRLF line endings, paths are compared normalised, resume
+  commands are quoted for the native shell and test commands are killed as a
+  process tree. CI adds windows-latest for Python 3.10-3.13.
+- `carcara run --issue N --triage-only` runs only triage and stops with the
+  local status `triaged` (#31). The report gives the size range, uncertainty
+  kind and rationale; with Urutau reporting on, the card records the range.
+- A new run on an issue carries the previous run's open unverified items
+  into the reviewer's inventory and re-sends them to Urutau marked
+  `carried_from` (#25). A new review replaces the carried set.
+- Carried unverified items a person marked resolved or accepted on Urutau are
+  no longer carried (#46). This needs an Urutau that returns card items with
+  `includeUnverifiedItems`; with an older one, or when Urutau is unreachable,
+  items are carried unchecked as before.
+- `carcara runs prune` keeps each issue's newest carry source, the newest
+  run whose inventory still has open unverified items (#47). `--dry-run` and
+  `--json` show it as `carry source for #N`; `--include-carry-sources`
+  prunes them too.
 
 ### Fixed
 - `carcara run` now defaults to the profile chosen at `carcara install`
@@ -141,6 +182,20 @@
 - A stage that ends without structured output is retried once, with a nudge
   to emit its result, before the run fails. Both attempts' costs are counted
   (#15).
+- `carcara uninstall --purge` checks every active-run leftover before
+  removing anything and holds the run lock for the whole purge, so a run
+  cannot start in between (#17).
+- `carcara status --plan` shows the plan a post-implement verifiability gate
+  is waiting on, instead of reporting "has no plan" (#24).
+- A stale verifiability gate no longer forces review on later rounds once the
+  diff stops touching a gated path (#35).
+- A review forced by the verifiability gate now runs once even when the fix
+  loop ends with failing tests, so a gated change finished with
+  `--accept-failures` is still reviewed (#36).
+- The test stage no longer hangs on background polling (#39). Stages can
+  have a wall-clock limit (test: 900 s), a stage that times out or ends
+  without structured output gets one "report what you have" follow-up, and
+  the test-runner may not background commands or poll in sleep loops.
 
 ### Removed
 - The deprecated bash `bin/carcara` (deprecated in 0.2.0). Install the Python
