@@ -27,6 +27,7 @@ def _hook(name, data, project=None, raw=None, env=None, extra_args=()):
         input=raw if raw is not None else json.dumps(data),
         capture_output=True,
         text=True,
+        encoding="utf-8",
         env=_env(**(env or {})),
         timeout=30,
     )
@@ -636,6 +637,7 @@ def _routing(*args):
         [sys.executable, "-m", "carcara", "routing", *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         env=_env(),
         timeout=30,
     )

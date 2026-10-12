@@ -50,6 +50,7 @@ def test_module_entry_point():
         [sys.executable, "-m", "carcara", "--version"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     assert out.stdout.strip() == f"carcara {__version__}"

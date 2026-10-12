@@ -265,6 +265,8 @@ def run_cli(argv, cwd, check=False):
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="strict",
         check=check,
     )
 
@@ -421,6 +423,7 @@ def test_oserror_is_reported_without_traceback(tmp_path):
         [sys.executable, "-m", "carcara", "install", str(target)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     assert proc.returncode == 1
     assert proc.stderr.startswith("carcara: ")

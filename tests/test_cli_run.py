@@ -602,6 +602,7 @@ def test_sigterm_saves_state_and_exits_130(repo, fake, tmp_path, sleep):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
         env=env,
     )
     lines = []
