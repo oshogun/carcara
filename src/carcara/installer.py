@@ -867,10 +867,11 @@ PURGE_LOCK_ID = "uninstall-purge"
 def _purge_lock_paths(target: str) -> list[str]:
     """``active.json`` (if present) and the ``acquire_lock`` leftovers next to it."""
     active = f"{target}/{ACTIVE_RUN_REL}"
+    # Rebuilt from the basename so displayed paths use "/" on every OS.
     leftovers = sorted(
-        path
+        f"{target}/.carcara/{os.path.basename(path)}"
         for pattern in runstore.LOCK_LEFTOVER_GLOBS
-        for path in glob.glob(os.path.join(glob.escape(f"{target}/.carcara"), pattern))
+        for path in glob.glob(f"{glob.escape(f'{target}/.carcara')}/{pattern}")
     )
     return ([active] if os.path.lexists(active) else []) + leftovers
 

@@ -1097,6 +1097,13 @@ def runs_main(ns: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if sys.platform == "win32":
+        # Redirected streams default to the locale code page there (e.g. cp1252).
+        for stream in (sys.stdout, sys.stderr):
+            reconfigure = getattr(stream, "reconfigure", None)
+            if reconfigure is not None:
+                with suppress(ValueError, OSError):
+                    reconfigure(encoding="utf-8", errors="replace")
     args = list(sys.argv[1:] if argv is None else argv)
     # Back-compat with the 0.1.0 flag-only interface: anything that is not a
     # subcommand or a top-level -h/-V is an install invocation.

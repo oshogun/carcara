@@ -387,7 +387,7 @@ class RunStore:
         self.base.mkdir(parents=True, exist_ok=True)
         ignore = self.base / ".gitignore"
         if not ignore.exists():
-            ignore.write_text("*\n", encoding="utf-8")
+            ignore.write_bytes(b"*\n")
 
     def _ensure_root(self) -> None:
         self._ensure_base()

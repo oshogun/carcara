@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import types
@@ -4313,22 +4314,38 @@ def _test_entry(orch, key="test"):
     return orch.run_state.stage(key)
 
 
+def _py(code):
+    """A shell command running ``code`` with this interpreter (sh and cmd.exe).
+
+    ``code`` must not contain double quotes, ``$``, backticks or backslashes
+    (sh treats them specially inside double quotes); use single-quoted strings.
+    """
+    return f'"{sys.executable}" -c "{code}"'
+
+
+def _fail(text, code):
+    """A shell command printing ``text`` and exiting with ``code``."""
+    return _py(f"import sys; print('{text}'); sys.exit({code})")
+
+
 def test_known_commands_passing_make_no_test_model_call(repo):
-    _config(repo, test_commands=["true"])
+    ok = _py("pass")
+    _config(repo, test_commands=[ok])
     orch, backend, _ = make(repo, {"implement": [impl()]}, size="S")
     assert go(orch).status == "done"
     assert all(r.stage not in ("test", "test-summary") for r in backend.requests)
     entry = _test_entry(orch)
-    assert entry["output"] == {"passed": True, "commands": ["true"], "failures": []}
+    assert entry["output"] == {"passed": True, "commands": [ok], "failures": []}
     assert (entry["cost_usd"], entry["role"], entry["model"]) == (0.0, None, None)
     completed = _events(orch, "test_command_completed")
-    assert [(e["cmd"], e["exit_code"], e["timed_out"]) for e in completed] == [("true", 0, False)]
+    assert [(e["cmd"], e["exit_code"], e["timed_out"]) for e in completed] == [(ok, 0, False)]
     assert _events(orch, "test_commands_resolved")[0]["source"] == "config"
-    assert orch.run_state.state["test_commands"] == ["true"]
+    assert orch.run_state.state["test_commands"] == [ok]
 
 
 def test_failing_command_summarised_once_and_fed_to_fix_loop(repo):
-    _config(repo, test_commands=["true", "echo boom; exit 1"])
+    ok, boom = _py("pass"), _fail("boom", 1)
+    _config(repo, test_commands=[ok, boom])
     summary = {"failures": [{"name": "x", "detail": "boom"}]}
     n = MAX_FIX_ITERATIONS + 1
     orch, backend, _ = make(
@@ -4345,7 +4362,7 @@ def test_failing_command_summarised_once_and_fed_to_fix_loop(repo):
     assert "boom" in summaries[0].prompt
     assert _test_entry(orch)["output"] == {
         "passed": False,
-        "commands": ["true", "echo boom; exit 1"],
+        "commands": [ok, boom],
         "failures": [{"name": "x", "detail": "boom"}],
     }
     # The fix loop re-runs the commands deterministically and summarises each round once.
@@ -4373,7 +4390,8 @@ def test_hanging_command_times_out_as_failure(repo):
 
 
 def test_summary_failure_falls_back_to_command_output(repo):
-    _config(repo, test_commands=["echo kaput; exit 2"])
+    cmd = _fail("kaput", 2)
+    _config(repo, test_commands=[cmd])
     orch, _, _ = make(
         repo,
         {"implement": [impl()], "test-summary": [BackendError("down")] * 2},
@@ -4384,14 +4402,15 @@ def test_summary_failure_falls_back_to_command_output(repo):
     # The summary failure did not stop the run: it went on into the fix loop.
     assert "stage fix-1:implement failed" in out.report_text
     [failure] = _test_entry(orch)["output"]["failures"]
-    assert failure["name"] == "echo kaput; exit 2"
+    assert failure["name"] == cmd
     assert "exit code 2" in failure["detail"] and "kaput" in failure["detail"]
     assert _events(orch, "test_summary_fallback")
 
 
 def test_deterministic_test_stage_replayed_on_resume(repo):
     log = repo.parent / "ran.log"
-    _config(repo, test_commands=[f"echo x >> {log}"])
+    append = f"open({log.as_posix()!r}, 'ab').write(b'x' + bytes([10]))"
+    _config(repo, test_commands=[_py(append)])
     orch, backend, _ = make(
         repo,
         {"implement": [impl()]},
@@ -4416,8 +4435,12 @@ def test_test_commands_do_not_see_secrets(repo, monkeypatch):
     _config(
         repo,
         test_commands=[
-            f'echo "[$URUTAU_MCP_TOKEN][$URUTAU_URL][$ANTHROPIC_API_KEY]'
-            f'[$ANTHROPIC_AUTH_TOKEN][$CARCARA_STAGE]" > {out}'
+            _py(
+                "import os; names = ('URUTAU_MCP_TOKEN', 'URUTAU_URL', 'ANTHROPIC_API_KEY', "
+                "'ANTHROPIC_AUTH_TOKEN', 'CARCARA_STAGE'); "
+                f"open({out.as_posix()!r}, 'w').write("
+                "''.join('[' + os.environ.get(n, '') + ']' for n in names))"
+            )
         ],
     )
     orch, _, _ = make(repo, {"implement": [impl()]}, size="S")
@@ -4434,15 +4457,16 @@ def test_no_known_commands_uses_test_runner_agent(repo):
 
 
 def test_discovered_commands_are_stored(repo, monkeypatch):
-    monkeypatch.setattr("carcara.orchestrator.discover_test_commands", lambda cwd: ["true"])
+    ok = _py("pass")
+    monkeypatch.setattr("carcara.orchestrator.discover_test_commands", lambda cwd: [ok])
     orch, _, _ = make(repo, {"implement": [impl()]}, size="S")
     assert go(orch).status == "done"
-    assert orch.run_state.state["test_commands"] == ["true"]
+    assert orch.run_state.state["test_commands"] == [ok]
     assert _events(orch, "test_commands_resolved")[0]["source"] == "discovered"
 
 
 def test_summary_cost_is_folded_into_the_test_stage(repo):
-    _config(repo, test_commands=["echo boom; exit 1"])
+    _config(repo, test_commands=[_fail("boom", 1)])
     summary = {"failures": [{"name": "x", "detail": "boom"}]}
     orch, backend, _ = make(
         repo,
@@ -4462,7 +4486,7 @@ def test_summary_cost_is_folded_into_the_test_stage(repo):
 
 
 def test_resume_ignores_stale_summary_and_summarises_fresh_results(repo):
-    _config(repo, test_commands=["echo fresh; exit 1"])
+    _config(repo, test_commands=[_fail("fresh", 1)])
     over = StageResult(subtype="error_max_budget_usd", is_error=True)
     orch, _, _ = make(repo, {"implement": [impl()], "test-summary": [over]}, size="S")
     # The summary call stops the run before the test stage records anything.

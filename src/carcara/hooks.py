@@ -643,7 +643,7 @@ def routing_main(action: str, project: str) -> int:
         base.mkdir(parents=True, exist_ok=True)
         ignore = base / ".gitignore"
         if not ignore.exists():
-            ignore.write_text("*\n", encoding="utf-8")
+            ignore.write_bytes(b"*\n")
         flag.write_text("", encoding="utf-8")
     elif action == "on":
         flag.unlink(missing_ok=True)
