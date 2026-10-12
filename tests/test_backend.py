@@ -25,6 +25,9 @@ from carcara.schemas import schema_for
 ROLES = load_roles()
 PROFILE = load_profile("quality")
 CWD = "/repo"
+# Coarse OS timer resolution (~15.6 ms on Windows) can make a measured duration
+# fall slightly short of the timeout it was waiting on.
+TIMER_SLACK_MS = 20
 
 IMPLEMENT_OK = {
     "changed": [{"path": "a.py", "summary": "x"}],
@@ -459,4 +462,5 @@ def test_timeout_raises_stage_timeout_with_session(monkeypatch):
         run(SdkBackend(), req)
     res = info.value.result
     assert res.session_id == "sess-init" and res.stop_reason == "timeout"
-    assert res.is_error and res.duration_ms is not None and res.duration_ms >= 50
+    assert res.is_error and res.duration_ms is not None
+    assert 50 - TIMER_SLACK_MS <= res.duration_ms < 5000
