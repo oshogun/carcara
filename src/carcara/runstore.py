@@ -211,7 +211,7 @@ class Run:
         key: str,
         stage: str,
         role: str | None,
-        model: str,
+        model: str | None,
         output: Any,
         cost_usd: float,
         usage: dict[str, Any] | None,

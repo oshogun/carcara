@@ -103,6 +103,12 @@ def test_dry_run_small_notes_gate_review(repo, capsys):
     assert "only if the verifiability gate" not in capsys.readouterr().out
 
 
+def test_dry_run_notes_deterministic_test_commands(repo, capsys):
+    assert run(repo, "--dry-run", "--size", "S") == 0
+    out = capsys.readouterr().out
+    assert "test-runner model only summarises failures" in out
+
+
 def test_dry_run_ultra_shows_parallel_rows(repo, capsys):
     assert run(repo, "--dry-run", "--size", "L", "--ultra") == 0
     out = capsys.readouterr().out

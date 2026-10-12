@@ -325,7 +325,8 @@ the report's total line), and the cap may be exceeded by that unknown amount.
 
 **Stage stops and follow-ups.** Each `stage_error` event (and each entry in
 `failed_attempts` in `state.json`) records why the attempt stopped: `subtype`,
-`stop_reason`, `num_turns` and `duration_ms`. The test stage has a wall-clock
+`stop_reason`, `num_turns` and `duration_ms`. The test-runner agent (used only
+when no [test commands](#project-config-carcaraconfigjson) are known) has a wall-clock
 limit of 900 s (`RunOptions.stage_timeout_s`); other stages have none. A timed-out
 attempt has `stop_reason: "timeout"` and its cost is uncounted. When a stage
 ends without structured output, or times out, carcara sends one cheap follow-up
@@ -582,7 +583,9 @@ the file mid-run has no effect on that run. Agents cannot write it.
 ```json
 {
   "verifiability_paths": [".github/**", "**/migrations/**", "**/auth/**", "**/policy*", "**/policy/**"],
-  "probes": {"pypi-name": "https://pypi.org/pypi/{arg}/json"}
+  "probes": {"pypi-name": "https://pypi.org/pypi/{arg}/json"},
+  "test_commands": [".venv/bin/ruff check .", ".venv/bin/ruff format --check .", ".venv/bin/pytest -q"],
+  "test_timeout_s": 900
 }
 ```
 
@@ -596,6 +599,36 @@ It is `confirmed` or `contradicted` against the item's expectation, and any
 other status, or an error, counts as `inconclusive`. Probes do not follow
 redirects (a 3xx is `inconclusive` with result `redirect`) and ignore proxy
 environment variables.
+
+**Test commands.** The test stage runs `test_commands` itself, in order, as
+shell commands in the run's directory, with stdin closed and each in its own
+session. Every command runs even after an earlier one fails. A command that
+exceeds `test_timeout_s` (per command; default 900 s, `RunOptions.test_timeout_s`
+overrides it) is killed with its whole process group and reported as a failure
+that says it timed out. When every command exits 0, the `test` result is built
+without any model call and costs nothing. When any fails, one short no-tools
+call on the test-runner model turns the failing commands and an output excerpt
+into the `failures` list. That call is not memoised on its own: its cost and
+usage are recorded on the `test` stage, and a resume that finds no `test` entry
+reruns the commands and summarises the fresh results. If that call fails, carcara
+lists each failing command with its output tail instead.
+
+Without `test_commands`, carcara discovers them once per run and stores them in
+`state.json` (`test_commands`; `--resume` reuses them). `[tool.ruff]` in
+`pyproject.toml` gives `ruff check .` and `ruff format --check .`;
+`[tool.pytest.ini_options]`, a `pytest.ini` or a `tests/` directory gives
+`pytest`. Each tool runs from `.venv/bin/` when the project has it there. The
+`test_commands_resolved` event records the list and its source (`config`,
+`discovered` or `none`). If nothing is found, or `test_commands` is `[]`, the
+test-runner agent runs the tests as before. Discovery can pick a tool the
+project does not install. A command that is not found then fails the stage
+(exit 127), so set `test_commands` explicitly in that case.
+
+These commands come from the repository and are not checked against the agents'
+[Bash deny-list](#tool-policy). Trust them as you would the project's own scripts.
+They run with the same environment filtering as agent stages: `URUTAU_MCP_TOKEN`
+and `URUTAU_URL` are removed, API-key variables are removed unless
+`--use-api-key` is set, and `CARCARA_STAGE=test-runner` is set.
 
 `pyproject.toml` is not gated by default. Only its version/publish sections
 matter for releases, and patterns match whole paths. If you want every change

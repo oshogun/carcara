@@ -60,6 +60,13 @@ def test_probes_loaded(tmp_path):
         {"probes": {"p": "https://example.com/{arg}/{arg}"}},
         {"probes": {"p": "https://user:pass@example.com/{arg}"}},
         {"probes": {"p": "https://{arg}.example.com/"}},
+        {"test_commands": "pytest"},
+        {"test_commands": ["pytest", ""]},
+        {"test_commands": [1]},
+        {"test_timeout_s": 0},
+        {"test_timeout_s": -5},
+        {"test_timeout_s": "60"},
+        {"test_timeout_s": True},
     ],
 )
 def test_invalid_config_raises(tmp_path, data):
@@ -124,3 +131,21 @@ def test_config_dict_round_trip():
     cfg = ProjectConfig(verifiability_paths=["a/**"], probes={"p": "https://h/{arg}"})
     assert parse_project_config(cfg.to_dict()) == cfg
     assert parse_project_config(ProjectConfig().to_dict()) == ProjectConfig()
+    cfg = ProjectConfig(test_commands=["ruff check .", "pytest"], test_timeout_s=60.0)
+    assert parse_project_config(cfg.to_dict()) == cfg
+    assert parse_project_config(ProjectConfig(test_commands=[]).to_dict()).test_commands == []
+
+
+def test_test_commands_defaults_and_loading(tmp_path):
+    cfg = load_project_config(str(tmp_path))
+    assert cfg.test_commands is None
+    assert cfg.test_timeout_s is None
+    # Snapshots from before these keys existed still parse.
+    old = parse_project_config({"verifiability_paths": ["a/**"], "probes": {}})
+    assert old.test_commands is None and old.test_timeout_s is None
+    write_config(tmp_path, {"test_commands": ["pytest -q"], "test_timeout_s": 300})
+    cfg = load_project_config(str(tmp_path))
+    assert cfg.test_commands == ["pytest -q"]
+    assert cfg.test_timeout_s == 300.0
+    write_config(tmp_path, {"test_commands": []})
+    assert load_project_config(str(tmp_path)).test_commands == []

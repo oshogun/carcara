@@ -68,6 +68,18 @@ URUTAU_ENV_VARS = ("URUTAU_MCP_TOKEN", "URUTAU_URL")
 STAGE_ENV_VAR = "CARCARA_STAGE"
 
 
+def subprocess_env(stage: str, use_api_key: bool = False) -> dict[str, str]:
+    """``os.environ`` as a stage's own subprocesses should see it.
+
+    Drops the Urutau settings and (unless ``use_api_key``) the API keys, as
+    for agent stages, and sets ``CARCARA_STAGE`` to ``stage``.
+    """
+    hidden = URUTAU_ENV_VARS + (() if use_api_key else API_KEY_ENV_VARS)
+    env = {k: v for k, v in os.environ.items() if k not in hidden}
+    env[STAGE_ENV_VAR] = stage
+    return env
+
+
 @contextmanager
 def _without_env(names: tuple[str, ...]) -> Iterator[None]:
     """Temporarily remove ``names`` from ``os.environ`` (process-global)."""
@@ -160,13 +172,16 @@ def build_request(
     key: str | None = None,
     schema: str | None = None,
     timeout_s: float | None = None,
+    model_role: str | None = None,
 ) -> StageRequest:
     """Assemble a stage request; ``role=None`` means the main model with no tools.
 
     ``schema`` names the output schema when it differs from ``stage``.
+    ``model_role`` picks another role's model for a no-tools (``role=None``)
+    request, e.g. the test-runner model for failure summaries.
     """
     if role is None:
-        model = model_for("main", profile)
+        model = model_for(model_role or "main", profile)
         append = MAIN_PROMPT + STAGE_SCHEMA_NOTE
         # Only StructuredOutput (how the CLI returns json_schema output). Never
         # use "*" in disallowed_tools: it would remove StructuredOutput too.

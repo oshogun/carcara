@@ -400,7 +400,11 @@ def _dry_run(profile: Any, ns: argparse.Namespace, cwd: str, origin: str) -> str
         if size == "L":
             out.append("  (implement runs once per plan step; docs only for user-facing changes)")
     out.append(
-        "\n(the gate also triggers when the plan or, for S, the changed files touch"
+        "\n(test runs the known test commands directly; the test-runner model only"
+        " summarises failures, or runs them itself when no commands are known)"
+    )
+    out.append(
+        "(the gate also triggers when the plan or, for S, the changed files touch"
         " low-verifiability paths; see .carcara/config.json verifiability_paths)"
     )
     return "\n".join(out) + "\n"

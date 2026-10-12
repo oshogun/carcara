@@ -160,6 +160,8 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "failures": _arr(_obj({"name": _STR, "detail": _STR})),
         }
     ),
+    # Failure summary for deterministic test commands (no-tools call).
+    "test-summary": _obj({"failures": _arr(_obj({"name": _STR, "detail": _STR}))}),
     "review": _REVIEW,
     "review-dim": _REVIEW,
     "review-refute": _REFUTE,

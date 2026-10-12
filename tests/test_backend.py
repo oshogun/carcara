@@ -15,10 +15,11 @@ from carcara.backend import (
     StageResult,
     StageTimeout,
     build_request,
+    subprocess_env,
 )
 from carcara.policy import KNOWN_TOOLS, STRUCTURED_OUTPUT_TOOL
 from carcara.profiles import load_profile
-from carcara.roles import load_roles
+from carcara.roles import load_roles, model_for
 from carcara.schemas import schema_for
 
 ROLES = load_roles()
@@ -160,6 +161,14 @@ def test_main_model_request_has_no_tools(monkeypatch):
     hook = opts.hooks["PreToolUse"][0].hooks[0]
     out = asyncio.run(hook({"tool_name": "Read", "tool_input": {}}, None, None))
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_no_tools_request_can_use_another_roles_model():
+    req = build_request("test-summary", None, PROFILE, "summarise", CWD, model_role="test-runner")
+    assert req.role is None
+    assert req.model == model_for("test-runner", PROFILE) != model_for("main", PROFILE)
+    assert req.allowed_tools == [STRUCTURED_OUTPUT_TOOL]
+    assert req.output_schema == schema_for("test-summary")
 
 
 def test_on_message_callback(monkeypatch):
@@ -333,6 +342,18 @@ def test_sdk_backend_hides_api_keys_by_default_and_restores(monkeypatch):
     assert not set(KEY_VARS) & set(impl_request().env)
     assert os.environ["ANTHROPIC_API_KEY"] == "sk-test"
     assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "tok-test"
+
+
+def test_subprocess_env_hides_secrets_and_sets_stage(monkeypatch):
+    for name in (*KEY_VARS, *URUTAU_ENV_VARS):
+        monkeypatch.setenv(name, "secret")
+    monkeypatch.setenv("KEEP_ME", "1")
+    env = subprocess_env("test-runner")
+    assert not (set(KEY_VARS) | set(URUTAU_ENV_VARS)) & set(env)
+    assert (env["KEEP_ME"], env["CARCARA_STAGE"]) == ("1", "test-runner")
+    with_key = subprocess_env("test-runner", use_api_key=True)
+    assert all(with_key[name] == "secret" for name in KEY_VARS)
+    assert not set(URUTAU_ENV_VARS) & set(with_key)
 
 
 def test_sdk_backend_restores_api_keys_on_exception(monkeypatch):

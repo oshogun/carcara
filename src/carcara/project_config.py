@@ -7,6 +7,11 @@ Keys (all optional; unknown keys are an error):
   ``DEFAULT_VERIFIABILITY_PATHS``; ``[]`` disables the trigger.
 - ``probes``: name -> URL template for read-only, unauthenticated HTTP GET
   checks, with exactly one ``{arg}`` placeholder outside the host.
+- ``test_commands``: shell commands the test stage runs itself, in order.
+  Absent or ``null`` means not configured (commands are discovered); ``[]``
+  means no known commands, so the test-runner agent is used.
+- ``test_timeout_s``: positive per-command wall-clock timeout for
+  ``test_commands``, in seconds.
 
 Model profiles (``.env`` ``MODEL_*`` files) are separate and not read here.
 """
@@ -32,7 +37,7 @@ DEFAULT_VERIFIABILITY_PATHS: tuple[str, ...] = (
     "**/policy/**",
 )
 PLACEHOLDER = "{arg}"
-_KEYS = ("verifiability_paths", "probes")
+_KEYS = ("verifiability_paths", "probes", "test_commands", "test_timeout_s")
 
 
 class ProjectConfigError(Exception):
@@ -45,10 +50,17 @@ class ProjectConfig:
         default_factory=lambda: list(DEFAULT_VERIFIABILITY_PATHS)
     )
     probes: dict[str, str] = field(default_factory=dict)
+    test_commands: list[str] | None = None
+    test_timeout_s: float | None = None
 
     def to_dict(self) -> dict[str, object]:
         """JSON-serialisable form; ``parse_project_config`` round-trips it."""
-        return {"verifiability_paths": list(self.verifiability_paths), "probes": dict(self.probes)}
+        return {
+            "verifiability_paths": list(self.verifiability_paths),
+            "probes": dict(self.probes),
+            "test_commands": None if self.test_commands is None else list(self.test_commands),
+            "test_timeout_s": self.test_timeout_s,
+        }
 
 
 def _check_probe(name: object, url: object) -> None:
@@ -81,7 +93,22 @@ def parse_project_config(data: object) -> ProjectConfig:
         raise ProjectConfigError("probes must be an object of name -> URL template")
     for name, url in probes.items():
         _check_probe(name, url)
-    return ProjectConfig(verifiability_paths=list(paths), probes=dict(probes))
+    commands = data.get("test_commands")
+    if commands is not None and (
+        not isinstance(commands, list) or not all(isinstance(c, str) and c for c in commands)
+    ):
+        raise ProjectConfigError("test_commands must be a list of non-empty strings")
+    timeout = data.get("test_timeout_s")
+    if timeout is not None and (
+        isinstance(timeout, bool) or not isinstance(timeout, int | float) or not timeout > 0
+    ):
+        raise ProjectConfigError("test_timeout_s must be a positive number")
+    return ProjectConfig(
+        verifiability_paths=list(paths),
+        probes=dict(probes),
+        test_commands=None if commands is None else list(commands),
+        test_timeout_s=None if timeout is None else float(timeout),
+    )
 
 
 def load_project_config(cwd: str) -> ProjectConfig:

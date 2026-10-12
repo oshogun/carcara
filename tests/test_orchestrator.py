@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import types
 
 import pytest
@@ -19,6 +20,7 @@ from carcara.orchestrator import (
     DEFAULT_FOLLOWUP_MAX_TURNS,
     DEFAULT_STAGE_TIMEOUT_S,
     FOLLOWUP_TIMEOUT_S,
+    MAX_FIX_ITERATIONS,
     AutoGate,
     Orchestrator,
     OrchestratorError,
@@ -1694,7 +1696,12 @@ def test_project_config_snapshot_used_on_resume(repo):
     )
     out = go(orch)
     assert out.status == "awaiting_approval"
-    snapshot = {"verifiability_paths": ["db/**"], "probes": {}}
+    snapshot = {
+        "verifiability_paths": ["db/**"],
+        "probes": {},
+        "test_commands": None,
+        "test_timeout_s": None,
+    }
     assert orch.run_state.state["project_config"] == snapshot
     # A mid-run edit (e.g. adding a probe host) has no effect on the resumed run.
     config.write_text('{"verifiability_paths": [], "probes": {"p": "https://evil/{arg}"}}')
@@ -4074,3 +4081,185 @@ def test_no_previous_run_no_carry(repo):
     assert go(orch).status == "done"
     assert "unverified" not in orch.run_state.state
     assert "unverified_carried" not in (orch.run_state.dir / "events.jsonl").read_text()
+
+
+# --- Deterministic test commands (#43) ---
+
+
+def _config(repo, **cfg):
+    (repo / ".carcara").mkdir(exist_ok=True)
+    (repo / ".carcara" / "config.json").write_text(json.dumps(cfg))
+
+
+def _test_entry(orch, key="test"):
+    return orch.run_state.stage(key)
+
+
+def test_known_commands_passing_make_no_test_model_call(repo):
+    _config(repo, test_commands=["true"])
+    orch, backend, _ = make(repo, {"implement": [impl()]}, size="S")
+    assert go(orch).status == "done"
+    assert all(r.stage not in ("test", "test-summary") for r in backend.requests)
+    entry = _test_entry(orch)
+    assert entry["output"] == {"passed": True, "commands": ["true"], "failures": []}
+    assert (entry["cost_usd"], entry["role"], entry["model"]) == (0.0, None, None)
+    completed = _events(orch, "test_command_completed")
+    assert [(e["cmd"], e["exit_code"], e["timed_out"]) for e in completed] == [("true", 0, False)]
+    assert _events(orch, "test_commands_resolved")[0]["source"] == "config"
+    assert orch.run_state.state["test_commands"] == ["true"]
+
+
+def test_failing_command_summarised_once_and_fed_to_fix_loop(repo):
+    _config(repo, test_commands=["true", "echo boom; exit 1"])
+    summary = {"failures": [{"name": "x", "detail": "boom"}]}
+    n = MAX_FIX_ITERATIONS + 1
+    orch, backend, _ = make(
+        repo,
+        {"implement": [impl()] * n, "test-summary": [summary] * n},
+        gate=AutoGate(continue_=False),
+        size="S",
+    )
+    go(orch)
+    summaries = [r for r in backend.requests if r.stage == "test-summary"]
+    assert summaries[0].key == "test-summary"
+    assert summaries[0].model == model_for("test-runner", PROFILE)
+    assert summaries[0].allowed_tools == ["StructuredOutput"]
+    assert "boom" in summaries[0].prompt
+    assert _test_entry(orch)["output"] == {
+        "passed": False,
+        "commands": ["true", "echo boom; exit 1"],
+        "failures": [{"name": "x", "detail": "boom"}],
+    }
+    # The fix loop re-runs the commands deterministically and summarises each round once.
+    assert _test_entry(orch, "fix-1:test")["output"]["passed"] is False
+    assert [r.key for r in summaries][:2] == ["test-summary", "fix-1:test-summary"]
+    assert not any(r.stage == "test" for r in backend.requests)
+
+
+def test_hanging_command_times_out_as_failure(repo):
+    _config(repo, test_commands=["sleep 30"])
+    orch, _, _ = make(
+        repo,
+        {"implement": [impl()], "test-summary": [{"failures": []}]},
+        gate=AutoGate(continue_=False),
+        size="S",
+        test_timeout_s=0.5,
+    )
+    start = time.monotonic()
+    go(orch)
+    assert time.monotonic() - start < 20
+    out = _test_entry(orch)["output"]
+    assert out["passed"] is False
+    assert out["failures"][0]["name"] == "sleep 30"
+    assert "timed out after 0.5s" in out["failures"][0]["detail"]
+
+
+def test_summary_failure_falls_back_to_command_output(repo):
+    _config(repo, test_commands=["echo kaput; exit 2"])
+    orch, _, _ = make(
+        repo,
+        {"implement": [impl()], "test-summary": [BackendError("down")] * 2},
+        gate=AutoGate(continue_=False),
+        size="S",
+    )
+    out = go(orch)
+    # The summary failure did not stop the run: it went on into the fix loop.
+    assert "stage fix-1:implement failed" in out.report_text
+    [failure] = _test_entry(orch)["output"]["failures"]
+    assert failure["name"] == "echo kaput; exit 2"
+    assert "exit code 2" in failure["detail"] and "kaput" in failure["detail"]
+    assert _events(orch, "test_summary_fallback")
+
+
+def test_deterministic_test_stage_replayed_on_resume(repo):
+    log = repo.parent / "ran.log"
+    _config(repo, test_commands=[f"echo x >> {log}"])
+    orch, backend, _ = make(
+        repo,
+        {"implement": [impl()]},
+        size="S",
+        review_small=True,
+    )
+    # Stop right after the test stage by failing the review.
+    backend.script["review"] = [BackendError("down")]
+    out = go(orch)
+    assert out.status == "failed"
+    orch2, backend2, _ = make(repo, {"review": [REVIEW_OK]}, size="S", review_small=True)
+    assert asyncio.run(orch2.resume(out.run_id)).status == "done"
+    assert log.read_text().splitlines() == ["x"]
+    assert ("test", None) not in seq(backend2)
+
+
+def test_test_commands_do_not_see_secrets(repo, monkeypatch):
+    for name in ("URUTAU_MCP_TOKEN", "URUTAU_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        monkeypatch.setenv(name, "secret")
+    monkeypatch.delenv("CARCARA_STAGE", raising=False)
+    out = repo.parent / "env.txt"
+    _config(
+        repo,
+        test_commands=[
+            f'echo "[$URUTAU_MCP_TOKEN][$URUTAU_URL][$ANTHROPIC_API_KEY]'
+            f'[$ANTHROPIC_AUTH_TOKEN][$CARCARA_STAGE]" > {out}'
+        ],
+    )
+    orch, _, _ = make(repo, {"implement": [impl()]}, size="S")
+    assert go(orch).status == "done"
+    assert out.read_text().strip() == "[][][][][test-runner]"
+
+
+def test_no_known_commands_uses_test_runner_agent(repo):
+    _config(repo, test_commands=[])
+    orch, backend, _ = make(repo, {"implement": [impl()], "test": [TEST_OK]}, size="S")
+    assert go(orch).status == "done"
+    assert ("test", "test-runner") in seq(backend)
+    assert _events(orch, "test_commands_resolved")[0]["source"] == "none"
+
+
+def test_discovered_commands_are_stored(repo, monkeypatch):
+    monkeypatch.setattr("carcara.orchestrator.discover_test_commands", lambda cwd: ["true"])
+    orch, _, _ = make(repo, {"implement": [impl()]}, size="S")
+    assert go(orch).status == "done"
+    assert orch.run_state.state["test_commands"] == ["true"]
+    assert _events(orch, "test_commands_resolved")[0]["source"] == "discovered"
+
+
+def test_summary_cost_is_folded_into_the_test_stage(repo):
+    _config(repo, test_commands=["echo boom; exit 1"])
+    summary = {"failures": [{"name": "x", "detail": "boom"}]}
+    orch, backend, _ = make(
+        repo,
+        {"implement": [impl()], "test-summary": [summary]},
+        gate=AutoGate(continue_=False),
+        costs={"test-summary": 0.03},
+        size="S",
+    )
+    report = go(orch).report_text
+    assert "tests: FAILED: x" in report
+    # No separate summary stage is recorded; the test entry carries its call.
+    assert not any(k.endswith("test-summary") for k in keys(orch))
+    [call] = [r for r in backend.requests if r.key == "test-summary"]
+    entry = _test_entry(orch)
+    assert (entry["model"], entry["cost_usd"], entry["num_turns"]) == (call.model, 0.03, 1)
+    assert orch.run_state.state["totals"]["cost_usd"] == pytest.approx(0.03)
+
+
+def test_resume_ignores_stale_summary_and_summarises_fresh_results(repo):
+    _config(repo, test_commands=["echo fresh; exit 1"])
+    over = StageResult(subtype="error_max_budget_usd", is_error=True)
+    orch, _, _ = make(repo, {"implement": [impl()], "test-summary": [over]}, size="S")
+    # The summary call stops the run before the test stage records anything.
+    out = go(orch)
+    assert out.status == "budget_exceeded"
+    run = orch.run_state
+    assert run.stage("test") is None
+    # A stale summary entry (e.g. from an older carcara) must not be replayed.
+    stale = {"failures": [{"name": "stale", "detail": "old"}]}
+    run.record_stage("test-summary", "test-summary", None, "m", stale, 0.1, None, 1, None)
+    fresh = {"failures": [{"name": "fresh", "detail": "new"}]}
+    orch2, backend2, _ = make(
+        repo, {"test-summary": [fresh]}, gate=AutoGate(continue_=False), size="S"
+    )
+    asyncio.run(orch2.resume(run.id))
+    summaries = [r for r in backend2.requests if r.key == "test-summary"]
+    assert len(summaries) == 1 and "fresh" in summaries[0].prompt
+    assert orch2.run_state.stage("test")["output"]["failures"] == fresh["failures"]

@@ -44,6 +44,7 @@ from carcara.backend import (
     StageResult,
     StageTimeout,
     build_request,
+    subprocess_env,
 )
 from carcara.probes import run_probes
 from carcara.profiles import Profile
@@ -63,6 +64,13 @@ from carcara.schemas import (
     MAX_UNVERIFIED,
     MAX_UNVERIFIED_TEXT,
     UNVERIFIED_KINDS,
+)
+from carcara.testcmds import (
+    CommandResult,
+    discover_test_commands,
+    excerpt,
+    failure_detail,
+    run_command,
 )
 from carcara.urutau import (
     ClaimConflict,
@@ -94,12 +102,16 @@ DEFAULT_MAX_TURNS: dict[str, int] = {
     "architect": 30,
     "implement": 80,
     "test": 50,
+    # No-tools failure summary for deterministic test commands.
+    "test-summary": 2,
     "review": 30,
     "docs": 30,
 }
 
 # Per-stage wall-clock limits in seconds, keyed by pipeline step name; unlisted: none.
-DEFAULT_STAGE_TIMEOUT_S: dict[str, float] = {"test": 900}
+DEFAULT_STAGE_TIMEOUT_S: dict[str, float] = {"test": 900, "test-summary": 120}
+# Per-command wall-clock limit for deterministic test commands.
+DEFAULT_TEST_TIMEOUT_S = 900.0
 # The "report the results you have" follow-up after a stage ended without a result.
 DEFAULT_FOLLOWUP_MAX_TURNS = 3
 FOLLOWUP_TIMEOUT_S = 120.0
@@ -308,6 +320,8 @@ class RunOptions:
     stage_timeout_s: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_STAGE_TIMEOUT_S))
     # Wall-clock limit for the "report the results you have" follow-up.
     followup_timeout_s: float = FOLLOWUP_TIMEOUT_S
+    # Per-command limit for deterministic test commands; overrides the project config.
+    test_timeout_s: float | None = None
     # GitHub issue the task came from (``--issue``) and its ``owner/name`` repo.
     issue: int | None = None
     repo: str | None = None
@@ -1597,10 +1611,18 @@ class Orchestrator:
         turns_key: str,
         prompt: Callable[[], str],
         budget_cap: float | None = None,
+        model_role: str | None = None,
+        unrecorded: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Run (or replay) one stage.
+
+        With ``unrecorded`` the stage is neither replayed nor recorded: its
+        model, cost, usage, turns and session go into that dict instead, for a
+        parent stage to record (its cost is still added to the run totals).
+        """
         run = self.run_state
         assert run is not None
-        done = run.stage(key)
+        done = run.stage(key) if unrecorded is None else None
         if done is not None:
             run.event("stage_replayed", key=key)
             return done["output"]
@@ -1660,6 +1682,7 @@ class Orchestrator:
                 key=key,
                 schema="plan-ultra" if stage == "plan" and self._ultra() else None,
                 timeout_s=self.options.stage_timeout_s.get(turns_key),
+                model_role=model_role,
             )
             run.event("stage_started", key=key, stage=stage, role=role_name, model=request.model)
             try:
@@ -1764,17 +1787,26 @@ class Orchestrator:
             raise _Stop("needs_human", f"implementer blocked at {key}: {output.get('notes', '')}")
         if apply_guidance:
             blocked["applied"] = True
-        run.record_stage(
-            key,
-            stage,
-            role_name,
-            request.model,
-            output,
-            result.cost_usd,
-            result.usage,
-            result.num_turns,
-            result.session_id,
-        )
+        if unrecorded is not None:
+            unrecorded.update(
+                model=request.model,
+                cost_usd=result.cost_usd,
+                usage=result.usage,
+                num_turns=result.num_turns,
+                session_id=result.session_id,
+            )
+        else:
+            run.record_stage(
+                key,
+                stage,
+                role_name,
+                request.model,
+                output,
+                result.cost_usd,
+                result.usage,
+                result.num_turns,
+                result.session_id,
+            )
         run.event(
             "stage_completed",
             key=key,
@@ -2494,6 +2526,129 @@ class Orchestrator:
             run.event("review_forced_on_failing_tests", key=f"{accept_prefix}review")
         await self._run_review(run, run.state["task"], accept_prefix)
 
+    def _test_commands(self, run: Run) -> list[str]:
+        """The test stage's commands, resolved once per run and kept for resumes."""
+        stored = run.state.get("test_commands")
+        if stored is not None:
+            return list(stored)
+        if self.config.test_commands is not None:
+            cmds, source = list(self.config.test_commands), "config"
+        else:
+            cmds = discover_test_commands(self.cwd)
+            source = "discovered"
+        if not cmds:
+            source = "none"
+        run.state["test_commands"] = cmds
+        run.save()
+        run.event("test_commands_resolved", commands=cmds, source=source)
+        return list(cmds)
+
+    async def _run_tests(
+        self, run: Run, key: str, test_prompt: Callable[[], str]
+    ) -> dict[str, Any]:
+        """Run the known test commands as subprocesses; the model only summarises failures.
+
+        With no known commands, falls back to the test-runner agent.
+        """
+        done = run.stage(key)
+        if done is not None:
+            run.event("stage_replayed", key=key)
+            return done["output"]
+        cmds = self._test_commands(run)
+        if not cmds:
+            return await self._stage(key, "test", "test-runner", "test", test_prompt)
+
+        timeout_s = (
+            self.options.test_timeout_s or self.config.test_timeout_s or DEFAULT_TEST_TIMEOUT_S
+        )
+        run.event("stage_started", key=key, stage="test", role=None, model=None)
+        # Same secrets hidden as for agent stages: these commands run agent-written code.
+        env = subprocess_env("test-runner", self.options.use_api_key)
+        results: list[CommandResult] = []
+        for cmd in cmds:
+            res = await run_command(cmd, self.cwd, timeout_s, env=env)
+            results.append(res)
+            run.event(
+                "test_command_completed",
+                key=key,
+                cmd=res.cmd,
+                exit_code=res.exit_code,
+                timed_out=res.timed_out,
+                duration_s=round(res.duration_s, 3),
+            )
+        failed = [r for r in results if not r.ok]
+        failures: list[dict[str, Any]] = []
+        # The summary call's model/cost/usage, recorded on this test stage only.
+        call: dict[str, Any] = {}
+        if failed:
+            failures = await self._summarise_test_failures(run, key, failed, call)
+        output = {"passed": not failed, "commands": cmds, "failures": failures}
+        cost = call.get("cost_usd") or 0.0
+        run.record_stage(
+            key,
+            "test",
+            None,
+            call.get("model"),
+            output,
+            cost,
+            call.get("usage"),
+            call.get("num_turns") or 0,
+            call.get("session_id"),
+        )
+        run.event("stage_completed", key=key, cost_usd=cost, deterministic=True)
+        return output
+
+    async def _summarise_test_failures(
+        self,
+        run: Run,
+        key: str,
+        failed: list[CommandResult],
+        call: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """One no-tools call on the test-runner model; deterministic fallback on failure.
+
+        The call is never replayed or recorded as its own stage (a stored
+        summary could not match fresh results); its model, cost and usage go
+        into ``call`` for the parent test stage.
+        """
+        task = run.state["task"]
+        listing = "\n".join(f"- {r.cmd}" for r in failed)
+
+        def summary_prompt() -> str:
+            return (
+                f"Task: {task}\n\nThese test commands failed:\n{listing}\n\n"
+                + _untrusted("COMMAND OUTPUT", excerpt(failed))
+                + "\n\nList the distinct failures (failing test, lint error or command) as "
+                "`failures`, each with a short `name` and a `detail` quoting the key error. "
+                "Do not suggest fixes."
+            )
+
+        failures: list[dict[str, Any]] = []
+        try:
+            summary = await self._stage(
+                f"{key}-summary",
+                "test-summary",
+                None,
+                "test-summary",
+                summary_prompt,
+                model_role="test-runner",
+                unrecorded=call,
+            )
+            failures = list(summary.get("failures") or [])
+        except _Stop as exc:
+            if exc.status != "failed":
+                raise
+            run.event("test_summary_fallback", key=key, error=exc.message)
+        if not failures:
+            return [{"name": r.cmd, "detail": failure_detail(r)} for r in failed]
+        # A timeout is always reported, whatever the summary says.
+        for r in failed:
+            if r.timed_out and not any(
+                f.get("name") == r.cmd and "timed out" in f.get("detail", "") for f in failures
+            ):
+                failures.append({"name": r.cmd, "detail": failure_detail(r)})
+        return failures
+
     async def _verify(
         self, run: Run, task: str, review_on: bool
     ) -> tuple[str | None, list[dict[str, Any]]]:
@@ -2520,9 +2675,7 @@ class Orchestrator:
         async def check(stage_prefix: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
             nonlocal last_prefix
             last_prefix = stage_prefix
-            test = await self._stage(
-                f"{stage_prefix}test", "test", "test-runner", "test", test_prompt
-            )
+            test = await self._run_tests(run, f"{stage_prefix}test", test_prompt)
             review = None
             if review_on and test["passed"]:
                 review = await self._run_review(run, task, stage_prefix)

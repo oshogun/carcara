@@ -89,6 +89,7 @@ def test_schemas_are_strict():
         "plan-ultra",
         "implement",
         "test",
+        "test-summary",
         "review",
         "review-dim",
         "review-refute",
