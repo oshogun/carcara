@@ -29,13 +29,12 @@ from pathlib import Path
 from typing import Any
 
 from carcara import policy
-from carcara.runstore import RunStore
+from carcara.runstore import PAUSED_STATUSES, RunStore
 
 STAGE_ENV_VAR = "CARCARA_STAGE"  # mirrors carcara.backend.STAGE_ENV_VAR (kept import-light)
 OFF_ENV_VAR = "CARCARA_OFF"
 ROUTING_OFF_FILE = "routing-off"
 STRICT_POLICY_FILE = "strict-policy"
-PAUSED_STATUSES = ("awaiting_approval", "needs_human", "budget_exceeded")
 MAX_PAUSED = 10
 MAX_CONTEXT = 1000
 

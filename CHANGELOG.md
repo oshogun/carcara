@@ -30,6 +30,12 @@
   stays serious as `goal_defeating`. The reviewer agent template says so too.
 
 ### Added
+- `carcara runs prune` deletes old run directories under `.carcara/runs/`
+  (#10). Prune by age (`--older-than 30d`, units `h`/`d`/`w`), by count
+  (`--keep 20`) or both; `--dry-run` shows the selection and `--json` prints
+  it. The run holding the active lock, running and paused runs
+  (awaiting_approval, needs_human, budget_exceeded) and unreadable runs are
+  never deleted.
 - `carcara run --ultra` fans out the read-only roles. A `scope` stage picks
   up to 4 areas that are explored in parallel and merged before the plan.
   Each review round runs 3 parallel dimension reviews (correctness, security,

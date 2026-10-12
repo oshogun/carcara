@@ -35,6 +35,16 @@ def test_help_flag(capsys):
     assert "usage: carcara" in capsys.readouterr().out
 
 
+def test_runs_is_a_subcommand(capsys):
+    from carcara.cli import SUBCOMMANDS
+
+    assert "runs" in SUBCOMMANDS
+    with pytest.raises(SystemExit) as exc:
+        main(["runs", "prune", "--help"])
+    assert exc.value.code == 0
+    assert "usage: carcara runs prune" in capsys.readouterr().out
+
+
 def test_module_entry_point():
     out = subprocess.run(
         [sys.executable, "-m", "carcara", "--version"],

@@ -11,9 +11,12 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 import time
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +30,9 @@ STATUSES = (
     "plan_only",
     "triaged",
 )
+PAUSED_STATUSES = ("awaiting_approval", "needs_human", "budget_exceeded")
+# Never pruned: a run in progress or waiting on a human.
+PROTECTED_STATUSES = ("running",) + PAUSED_STATUSES
 
 
 class RunStoreError(Exception):
@@ -115,6 +121,95 @@ def _now() -> str:
 
 def _empty_totals() -> dict[str, Any]:
     return {"cost_usd": 0.0, "num_turns": 0, "input_tokens": 0, "output_tokens": 0}
+
+
+@dataclass
+class PruneDecision:
+    """What ``carcara runs prune`` does with one run, and why."""
+
+    run_id: str
+    status: str | None
+    age_ts: str | None
+    action: str  # "delete" | "keep"
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    """A timezone-aware datetime from a state timestamp; None if unparseable."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        ts = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        try:
+            ts = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return ts if ts.tzinfo is not None else ts.astimezone()
+
+
+def _run_id_ts(run_id: str) -> datetime | None:
+    """The local creation time encoded in a run id (``%Y%m%d-%H%M%S-xxxx``)."""
+    try:
+        return datetime.strptime(run_id[:15], "%Y%m%d-%H%M%S").astimezone()
+    except ValueError:
+        return None
+
+
+def _run_age_ts(run_id: str, state: dict[str, Any]) -> datetime | None:
+    for key in ("updated_at", "created_at"):
+        ts = _parse_ts(state.get(key))
+        if ts is not None:
+            return ts
+    return _run_id_ts(run_id)
+
+
+def select_prunable(
+    entries: list[tuple[str, dict[str, Any] | None]],
+    *,
+    keep: int | None,
+    older_than: timedelta | None,
+    now: datetime,
+    active_run_id: str | None,
+) -> list[PruneDecision]:
+    """Decide which runs to delete. ``entries`` are ``(run_id, state or None)``
+    oldest first. Unreadable, locked, running and paused runs are always kept;
+    ``keep`` keeps the newest N runs (protected ones count); ``older_than``
+    keeps runs touched more recently. With both, a run must fail both to go."""
+    if keep is None and older_than is None:
+        raise ValueError("give keep and/or older_than")
+    if now.tzinfo is None:
+        now = now.astimezone()
+    keep_from = len(entries) - keep if keep is not None else len(entries)
+    decisions: list[PruneDecision] = []
+    for index, (run_id, state) in enumerate(entries):
+        if not isinstance(state, dict):
+            decisions.append(PruneDecision(run_id, None, None, "keep", "unreadable"))
+            continue
+        status = state.get("status")
+        status = status if isinstance(status, str) else None
+        age = _run_age_ts(run_id, state)
+        age_ts = age.isoformat() if age is not None else None
+
+        action, reason = "keep", ""
+        if run_id == active_run_id:
+            reason = "active lock"
+        elif status in PROTECTED_STATUSES:
+            reason = f"status {status}"
+        elif index >= keep_from:
+            reason = "within --keep"
+        elif older_than is not None and age is None:
+            reason = "unknown age"
+        elif older_than is not None and age > now - older_than:
+            reason = "too recent"
+        else:
+            action = "delete"
+            reason = "older than --older-than" if older_than is not None else "beyond --keep"
+        decisions.append(PruneDecision(run_id, status, age_ts, action, reason))
+    return decisions
 
 
 class Run:
@@ -474,6 +569,55 @@ class RunStore:
         if not self.root.is_dir():
             return []
         return sorted(p.name for p in self.root.iterdir() if (p / "state.json").is_file())
+
+    def delete_run(self, run_id: str) -> None:
+        """Remove one run directory; only a real direct child of ``runs/``."""
+        if not run_id or "/" in run_id or "\\" in run_id or run_id in (".", ".."):
+            raise RunStoreError(f"invalid run id: {run_id!r}")
+        run_dir = self.root / run_id
+        if run_dir.is_symlink() or not run_dir.is_dir():
+            raise RunStoreError(f"not a run directory: {run_dir}")
+        if run_dir.resolve().parent != self.root.resolve():
+            raise RunStoreError(f"run directory outside {self.root}: {run_dir}")
+        shutil.rmtree(run_dir)
+
+    def prune(
+        self,
+        *,
+        keep: int | None,
+        older_than: timedelta | None,
+        dry_run: bool,
+        now: datetime | None = None,
+    ) -> list[PruneDecision]:
+        """Select runs with ``select_prunable`` and delete them unless ``dry_run``."""
+        entries: list[tuple[str, dict[str, Any] | None]] = []
+        for run_id in self.list_runs():
+            try:
+                entries.append((run_id, self.load(run_id).state))
+            except RunStoreError:
+                entries.append((run_id, None))
+        holder = self.active()
+        decisions = select_prunable(
+            entries,
+            keep=keep,
+            older_than=older_than,
+            now=now or datetime.now().astimezone(),
+            active_run_id=holder["run_id"] if holder is not None else None,
+        )
+        if dry_run:
+            return decisions
+        for decision in decisions:
+            if decision.action != "delete":
+                continue
+            holder = self.active()  # a run may have taken the lock since selection
+            if holder is not None and holder["run_id"] == decision.run_id:
+                decision.action, decision.reason = "keep", "active lock"
+                continue
+            try:
+                self.delete_run(decision.run_id)
+            except (OSError, RunStoreError) as exc:
+                decision.action, decision.reason = "keep", f"error: {exc}"
+        return decisions
 
     def find_previous_issue_run(
         self, issue: int, repo: str | None, exclude_run_id: str | None = None

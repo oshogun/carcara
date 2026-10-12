@@ -13,11 +13,22 @@ import signal
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import timedelta
 from typing import Any
 
 from carcara import __version__
 
-SUBCOMMANDS = ("install", "uninstall", "run", "status", "diff", "profiles", "hook", "routing")
+SUBCOMMANDS = (
+    "install",
+    "uninstall",
+    "run",
+    "status",
+    "diff",
+    "runs",
+    "profiles",
+    "hook",
+    "routing",
+)
 SIZES = ("S", "M", "L")
 DEFAULT_PROFILE = "balanced"
 STAGE_ENV_VAR = "CARCARA_STAGE"  # mirrors carcara.backend.STAGE_ENV_VAR (kept import-light)
@@ -46,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_run_parser(sub)
     _add_status_parser(sub)
     _add_diff_parser(sub)
+    _add_runs_parser(sub)
     _add_hook_parsers(sub)
     return parser
 
@@ -202,6 +214,64 @@ def _add_diff_parser(sub: Any) -> None:
     diff.add_argument("run_id", nargs="?", metavar="RUN_ID", help="run to diff")
     diff.add_argument("--stat", action="store_true", help="print a diffstat only")
     diff.add_argument("--cwd", default=".", metavar="DIR", help="project directory (default .)")
+
+
+def _add_runs_parser(sub: Any) -> None:
+    runs = sub.add_parser(
+        "runs",
+        allow_abbrev=False,
+        help="manage stored runs (prune)",
+        description="Manage the runs stored under .carcara/runs/.",
+    )
+    runs.set_defaults(runs_parser=runs)
+    actions = runs.add_subparsers(dest="runs_command", metavar="ACTION")
+    prune = actions.add_parser(
+        "prune",
+        allow_abbrev=False,
+        help="delete old runs",
+        description="Delete old run directories. Never touches the run holding the "
+        "active lock, running or paused runs (awaiting_approval, needs_human, "
+        "budget_exceeded) or unreadable runs. With both --older-than and --keep, a run "
+        "is deleted only if it is outside the --keep window and older than --older-than.",
+    )
+    prune.add_argument(
+        "--older-than",
+        type=_duration,
+        default=None,
+        metavar="AGE",
+        help="delete runs last updated more than AGE ago (e.g. 30d, 12h, 2w)",
+    )
+    prune.add_argument(
+        "--keep",
+        type=_non_negative_int,
+        default=None,
+        metavar="N",
+        help="keep the N newest runs (protected runs count toward N)",
+    )
+    prune.add_argument("--dry-run", action="store_true", help="show what would be deleted")
+    prune.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    prune.add_argument("--cwd", default=".", metavar="DIR", help="project directory (default .)")
+
+
+_DURATION_RE = re.compile(r"^(\d+)([dhw])$")
+_DURATION_UNITS = {"h": "hours", "d": "days", "w": "weeks"}
+
+
+def _duration(value: str) -> timedelta:
+    match = _DURATION_RE.match(value.strip())
+    if match is None or int(match.group(1)) < 1:
+        raise argparse.ArgumentTypeError(f"invalid duration: {value!r} (use e.g. 30d, 12h, 2w)")
+    return timedelta(**{_DURATION_UNITS[match.group(2)]: int(match.group(1))})
+
+
+def _non_negative_int(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        n = -1
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"invalid count: {value!r}")
+    return n
 
 
 def _err(msg: str) -> None:
@@ -967,6 +1037,37 @@ def _run_main(ns: argparse.Namespace) -> int:
     return outcome.exit_code
 
 
+def runs_main(ns: argparse.Namespace) -> int:
+    from carcara.runstore import RunStore
+
+    if ns.runs_command is None:
+        ns.runs_parser.print_help(sys.stderr)
+        return 2
+    cwd = os.path.abspath(ns.cwd)
+    if not os.path.isdir(cwd):
+        _err(f"directory not found: {ns.cwd}")
+        return 1
+    if ns.older_than is None and ns.keep is None:
+        _err("runs prune: give --older-than and/or --keep")
+        return 2
+    decisions = RunStore(cwd).prune(keep=ns.keep, older_than=ns.older_than, dry_run=ns.dry_run)
+    failed = any(d.reason.startswith("error: ") for d in decisions)
+    if ns.json:
+        sys.stdout.write(json.dumps([d.to_dict() for d in decisions], indent=2) + "\n")
+        return 1 if failed else 0
+    if not decisions:
+        sys.stdout.write("0 runs\n")
+        return 0
+    verb = "would delete" if ns.dry_run else "delete"
+    for d in decisions:
+        action = verb if d.action == "delete" else "keep"
+        sys.stdout.write(f"{action:<12} {d.run_id}  {d.status or '?'}  ({d.reason})\n")
+    deleted = sum(d.action == "delete" for d in decisions)
+    done = "would be deleted" if ns.dry_run else "deleted"
+    sys.stdout.write(f"{deleted} run(s) {done}, {len(decisions) - deleted} kept\n")
+    return 1 if failed else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     # Back-compat with the 0.1.0 flag-only interface: anything that is not a
@@ -1000,6 +1101,8 @@ def main(argv: list[str] | None = None) -> int:
         return status_main(ns)
     if ns.command == "diff":
         return diff_main(ns)
+    if ns.command == "runs":
+        return runs_main(ns)
     if ns.command == "routing":
         from carcara.hooks import routing_main
 

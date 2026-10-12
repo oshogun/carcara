@@ -356,6 +356,25 @@ in the state.
 | 6 | another run is active (no run was started) |
 | 130 | interrupted (state saved; resume with `--resume`) |
 
+**Pruning runs.** Run directories are kept until you remove them with
+`carcara runs prune`:
+
+```bash
+carcara runs prune --older-than 30d --dry-run   # show what would go
+carcara runs prune --keep 20                    # keep the 20 newest runs
+carcara runs prune --older-than 30d --keep 20   # both rules must match
+```
+
+`--older-than AGE` (`12h`, `30d`, `2w`) selects runs last updated more than
+AGE ago (falling back to the creation time). `--keep N` keeps the N newest
+runs; protected runs count toward N, so the last N runs always stay. With
+both flags a run is deleted only if it is outside the `--keep` window *and*
+older than `--older-than`. At least one of them is required. The run holding
+the live `.carcara/active.json` lock, runs that are `running`,
+`awaiting_approval`, `needs_human` or `budget_exceeded`, and runs whose state
+cannot be read are never deleted. Try `--dry-run` first; `--json` prints the
+decisions. The exit code is 1 if a deletion failed.
+
 ### Ultra mode (`--ultra`)
 
 `carcara run --ultra` runs the read-only roles in parallel:
