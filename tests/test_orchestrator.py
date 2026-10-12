@@ -72,7 +72,13 @@ REVIEW_OK = {"verdict": "approve", "findings": [], "unverified": []}
 REVIEW_MAJOR = {
     "verdict": "request_changes",
     "findings": [
-        {"severity": "major", "path": "a.py", "issue": "bug", "fix": "fix it"},
+        {
+            "severity": "major",
+            "path": "a.py",
+            "issue": "bug",
+            "fix": "fix it",
+            "reason": "correctness",
+        },
         {"severity": "nit", "path": "a.py", "issue": "style", "fix": "meh"},
     ],
     "unverified": [],
@@ -3240,13 +3246,48 @@ def test_ultra_capped_finding_single_disproof_without_evidence_is_kept(repo):
     assert "(capped: no reason); disproof kept unverified" in out.report_text
 
 
-def test_non_ultra_review_major_without_reason_unchanged(repo):
+def test_non_ultra_review_major_without_reason_is_capped(repo):
+    # Issue #44: the plain review caps a reasonless major like ultra does.
+    from carcara.orchestrator import _FINDING_REASON_RULE, _extent
+
+    gap = {**_finding("minor", GAP), "severity": "major"}  # no reason
+    review = {**REVIEW_MAJOR, "findings": [gap]}
+    orch, backend, _ = make(
+        repo,
+        {"implement": [impl()], "test": [TEST_OK], "review": [review]},
+        size="S",
+        review_small=True,
+    )
+    out = go(orch)
+    assert out.status == "done"
+    assert "fix-1:implement" not in keys(orch)
+    assert _extent(orch.run_state)["fix_rounds"] == 0
+    review_req = next(r for r in backend.requests if r.key == "review")
+    assert _FINDING_REASON_RULE in review_req.prompt
+    entry = orch.run_state.stage("review")
+    assert entry["original_output"] == review
+    stored = entry["output"]
+    assert stored["verdict"] == "approve"
+    assert stored["findings"] == [{**gap, "severity": "minor", "capped": True}]
+    assert orch.run_state.state["unverified"] == [
+        {"id": "U1", "kind": "untested", "text": f"a.py: {GAP}"}
+    ]
+    (event,) = _events(orch, "review_severity_capped")
+    assert event["count"] == 1 and event["findings"][0]["before"] == "major"
+    assert orch.run_state.state["severity_capped"]["review"] == event["findings"]
+    assert "1 majors capped (no reason)" in out.report_text
+
+
+@pytest.mark.parametrize("reason", ["goal_defeating", "correctness"])
+def test_non_ultra_review_major_with_reason_still_fixes(repo, reason):
+    # A goal-defeating missing test stays serious in the plain review too.
+    review = {**REVIEW_MAJOR, "findings": [_finding("major", GAP, reason)]}
     orch, _, _ = make(
         repo,
         {
             "implement": [impl(), impl()],
             "test": [TEST_OK, TEST_OK],
-            "review": [REVIEW_MAJOR, REVIEW_OK],
+            "review": [review, REVIEW_OK],
         },
         size="S",
         review_small=True,

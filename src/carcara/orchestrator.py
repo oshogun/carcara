@@ -172,8 +172,8 @@ assert tuple(_REVIEW_DIMS) == REVIEW_DIMENSIONS
 # Ultra mode: the dimensions whose reasonless majors get one follow-up before the cap.
 _REASON_FOLLOWUP_DIMS = ("correctness", "security")
 
-# Ultra mode: the reason a dimension or merged finding of major or higher must give
-# (enforced in code by _cap_review_findings).
+# The reason a review finding of major or higher must give, in plain reviews and in
+# ultra dimension and merged reviews (enforced in code by _cap_review_findings).
 _FINDING_REASON_RULE = (
     "Every major or blocker finding must set `reason`: correctness (wrong behaviour in "
     "the shipped code), security, goal_defeating (including a missing or weak test for "
@@ -766,6 +766,12 @@ def _cap_review_findings(
         return review, capped
     verdict = "request_changes" if any(_serious(f) for f in findings) else "approve"
     return _with_untested({**review, "verdict": verdict, "findings": findings}), capped
+
+
+def _record_severity_capped(run: Run, key: str, capped: list[dict[str, Any]]) -> None:
+    """Record review `key`'s findings capped by _cap_review_findings; caller saves."""
+    run.state.setdefault("severity_capped", {})[key] = capped
+    run.event("review_severity_capped", key=key, count=len(capped), findings=capped)
 
 
 def capped_finding_lines(state: dict[str, Any], limit: int | None = None) -> list[str]:
@@ -2785,13 +2791,7 @@ class Orchestrator:
                 adjusted = _with_untested(
                     {**adjusted, "unverified": original.get("unverified", [])}
                 )
-                run.state.setdefault("severity_capped", {})[key] = severity_capped
-                run.event(
-                    "review_severity_capped",
-                    key=key,
-                    count=len(severity_capped),
-                    findings=severity_capped,
-                )
+                _record_severity_capped(run, key, severity_capped)
             changes = [{"key": f"{prefix}review-refute:{c['index']}", **c} for c in changes]
             run.state.setdefault("refutations", []).extend(changes)
             run.state.setdefault("refuted_reviews", []).append(key)
@@ -2832,12 +2832,19 @@ class Orchestrator:
         def review_prompt() -> str:
             return (
                 f"Task: {task}\n\nReview this change for correctness, security and "
-                f"missing tests. Report only real issues.\n\n"
+                f"missing tests. Report only real issues. {_FINDING_REASON_RULE}\n\n"
                 f"{self._inventory_prompt(run)}\n\n{self._diff_context()}"
             )
 
         key = f"{prefix}review"
         review = await self._stage(key, "review", "reviewer", "review", review_prompt)
+        # Same cap as ultra: a reasonless major is minor and listed untested. Once
+        # per review: a resume finds the capped output stored as amended.
+        if "original_output" not in (run.stage(key) or {}):
+            review, severity_capped = _cap_review_findings(review)
+            if severity_capped:
+                _record_severity_capped(run, key, severity_capped)
+                run.amend_stage_output(key, review)
         self._record_unverified(run, key, review)
         return review
 
