@@ -334,3 +334,14 @@ def test_find_previous_issue_run_stops_at_empty_inventory(tmp_path):
     _issue_run(store, "r1", unverified=[{"id": "U1", "kind": "external", "text": "x"}])
     _issue_run(store, "r2", unverified=[])  # carried nothing: everything was resolved
     assert store.find_previous_issue_run(7, "acme/widgets").id == "r2"
+
+
+def test_pid_alive_rejects_unused_pid():
+    assert runstore._pid_alive(DEAD_PID) is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only liveness probe")
+def test_pid_alive_windows_probe_does_not_kill():
+    assert runstore._pid_alive(os.getpid()) is True
+    # os.kill(pid, 0) would have terminated us; reaching here proves it didn't.
+    assert runstore._pid_alive(os.getpid()) is True

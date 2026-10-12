@@ -43,11 +43,15 @@ class Profile:
 
 
 def _split_lines(data: bytes) -> list[bytes]:
-    """Split like ``while read -r line || [ -n "$line" ]``: on ``\\n`` only."""
+    """Split like ``while read -r line || [ -n "$line" ]``: on ``\\n`` only.
+
+    CRLF is accepted: one trailing ``\\r`` is stripped from each line, so
+    profiles saved by Windows editors or checked out with CRLF still parse.
+    """
     lines = data.split(b"\n")
     if lines and lines[-1] == b"":
         lines.pop()
-    return lines
+    return [line[:-1] if line.endswith(b"\r") else line for line in lines]
 
 
 def _basename_sans_env(path: str) -> str:
@@ -85,7 +89,7 @@ def load_profile(spec: str) -> Profile:
         with open(spec, "rb") as fh:
             data = fh.read()
     else:
-        if spec == "" or "/" in spec or "." in spec:
+        if spec == "" or "/" in spec or "\\" in spec or "." in spec:
             raise ProfileError(f"unknown profile: {spec}")
         res = profiles_root().joinpath(f"{spec}.env")
         if not res.is_file():

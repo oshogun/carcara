@@ -301,12 +301,12 @@ def test_notebook_and_multiedit_paths_confined():
     assert not decide(role, "MultiEdit", {"file_path": "a.py", "edits": edits}, CWD).allow
 
 
-def test_write_through_symlink_dir_outside_cwd_denied(tmp_path):
+def test_write_through_symlink_dir_outside_cwd_denied(tmp_path, symlink):
     repo = tmp_path / "repo"
     outside = tmp_path / "outside"
     repo.mkdir()
     outside.mkdir()
-    (repo / "link").symlink_to(outside, target_is_directory=True)
+    symlink(repo / "link", outside, target_is_directory=True)
     (repo / "src").mkdir()
     cwd = str(repo)
     assert not decide("implementer", "Write", {"file_path": "link/x"}, cwd).allow
@@ -318,12 +318,12 @@ def test_write_through_symlink_dir_outside_cwd_denied(tmp_path):
     assert decide("explorer", "Read", {"file_path": "src/a.py"}, cwd).allow
 
 
-def test_write_with_symlinked_cwd(tmp_path):
+def test_write_with_symlinked_cwd(tmp_path, symlink):
     real = tmp_path / "real"
     (real / "src").mkdir(parents=True)
     (tmp_path / "outside").mkdir()
     alias = tmp_path / "alias"
-    alias.symlink_to(real, target_is_directory=True)
+    symlink(alias, real, target_is_directory=True)
     cwd = str(alias)
     assert decide("implementer", "Write", {"file_path": f"{alias}/src/a.py"}, cwd).allow
     assert decide("implementer", "Write", {"file_path": f"{real}/src/a.py"}, cwd).allow
@@ -354,10 +354,10 @@ def test_read_only_bash_secret_case_insensitive(command):
     assert not allowed("explorer", "Bash", {"command": command})
 
 
-def test_symlink_to_secret_denied(tmp_path):
+def test_symlink_to_secret_denied(tmp_path, symlink):
     (tmp_path / ".env").write_text("KEY=1")
-    (tmp_path / "harmless.txt").symlink_to(tmp_path / ".env")
-    (tmp_path / "vault").symlink_to(tmp_path / "secrets", target_is_directory=True)
+    symlink(tmp_path / "harmless.txt", tmp_path / ".env")
+    symlink(tmp_path / "vault", tmp_path / "secrets", target_is_directory=True)
     cwd = str(tmp_path)
     assert not decide("explorer", "Read", {"file_path": "harmless.txt"}, cwd).allow
     assert not decide("explorer", "Read", {"file_path": "vault/k"}, cwd).allow
@@ -828,11 +828,11 @@ def test_structured_output_in_allowed_never_disallowed():
         assert "*" not in disallowed_tools_for(role)
 
 
-def test_glob_pattern_resolved_relative_to_path(tmp_path):
+def test_glob_pattern_resolved_relative_to_path(tmp_path, symlink):
     repo = tmp_path / "repo"
     (repo / "src").mkdir(parents=True)
     (tmp_path / "outside").mkdir()
-    (repo / "src" / "out").symlink_to("../../outside", target_is_directory=True)
+    symlink(repo / "src" / "out", "../../outside", target_is_directory=True)
     cwd = str(repo)
     assert not decide("explorer", "Glob", {"pattern": "out/*", "path": "src"}, cwd).allow
     assert not decide("explorer", "Glob", {"pattern": "~/*", "path": "src"}, cwd).allow

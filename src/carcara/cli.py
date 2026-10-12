@@ -12,7 +12,7 @@ import shutil
 import signal
 import sys
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import timedelta
 from typing import Any
 
@@ -407,7 +407,8 @@ def _project_root(cwd: str) -> str:
     except OSError:
         return cwd
     top = proc.stdout.strip()
-    return top if proc.returncode == 0 and top else cwd
+    # git prints "C:/..." on Windows; normpath gives the native form (no-op on POSIX).
+    return os.path.normpath(top) if proc.returncode == 0 and top else cwd
 
 
 def _select_profile(ns: argparse.Namespace, cwd: str) -> tuple[Any, str]:
@@ -565,8 +566,17 @@ def _make_gate(yes: bool) -> Any:
     return TtyGate(stdout=sys.stderr) if tty else NonInteractiveGate()
 
 
+def _shell_quote(s: str) -> str:
+    """Quote ``s`` for the native shell: cmd/PowerShell on Windows, sh elsewhere."""
+    if os.name == "nt":
+        import subprocess
+
+        return subprocess.list2cmdline([s])
+    return shlex.quote(s)
+
+
 def _resume_cmd(run_id: str, cwd_arg: str) -> str:
-    cwd_part = "" if os.path.abspath(cwd_arg) == os.getcwd() else f" --cwd {shlex.quote(cwd_arg)}"
+    cwd_part = "" if os.path.abspath(cwd_arg) == os.getcwd() else f" --cwd {_shell_quote(cwd_arg)}"
     return f"carcara run --resume {run_id}{cwd_part}"
 
 
@@ -817,16 +827,26 @@ def _raise_interrupt(signum: int, frame: Any) -> None:
 
 @contextmanager
 def _sigterm_as_interrupt() -> Iterator[None]:
-    """Turn SIGTERM into KeyboardInterrupt so the run saves state and exits 130."""
-    try:
-        previous = signal.signal(signal.SIGTERM, _raise_interrupt)
-    except (ValueError, OSError):  # not the main thread / unsupported
-        yield
-        return
+    """Turn SIGTERM (and SIGBREAK on Windows) into KeyboardInterrupt.
+
+    The run then saves state and exits 130.
+    """
+    signums = [signal.SIGTERM]
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sigbreak is not None:
+        signums.append(sigbreak)
+    previous: list[tuple[int, Any]] = []
+    for signum in signums:
+        try:
+            previous.append((signum, signal.signal(signum, _raise_interrupt)))
+        except (ValueError, OSError):  # not the main thread / unsupported
+            pass
     try:
         yield
     finally:
-        signal.signal(signal.SIGTERM, previous)
+        for signum, handler in previous:
+            with suppress(ValueError, OSError):
+                signal.signal(signum, handler)
 
 
 def _announce(run_id: str, resumed: bool, profile_name: str) -> None:

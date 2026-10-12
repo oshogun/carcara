@@ -100,11 +100,11 @@ def test_main_edit_routing_config_denied(project, path):
     assert _decision(out) == "deny"
 
 
-def test_case_insensitive_fs_spelling_denied(project, monkeypatch):
+def test_case_insensitive_fs_spelling_denied(project, monkeypatch, symlink):
     """A differently-spelled path to the same project dir (a symlink alias) is
     matched via samefile, not string prefixes."""
     alias = project.parent / "proj-alias"
-    alias.symlink_to(project)
+    symlink(alias, project, target_is_directory=True)
     (project / ".claude").mkdir()
     (project / ".claude" / "settings.json").write_text("{}")
     (project / ".claude" / "agents").mkdir()
@@ -132,9 +132,9 @@ def test_main_edit_outside_project_allowed(project, tmp_path):
     assert _hook("pre-tool-use", data, project) == {}
 
 
-def test_symlink_into_project_denied(project, tmp_path):
+def test_symlink_into_project_denied(project, tmp_path, symlink):
     link = tmp_path / "link"
-    link.symlink_to(project / "src")
+    symlink(link, project / "src", target_is_directory=True)
     data = _pre("Edit", {"file_path": str(link / "a.py")}, tmp_path)
     assert _decision(hooks.pre_tool_use(data, str(project))) == "deny"
 

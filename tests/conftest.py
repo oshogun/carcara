@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 
 
@@ -28,3 +30,21 @@ def _clean_env(monkeypatch):
         "ANTHROPIC_AUTH_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
+def symlink():
+    """Create a symlink, skipping the test where Windows denies the privilege.
+
+    Returns ``make(link, target, target_is_directory=False)``.
+    """
+
+    def make(link, target, target_is_directory=False):
+        try:
+            link.symlink_to(target, target_is_directory=target_is_directory)
+        except OSError:
+            if sys.platform == "win32":
+                pytest.skip("symlinks not permitted on this Windows host")
+            raise
+
+    return make

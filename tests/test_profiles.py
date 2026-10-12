@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 from carcara.profiles import MODEL_KEYS, ProfileError, list_profiles, load_profile, parse_profile
@@ -78,11 +80,11 @@ def test_line_without_equals_uses_whole_line_as_value():
 @pytest.mark.parametrize("line", ["BOGUS=x", " MODEL_MAIN=x", "   ", "model_main=x"])
 def test_unknown_key_fatal(tmp_path, line):
     p = write(tmp_path, VALID + line + "\n")
-    with pytest.raises(ProfileError, match=f"invalid key in profile {p}: "):
+    with pytest.raises(ProfileError, match=re.escape(f"invalid key in profile {p}: ")):
         load_profile(p)
 
 
-@pytest.mark.parametrize("value", ["so/net", "", "a b", "x;y", "sonnet\r", "é"])
+@pytest.mark.parametrize("value", ["so/net", "", "a b", "x;y", "son\rnet", "é"])
 def test_unsafe_value_rejected(tmp_path, value):
     p = write(tmp_path, VALID + f"MODEL_MAIN={value}\n")
     with pytest.raises(ProfileError) as exc:
@@ -90,9 +92,19 @@ def test_unsafe_value_rejected(tmp_path, value):
     assert str(exc.value) == f"invalid model for MODEL_MAIN in {p}: '{value}'"
 
 
-def test_crlf_profile_rejected(tmp_path):
-    with pytest.raises(ProfileError, match="invalid model for MODEL_MAIN"):
-        load_profile(write(tmp_path, VALID.replace("\n", "\r\n")))
+def test_crlf_profile_accepted(tmp_path):
+    p = load_profile(write(tmp_path, VALID.replace("\n", "\r\n")))
+    assert p.models == {k: f"m-{i}" for i, k in enumerate(MODEL_KEYS)}
+    data = VALID.encode().replace(b"m-0\n", b"sonnet\r\n")
+    assert parse_profile(data, "x")["MODEL_MAIN"] == "sonnet"
+
+
+def test_crlf_list_profiles(tmp_path, monkeypatch):
+    (tmp_path / "crlf.env").write_bytes(VALID.replace("\n", "\r\n").encode())
+    monkeypatch.setattr("carcara.profiles.profiles_root", lambda: tmp_path)
+    out = list_profiles()
+    assert "\r" not in out
+    assert out.startswith("crlf\n  MODEL_MAIN=m-0\n")
 
 
 @pytest.mark.parametrize("missing", MODEL_KEYS)

@@ -186,7 +186,7 @@ def test_round_trip_reinstall(proj):
 
 def test_user_edited_agent_kept(proj, capsys):
     assert main(["d"]) == 0
-    (proj / AGENT).write_text("custom\n")
+    (proj / AGENT).write_text("custom\n", newline="")
     capsys.readouterr()
     assert main(["uninstall", "d"]) == 0
     out = capsys.readouterr().out
@@ -239,7 +239,7 @@ def test_user_hook_and_model_change_kept(proj):
 
 def test_user_content_in_created_claude_md_kept(proj):
     assert main(["d"]) == 0
-    with open(proj / "CLAUDE.md", "a") as fh:
+    with open(proj / "CLAUDE.md", "a", newline="") as fh:
         fh.write("my notes\n")
     assert main(["uninstall", "d"]) == 0
     assert (proj / "CLAUDE.md").read_bytes() == b"my notes\n"
@@ -266,11 +266,22 @@ def test_purge_removes_runs(proj, capsys):
     assert list(proj.iterdir()) == []
 
 
-def test_purge_refuses_symlinked_runs(proj, tmp_path, capsys):
+def test_same_path_normalises_separators_and_relative(tmp_path, monkeypatch):
+    runs = tmp_path / ".carcara" / "runs"
+    runs.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    # Mix the native separator with "/" the way git and f-strings do on Windows.
+    mixed = os.path.join(".carcara", ".") + "/runs/../runs"
+    assert installer._same_path(mixed, os.path.realpath(runs))
+    assert installer._same_path(str(tmp_path) + "/.carcara/runs", runs)
+    assert not installer._same_path(mixed, tmp_path / ".carcara")
+
+
+def test_purge_refuses_symlinked_runs(proj, tmp_path, capsys, symlink):
     elsewhere = tmp_path / "elsewhere"
     (elsewhere / "r1").mkdir(parents=True)
     assert main(["d"]) == 0
-    (proj / ".carcara" / "runs").symlink_to(elsewhere)
+    symlink(proj / ".carcara" / "runs", elsewhere, target_is_directory=True)
     before = tree(proj)
     capsys.readouterr()
     assert main(["uninstall", "--purge", "d"]) == 1
@@ -441,12 +452,12 @@ def test_purge_lock_race_without_runs_dir_leaves_nothing_behind(proj, monkeypatc
     assert tree(proj) == before and dirs(proj) == before_dirs
 
 
-def test_purge_refuses_symlinked_carcara_dir(proj, tmp_path, capsys):
+def test_purge_refuses_symlinked_carcara_dir(proj, tmp_path, capsys, symlink):
     assert main(["d"]) == 0
     elsewhere = tmp_path / "elsewhere"
     (proj / ".carcara").rename(elsewhere)
     (elsewhere / "runs" / "r1").mkdir(parents=True)
-    (proj / ".carcara").symlink_to(elsewhere)
+    symlink(proj / ".carcara", elsewhere, target_is_directory=True)
     before, before_dirs = tree(proj), dirs(proj)
     outside = tree(elsewhere)
     capsys.readouterr()
@@ -458,7 +469,7 @@ def test_purge_refuses_symlinked_carcara_dir(proj, tmp_path, capsys):
     assert tree(elsewhere) == outside and (elsewhere / "runs" / "r1").is_dir()
 
 
-def test_purge_rechecks_runs_created_before_lock(proj, tmp_path, capsys, monkeypatch):
+def test_purge_rechecks_runs_created_before_lock(proj, tmp_path, capsys, monkeypatch, symlink):
     assert main(["d"]) == 0
     elsewhere = tmp_path / "elsewhere"
     (elsewhere / "r1").mkdir(parents=True)
@@ -466,7 +477,7 @@ def test_purge_rechecks_runs_created_before_lock(proj, tmp_path, capsys, monkeyp
 
     def acquire(target):
         # runs/ shows up (as a symlink) between the checks and taking the lock.
-        (proj / ".carcara" / "runs").symlink_to(elsewhere)
+        symlink(proj / ".carcara" / "runs", elsewhere, target_is_directory=True)
         return real_acquire(target)
 
     monkeypatch.setattr(installer, "_acquire_purge_lock", acquire)
@@ -481,9 +492,9 @@ def test_purge_rechecks_runs_created_before_lock(proj, tmp_path, capsys, monkeyp
     assert (elsewhere / "r1").is_dir()
 
 
-def test_purge_removes_dangling_symlink_at_active(proj, capsys):
+def test_purge_removes_dangling_symlink_at_active(proj, capsys, symlink):
     assert main(["d"]) == 0
-    (proj / ".carcara" / "active.json").symlink_to(proj / "nowhere")
+    symlink(proj / ".carcara" / "active.json", proj / "nowhere")
     capsys.readouterr()
     assert main(["uninstall", "--purge", "d"]) == 0
     assert "  purge      d/.carcara/active.json\n" in capsys.readouterr().out

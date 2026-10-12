@@ -47,9 +47,37 @@ class RunBusy(RunStoreError):
         self.run_id = run_id
 
 
+def _win_pid_alive(pid: int) -> bool:
+    """Windows liveness probe; ``os.kill(pid, 0)`` would terminate the process there."""
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    process_query_limited_information = 0x1000
+    still_active = 259
+    error_access_denied = 5
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == error_access_denied
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _pid_alive(pid: Any) -> bool:
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         return False
+    if os.name == "nt":
+        try:
+            return _win_pid_alive(pid)
+        except (OSError, AttributeError, ValueError, OverflowError):
+            return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

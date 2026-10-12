@@ -1,0 +1,4 @@
+# Keep every text file LF in the working tree, Windows included: installed
+# data/templates and golden fixtures are compared byte-for-byte and hashed,
+# and ruff format --check expects LF.
+* text=auto eol=lf

@@ -91,7 +91,7 @@ def test_output_format(tmp_path, capsys):
 def test_skip_and_force(tmp_path, capsys):
     d = tmp_path / "d"
     (d / ".claude" / "agents").mkdir(parents=True)
-    (d / ".claude" / "agents" / "reviewer.md").write_text("custom\n")
+    (d / ".claude" / "agents" / "reviewer.md").write_text("custom\n", newline="")
     assert main(["d"]) == 0
     out = capsys.readouterr().out
     assert "  skip       d/.claude/agents/reviewer.md (exists; use --force to overwrite)\n" in out
@@ -129,14 +129,14 @@ def test_append_without_trailing_newline(tmp_path):
 def test_idempotent_and_preserves_user_content(tmp_path):
     d = tmp_path / "d"
     d.mkdir()
-    (d / "CLAUDE.md").write_text("# My project\n\nKeep this line.\n")
+    (d / "CLAUDE.md").write_text("# My project\n\nKeep this line.\n", newline="")
     assert main(["d"]) == 0
     first = (d / "CLAUDE.md").read_bytes()
     assert main(["-p", "quality", "d"]) == 0
     assert b"profile: quality" in (d / "CLAUDE.md").read_bytes()
     assert main(["d"]) == 0
     assert (d / "CLAUDE.md").read_bytes() == first
-    with open(d / "CLAUDE.md", "a") as fh:
+    with open(d / "CLAUDE.md", "a", newline="") as fh:
         fh.write("after\n")
     assert main(["d"]) == 0
     assert (d / "CLAUDE.md").read_bytes() == first + b"after\n"
@@ -222,7 +222,7 @@ PARITY = json.loads((FIXTURES / "install_snapshot.json").read_text())
 
 def _existing(proj):
     (proj / ".claude" / "agents").mkdir(parents=True)
-    (proj / ".claude" / "agents" / "reviewer.md").write_text("custom\n")
+    (proj / ".claude" / "agents" / "reviewer.md").write_text("custom\n", newline="")
     (proj / "CLAUDE.md").write_bytes((GOLDEN / "claude-md-update" / "CLAUDE.md.input").read_bytes())
 
 
@@ -337,7 +337,7 @@ def test_custom_profile_file(tmp_path):
         "MODEL_REVIEWER=opus" if line.startswith("MODEL_REVIEWER=") else line
         for line in economy.splitlines()
     ]
-    (tmp_path / "custom.env").write_text("\n".join(lines) + "\n")
+    (tmp_path / "custom.env").write_text("\n".join(lines) + "\n", newline="")
     (tmp_path / "d").mkdir()
     run_cli(["-p", "custom.env", "d"], cwd=tmp_path, check=True)
     assert model_of(tmp_path / "d" / ".claude" / "agents" / "reviewer.md") == "opus"
@@ -364,7 +364,7 @@ def test_bad_profile_file_rejected(tmp_path, transform, err):
     balanced = (ROOT / "src" / "carcara" / "data" / "profiles" / "balanced.env").read_text()
     bad = transform(balanced)
     assert bad != balanced
-    (tmp_path / "bad.env").write_text(bad)
+    (tmp_path / "bad.env").write_text(bad, newline="")
     (tmp_path / "d").mkdir()
     proc = run_cli(["-p", "bad.env", "d"], cwd=tmp_path)
     assert proc.returncode == 1
@@ -376,7 +376,7 @@ def test_bad_profile_file_rejected(tmp_path, transform, err):
 def test_existing_settings_are_merged_keeping_model(tmp_path):
     d = tmp_path / "d"
     (d / ".claude").mkdir(parents=True)
-    (d / ".claude" / "settings.json").write_text('{"model":"opus"}\n')
+    (d / ".claude" / "settings.json").write_text('{"model":"opus"}\n', newline="")
     proc = run_cli(["d"], cwd=tmp_path, check=True)
     assert "  merge      d/.claude/settings.json\n" in proc.stdout
     data = json.loads((d / ".claude" / "settings.json").read_text())
@@ -434,7 +434,7 @@ _HOME_ERR = (
 
 
 @pytest.mark.parametrize("sub", ["", ".claude", ".claude/agents", "cfg"])
-def test_refuses_home_and_claude_config_dir(tmp_path, monkeypatch, capsys, sub):
+def test_refuses_home_and_claude_config_dir(tmp_path, monkeypatch, capsys, symlink, sub):
     home = tmp_path / "home"
     home.mkdir()
     (home / ".claude" / "agents").mkdir(parents=True)
@@ -452,7 +452,7 @@ def test_refuses_home_and_claude_config_dir(tmp_path, monkeypatch, capsys, sub):
     monkeypatch.chdir(target)
     assert main([]) == 1
     link = tmp_path / "link"
-    link.symlink_to(target)
+    symlink(link, target, target_is_directory=True)
     assert main([str(link)]) == 1
     assert sorted(str(p) for p in home.rglob("*")) == before
 

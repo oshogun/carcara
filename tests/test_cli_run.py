@@ -587,6 +587,9 @@ sys.exit(cli.main(sys.argv[1:]))
 # Blocking sleep: the signal lands in the coroutine frame; asyncio.sleep: it
 # lands in the event loop's selector (like the real SDK backend awaiting I/O).
 @pytest.mark.parametrize("sleep", ["time.sleep(60)", "await asyncio.sleep(60)"])
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="SIGTERM via send_signal is TerminateProcess on Windows"
+)
 def test_sigterm_saves_state_and_exits_130(repo, fake, tmp_path, sleep):
     import signal
 
@@ -843,6 +846,18 @@ def test_status_review_findings_and_done(repo):
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX quoting")
+def test_shell_quote_posix():
+    assert cli._shell_quote("/tmp/my repo") == "'/tmp/my repo'"
+    assert cli._shell_quote("/tmp/repo") == "/tmp/repo"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows quoting")
+def test_shell_quote_windows():
+    assert cli._shell_quote(r"C:\Users\me\my repo") == r'"C:\Users\me\my repo"'
+    assert cli._shell_quote(r"C:\repo") == r"C:\repo"
+
+
 def test_status_default_prefers_active_then_latest(repo, capsys):
     store = RunStore(repo)
     first = store.create("one", "balanced", "sha")
@@ -967,12 +982,14 @@ def test_subcommand_flags_not_abbreviated(repo, args):
 def test_cli_rejects_non_toplevel_cwd(repo, fake, capsys):
     (repo / "sub").mkdir()
     fake({"implement": [IMPL], "test": [TEST_OK]})
+    # git prints the resolved toplevel (long names, not 8.3 short ones on Windows).
+    msg = f"carcara: run from the repository root ({os.path.realpath(repo)})\n"
     assert main(["run", "x", "--size", "S", "--cwd", str(repo / "sub")]) == 1
-    assert capsys.readouterr().err == f"carcara: run from the repository root ({repo})\n"
+    assert capsys.readouterr().err == msg
     assert main(["diff", "--cwd", str(repo / "sub")]) == 1
-    assert capsys.readouterr().err == f"carcara: run from the repository root ({repo})\n"
+    assert capsys.readouterr().err == msg
     assert main(["run", "--resume", "20990101-000000-abcd", "--cwd", str(repo / "sub")]) == 1
-    assert capsys.readouterr().err == f"carcara: run from the repository root ({repo})\n"
+    assert capsys.readouterr().err == msg
     assert not (repo / "sub" / ".carcara").exists()
 
 

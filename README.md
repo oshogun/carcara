@@ -25,7 +25,9 @@ carcara balances this by:
 
 ## Install
 
-Requirements: Python 3.10 or newer.
+Requirements: Python 3.10 or newer, on Linux, macOS or Windows (native; WSL
+is not required). On Windows, Claude Code runs carcara's hooks through Git
+Bash, so install Git for Windows.
 
 ```sh
 pipx install carcara-sdlc    # or: uv tool install carcara-sdlc
@@ -460,7 +462,9 @@ confined to the repo, and `.env`, `.env.*` and `secrets/` are refused (case-
 insensitively, symlinks resolved). Write tools are confined to the repo and
 refuse `.git`, `.claude` and `.carcara`. The policy is
 enforced by a PreToolUse hook, which applies in every permission mode;
-`bypassPermissions` is never used.
+`bypassPermissions` is never used. The symlink-related protections are
+tested only where the OS permits creating symlinks (on Windows, that needs
+Developer Mode or an elevated shell); elsewhere those tests are skipped.
 
 implementer and test-runner may run any Bash command except those caught by a
 deny-list: git subcommands that create commits or move refs (`push`,
@@ -670,11 +674,13 @@ to it gated, add `"pyproject.toml"` to the list.
 ## Development
 
 ```sh
-pip install -e '.[dev]'
+pip install -e ".[dev]"
 ruff check .
 pytest -q
 tests/fixtures/regen_golden.sh     # regenerate golden installer output after template/profile changes
 ```
+
+`regen_golden.sh` needs bash; on Windows, run it from Git Bash or WSL.
 
 See `tests/fixtures/golden/README.md` for the golden and install-snapshot fixtures.
 

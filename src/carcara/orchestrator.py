@@ -359,7 +359,7 @@ class _Stop(Exception):
 
 
 # Repo config must not run code during carcara's own git calls.
-_GIT_SAFE = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+_GIT_SAFE = ("-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}")
 _DIFF_SAFE = ("--no-ext-diff", "--no-textconv", "--no-color")
 # Paths never captured in snapshots nor shown in diffs.
 _SECRET_PATHSPECS = (
@@ -449,8 +449,9 @@ def require_toplevel(cwd: str) -> None:
     if proc.returncode != 0:
         raise OrchestratorError(f"{cwd} is not a git repository")
     top = proc.stdout.strip()
-    if os.path.realpath(top) != os.path.realpath(cwd):
-        raise OrchestratorError(f"run from the repository root ({top})")
+    # git prints "C:/..." on Windows; normalise both sides before comparing.
+    if os.path.normcase(os.path.realpath(top)) != os.path.normcase(os.path.realpath(cwd)):
+        raise OrchestratorError(f"run from the repository root ({os.path.normpath(top)})")
 
 
 def _safe_diff(cwd: str, base: str, tree: str, *opts: str, check: bool = True) -> str:

@@ -118,11 +118,11 @@ def test_absolute_paths_under_cwd_match_relative_patterns(tmp_path):
     assert match_paths([str(tmp_path)], ["**"], str(tmp_path)) == [str(tmp_path)]
 
 
-def test_absolute_path_via_symlinked_cwd(tmp_path):
+def test_absolute_path_via_symlinked_cwd(tmp_path, symlink):
     real = tmp_path / "real"
     (real / "db" / "migrations").mkdir(parents=True)
     link = tmp_path / "link"
-    link.symlink_to(real)
+    symlink(link, real, target_is_directory=True)
     path = str(real / "db" / "migrations" / "1.sql")
     assert match_paths([path], DEFAULT_VERIFIABILITY_PATHS, str(link)) == ["db/migrations/1.sql"]
 

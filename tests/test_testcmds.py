@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 import time
 
 import pytest
@@ -18,6 +19,14 @@ def _run(cmd, cwd, timeout_s=10.0):
     return asyncio.run(run_command(cmd, cwd, timeout_s))
 
 
+def _py(code):
+    """A shell command running ``code`` with this interpreter (sh and cmd.exe)."""
+    return f'"{sys.executable}" -c "{code}"'
+
+
+posix_only = pytest.mark.skipif(os.name == "nt", reason="POSIX shell and process groups")
+
+
 def test_run_command_success(tmp_path):
     r = _run("exit 0", tmp_path)
     assert r.exit_code == 0
@@ -26,7 +35,7 @@ def test_run_command_success(tmp_path):
 
 
 def test_run_command_failure_captures_output(tmp_path):
-    r = _run("echo out; echo err >&2; exit 3", tmp_path)
+    r = _run(_py("import sys; print('out'); print('err', file=sys.stderr); sys.exit(3)"), tmp_path)
     assert r.exit_code == 3
     assert not r.ok
     assert "out" in r.output_tail
@@ -35,14 +44,18 @@ def test_run_command_failure_captures_output(tmp_path):
 
 def test_run_command_runs_in_cwd_with_closed_stdin(tmp_path):
     (tmp_path / "marker").write_text("x")
-    r = _run("ls; cat; echo rc=$?", tmp_path)
+    r = _run(
+        _py("import os, sys; print(os.listdir()); print('stdin=' + repr(sys.stdin.read()))"),
+        tmp_path,
+    )
+    assert r.exit_code == 0
     assert "marker" in r.output_tail
-    assert "rc=0" in r.output_tail
+    assert "stdin=''" in r.output_tail
 
 
 def test_run_command_timeout(tmp_path):
     start = time.monotonic()
-    r = _run("sleep 30", tmp_path, timeout_s=0.5)
+    r = _run(_py("import time; time.sleep(30)"), tmp_path, timeout_s=0.5)
     assert time.monotonic() - start < 5
     assert r.timed_out
     assert r.exit_code is None
@@ -50,6 +63,7 @@ def test_run_command_timeout(tmp_path):
     assert "timed out after 0.5s" in testcmds.failure_detail(r)
 
 
+@posix_only
 def test_run_command_timeout_kills_background_children(tmp_path):
     pid_file = tmp_path / "pgid"
     start = time.monotonic()
@@ -61,6 +75,7 @@ def test_run_command_timeout_kills_background_children(tmp_path):
         os.killpg(pgid, 0)
 
 
+@posix_only
 def test_run_command_background_child_holding_pipe_times_out(tmp_path):
     # The shell exits at once, but a backgrounded child keeps stdout open.
     start = time.monotonic()
@@ -70,13 +85,13 @@ def test_run_command_background_child_holding_pipe_times_out(tmp_path):
 
 
 def test_run_command_truncates_output(tmp_path):
-    r = _run("seq 1 5000", tmp_path)
+    r = _run(_py("for i in range(1, 5001): print(i)"), tmp_path)
     lines = r.output_tail.splitlines()
     assert len(lines) <= testcmds.TAIL_LINES
     assert len(r.output_tail) <= testcmds.TAIL_CHARS
     assert lines[-1] == "5000"
 
-    r = _run("head -c 200000 /dev/zero | tr '\\0' x", tmp_path)
+    r = _run(_py("import sys; sys.stdout.write('x' * 200000)"), tmp_path)
     assert len(r.output_tail) == testcmds.TAIL_CHARS
 
 
@@ -86,6 +101,7 @@ def test_run_commands_runs_all_after_failure(tmp_path):
     assert "second" in results[1].output_tail
 
 
+@posix_only
 def test_run_command_cancel_kills_group(tmp_path):
     pid_file = tmp_path / "pgid"
 
@@ -151,6 +167,26 @@ def test_discover_prefers_project_venv(tmp_path):
         "ruff format --check .",
         ".venv/bin/pytest",
     ]
+
+
+def test_discover_prefers_project_windows_venv(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.ruff.lint]\nselect = []\n\n[tool.pytest.ini_options]\n"
+    )
+    scripts = tmp_path / ".venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "pytest.exe").write_text("")
+    (scripts / "ruff.exe").write_text("")
+    assert discover_test_commands(tmp_path) == [
+        ".venv\\Scripts\\ruff check .",
+        ".venv\\Scripts\\ruff format --check .",
+        ".venv\\Scripts\\pytest",
+    ]
+    # A POSIX venv layout wins when both exist.
+    bin_dir = tmp_path / ".venv" / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "pytest").write_text("")
+    assert discover_test_commands(tmp_path)[-1] == ".venv/bin/pytest"
 
 
 def test_discover_regex_fallback_patterns():

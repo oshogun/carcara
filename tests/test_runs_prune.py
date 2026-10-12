@@ -228,13 +228,13 @@ def test_delete_run_rejects_invalid_ids(tmp_path, bad):
     assert (tmp_path / "x").is_dir()
 
 
-def test_delete_run_does_not_follow_symlink(tmp_path):
+def test_delete_run_does_not_follow_symlink(tmp_path, symlink):
     store = RunStore(tmp_path / "proj")
     store.root.mkdir(parents=True)
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "keep.txt").write_text("x")
-    (store.root / "link").symlink_to(outside)
+    symlink(store.root / "link", outside, target_is_directory=True)
     with pytest.raises(RunStoreError):
         store.delete_run("link")
     assert (outside / "keep.txt").exists()

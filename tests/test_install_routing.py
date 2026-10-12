@@ -389,7 +389,8 @@ def test_settings_written_atomically_keeping_mode(proj, monkeypatch):
     path = proj / ".claude" / "settings.json"
     path.chmod(0o640)
     assert main(["d"]) == 0
-    assert path.stat().st_mode & 0o777 == 0o640
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o640
     assert sorted(os.listdir(proj / ".claude")) == ["agents", "commands", "settings.json", "skills"]
 
     path.write_bytes(raw)
@@ -405,11 +406,11 @@ def test_settings_written_atomically_keeping_mode(proj, monkeypatch):
     assert [n for n in os.listdir(proj / ".claude") if n.endswith(".tmp")] == []
 
 
-def test_symlinked_settings_stay_a_symlink(proj, tmp_path):
+def test_symlinked_settings_stay_a_symlink(proj, tmp_path, symlink):
     real = tmp_path / "shared-settings.json"
     real.write_text(json.dumps(USER_SETTINGS))
     (proj / ".claude").mkdir()
-    (proj / ".claude" / "settings.json").symlink_to(real)
+    symlink(proj / ".claude" / "settings.json", real)
     assert main(["d"]) == 0
     assert (proj / ".claude" / "settings.json").is_symlink()
     assert pre_matchers(json.loads(real.read_text())) == DEFAULT_PRE

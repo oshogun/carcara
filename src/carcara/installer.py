@@ -567,15 +567,25 @@ def _install_profile_record(
         _write(path, data)
 
 
+def _norm_real(path: str | Path) -> str:
+    """``path`` resolved and case-normalised (Windows) for comparisons only."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _same_path(a: str | Path, b: str | Path) -> bool:
+    """True if ``a`` and ``b`` resolve to the same path (separators and case normalised)."""
+    return _norm_real(a) == _norm_real(b)
+
+
 def _is_user_config_dir(target: str) -> bool:
     """True if ``target`` is the home directory, the Claude config dir or inside ~/.claude."""
-    real = os.path.realpath(target)
-    home = os.path.realpath(Path.home())
-    claude_dir = os.path.join(home, ".claude")
+    real = _norm_real(target)
+    home = _norm_real(Path.home())
+    claude_dir = os.path.join(home, os.path.normcase(".claude"))
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     forbidden = {home, claude_dir}
     if config_dir:
-        forbidden.add(os.path.realpath(os.path.expanduser(config_dir)))
+        forbidden.add(_norm_real(os.path.expanduser(config_dir)))
     return real in forbidden or real.startswith(claude_dir + os.sep)
 
 
@@ -845,8 +855,8 @@ def _prune_dirs(dirs: list[str]) -> None:
 
 def _check_purge(target: str, runs: str) -> None:
     """Only a real directory inside ``target`` may be rmtree'd."""
-    inside = os.path.join(os.path.realpath(target), RUNS_REL)
-    if os.path.islink(runs) or not os.path.isdir(runs) or os.path.realpath(runs) != inside:
+    inside = os.path.join(os.path.realpath(target), *RUNS_REL.split("/"))
+    if os.path.islink(runs) or not os.path.isdir(runs) or not _same_path(runs, inside):
         raise InstallError(f"refusing to purge {runs}: not a directory inside {target}")
 
 
@@ -930,7 +940,7 @@ def uninstall(
         carcara_dir = f"{target}/.carcara"
         inside = os.path.join(os.path.realpath(target), ".carcara")
         if os.path.lexists(carcara_dir) and (
-            os.path.islink(carcara_dir) or os.path.realpath(carcara_dir) != inside
+            os.path.islink(carcara_dir) or not _same_path(carcara_dir, inside)
         ):
             raise InstallError(f"refusing to purge {carcara_dir}: not a directory inside {target}")
         for path in _purge_lock_paths(target):

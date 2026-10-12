@@ -2,8 +2,9 @@
 
 The test stage runs known commands itself instead of handing them to an agent,
 so nothing can background a command and then poll-wait on it forever. Each
-command runs in its own session with stdin closed and a hard wall-clock
-timeout; on timeout (or cancellation) the whole process group is killed.
+command runs in its own session (a new process group on Windows) with stdin
+closed and a hard wall-clock timeout; on timeout (or cancellation) the whole
+process group (on Windows the process tree, via ``taskkill /T``) is killed.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import contextlib
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 from collections import deque
@@ -29,6 +31,8 @@ TERM_GRACE_S = 5.0
 READER_GRACE_S = 2.0
 EXCERPT_CHARS_PER_COMMAND = 4000
 EXCERPT_CHARS = 12000
+
+_WINDOWS = os.name == "nt"
 
 _RUFF_RE = re.compile(r"^\s*\[\s*tool\.ruff\s*[\].]", re.MULTILINE)
 _PYTEST_RE = re.compile(r"^\s*\[\s*tool\.pytest\.ini_options\s*\]", re.MULTILINE)
@@ -62,8 +66,8 @@ def discover_test_commands(cwd: str | os.PathLike[str]) -> list[str]:
     ``[tool.ruff]`` in pyproject.toml gives ``ruff check .`` and
     ``ruff format --check .``; ``[tool.pytest.ini_options]``, a ``pytest.ini``
     or a ``tests/`` directory gives ``pytest``. A tool is run from
-    ``.venv/bin/`` when the project has it there. Returns [] when nothing is
-    recognised.
+    ``.venv/bin/`` (or ``.venv\\Scripts\\`` on a Windows venv) when the
+    project has it there. Returns [] when nothing is recognised.
     """
     root = Path(cwd)
     has_ruff = has_pytest = False
@@ -74,8 +78,11 @@ def discover_test_commands(cwd: str | os.PathLike[str]) -> list[str]:
         has_pytest = True
 
     def tool(name: str) -> str:
-        local = root / ".venv" / "bin" / name
-        return f".venv/bin/{name}" if local.is_file() else name
+        if (root / ".venv" / "bin" / name).is_file():
+            return f".venv/bin/{name}"
+        if (root / ".venv" / "Scripts" / f"{name}.exe").is_file():
+            return f".venv\\Scripts\\{name}"
+        return name
 
     cmds: list[str] = []
     if has_ruff:
@@ -130,8 +137,28 @@ def _killpg(pgid: int, sig: int) -> None:
         os.killpg(pgid, sig)
 
 
+def _kill_tree(pid: int) -> None:
+    """Forcefully kill ``pid`` and all its descendants (Windows only)."""
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(pid)],
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+
+
 async def _kill_group(proc: asyncio.subprocess.Process, pgid: int) -> None:
-    """SIGTERM the group, give it TERM_GRACE_S to exit, then SIGKILL it."""
+    """SIGTERM the group, give it TERM_GRACE_S to exit, then SIGKILL it.
+
+    On Windows there are no process-group signals: the process tree is killed
+    with ``taskkill /T /F`` and the shell is given TERM_GRACE_S to be reaped.
+    """
+    if _WINDOWS:
+        _kill_tree(proc.pid)
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(proc.wait(), TERM_GRACE_S)
+        return
     _killpg(pgid, signal.SIGTERM)
     with contextlib.suppress(asyncio.TimeoutError):
         await asyncio.wait_for(proc.wait(), TERM_GRACE_S)
@@ -172,13 +199,19 @@ async def run_command(
 
     ``env`` replaces the inherited environment when given.
 
-    The command gets its own session (process group) and a closed stdin;
+    The command gets its own session (process group; on Windows a new process
+    group, run through the default shell) and a closed stdin;
     stderr is merged into stdout and only a bounded tail is kept. The timeout
     covers both the shell's exit and EOF on its output, so a backgrounded
     child holding the pipe counts as still running. On timeout the whole
     group is killed and the result is marked ``timed_out``.
     """
     start = time.monotonic()
+    group_kwargs: dict[str, object] = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        if _WINDOWS
+        else {"start_new_session": True}
+    )
     proc = await asyncio.create_subprocess_shell(
         cmd,
         cwd=os.fspath(cwd),
@@ -186,7 +219,7 @@ async def run_command(
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        start_new_session=True,
+        **group_kwargs,
     )
     pgid = proc.pid  # session leader: its pid is the group id
     tail = _Tail()
@@ -207,7 +240,10 @@ async def run_command(
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(asyncio.shield(reader), READER_GRACE_S)
     except asyncio.CancelledError:
-        _killpg(pgid, signal.SIGKILL)
+        if _WINDOWS:
+            _kill_tree(proc.pid)
+        else:
+            _killpg(pgid, signal.SIGKILL)
         # Reap the shell so no zombie keeps the group alive past cancellation.
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(proc.wait(), READER_GRACE_S)
