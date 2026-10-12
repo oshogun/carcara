@@ -648,6 +648,7 @@ STATUS_KEYS = {
     "gate",
     "review_reason",
     "unverified",
+    "severity_capped",
     "probe_results",
     "extent",
     "triage_range",
@@ -759,6 +760,35 @@ def test_status_verifiability_fields(repo, capsys):
     assert "extent: 1 files, areas .github, fix rounds 0 [carcara/extent-1]\n" in out
     assert "unverified: 1 open (external 1, normative 0, untested 0)\n" in out
     assert "  - U1 [external] pypi name free\n" in out and "U2" not in out
+
+
+def test_status_lists_capped_findings(repo, capsys):
+    run_ = RunStore(repo).create("t", "balanced", "sha", size="S")
+    entry = {
+        "index": 0,
+        "before": "major",
+        "path": "a.py",
+        "issue": "token leak",
+        "dimension": "security",
+        "why": "no reason",
+    }
+    capped = {"review": [entry], "fix-1:review": [{"index": 1, "before": "blocker"}]}
+    refutations = [
+        {"key": "review-refute:0", "index": 0, "before": "minor", "after": "minor"}
+        | {"disproved": False, "basis": "kept_unverified"}
+    ]
+    run_.state.update(status="running", severity_capped=capped, refutations=refutations)
+    run_.save()
+    assert _status_json(repo, capsys)["severity_capped"] == capped
+
+    assert status(repo) == 0
+    out = capsys.readouterr().out
+    assert "Capped (no reason): 2\n" in out
+    assert (
+        "  - major -> minor [security] a.py: token leak (capped: no reason); "
+        "disproof kept unverified\n"
+    ) in out
+    assert "  - blocker -> minor [unknown] (capped: no reason)\n" in out
 
 
 def test_status_plan_shows_post_implement_gate(repo, capsys):

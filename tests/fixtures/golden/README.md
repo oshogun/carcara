@@ -46,5 +46,7 @@ and `-l` output are unchanged 0.1.0 values. The uninstall work (#9) added
 the `.carcara/install.json` manifest line and hash to the success cases. #39
 updated the `test-runner.md` hashes (rules on how to run commands), and #40
 the `reviewer.md` hashes (major findings need a reason). #43 updated the
-`test-runner.md` hashes again (the agent is only the fallback). Regenerate it with a script that
+`test-runner.md` hashes again (the agent is only the fallback), and #45 the
+`reviewer.md` hashes again (`reason` is required on every major or blocker).
+Regenerate it with a script that
 replays each scenario, and review the diff before committing.

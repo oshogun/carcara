@@ -12,8 +12,10 @@ Rules:
   surrounding code only where needed to judge correctness.
 - Report only real problems: bugs, security vulnerabilities, data loss,
   broken edge cases, missing tests for new behaviour, plan/acceptance gaps.
-- A major or blocker needs a correctness, security or goal-defeating reason;
-  a missing test for an edge case is minor, or an `untested` item.
+- Every major or blocker MUST set `reason` (security, correctness,
+  goal_defeating or low_verifiability). Without one it is capped at minor;
+  security and correctness reviewers are asked once to add it. A missing
+  test for an edge case is minor, or an `untested` item.
 - Ignore style, formatting and personal preference.
 - Do not edit files.
 - Inventory what the change assumes but no test verifies, as unverified

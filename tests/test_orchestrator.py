@@ -2877,7 +2877,8 @@ def test_ultra_review_fix_round_uses_merge_and_prefix(repo):
     script = {
         "implement": [impl(), impl()],
         "test": [TEST_OK, TEST_OK],
-        "review-dim": [REVIEW_MAJOR] * 3 + [REVIEW_OK] * 3,
+        # A reasoned major, so no reason follow-up runs.
+        "review-dim": [{**REVIEW_MAJOR, "findings": [_finding("major")]}] * 3 + [REVIEW_OK] * 3,
         "review": [REVIEW_MAJOR, REVIEW_OK],
         "review-refute": [_refute()],
     }
@@ -3085,11 +3086,24 @@ def test_ultra_untested_major_without_reason_is_capped_to_untested(repo):
     assert orch.run_state.state["unverified"] == [
         {"id": "U1", "kind": "untested", "text": f"a.py: {GAP}"}
     ]
+    capped = {
+        "index": 0,
+        "before": "major",
+        "path": "a.py",
+        "issue": GAP,
+        "dimension": "unknown",
+        "why": "no reason",
+    }
     (event,) = _events(orch, "review_severity_capped")
-    assert event["count"] == 1 and event["findings"] == [{"index": 0, "before": "major"}]
+    assert event["count"] == 1 and event["findings"] == [capped]
+    assert orch.run_state.state["severity_capped"] == {"review": [capped]}
+    # A tests-dimension major gets no reason follow-up.
+    assert _events(orch, "review_reason_followup") == []
+    assert not any(r.key.endswith(":reason") for r in backend.requests)
     refute_req = next(r for r in backend.requests if r.key == "review-refute:0")
     assert '"severity":"minor"' in refute_req.prompt
     assert "1 majors capped (no reason)" in out.report_text
+    assert f"- major -> minor [unknown] a.py: {GAP} (capped: no reason)\n" in out.report_text
     assert "untested 1" in out.report_text
 
 
@@ -3122,14 +3136,55 @@ def test_ultra_capped_finding_refuter_justified_raise_restores(repo):
     assert event["changes"][0]["before"] == "minor" and event["changes"][0]["after"] == "major"
 
 
-def test_ultra_capped_finding_disproved_is_not_listed_untested(repo):
+@pytest.mark.parametrize(
+    ("refutes", "basis"),
+    [
+        ({"review-refute:0": [_refute("nit", disproved=True, evidence=[CITE])]}, "evidence"),
+        (
+            {
+                "review-refute:0": [_refute("nit", disproved=True)],
+                "review-refute-2:0": [_refute("nit", disproved=True)],
+            },
+            "second_refuter",
+        ),
+    ],
+)
+def test_ultra_capped_finding_disproved_is_not_listed_untested(repo, refutes, basis):
+    # #45: dropping a capped finding needs evidence or a second refuter's agreement.
     gap = {**_finding("minor", GAP), "severity": "major"}
     review = {**REVIEW_MAJOR, "findings": [gap]}
-    refutes = {"review-refute:0": [_refute("nit", disproved=True)]}
     orch, _ = _refute_run(repo, review, refutes)
-    assert go(orch).status == "done"
+    out = go(orch)
+    assert out.status == "done"
     stored = orch.run_state.stage("review")["output"]
     assert stored["findings"] == [] and stored["unverified"] == []
+    (change,) = orch.run_state.state["refutations"]
+    assert change["after"] is None and change["basis"] == basis
+    assert f"(capped: no reason); dropped ({basis})" in out.report_text
+
+
+def test_ultra_capped_finding_single_disproof_without_evidence_is_kept(repo):
+    # #45: one refuter's bare disproof cannot drop a capped finding unseen.
+    gap = {**_finding("minor", GAP), "severity": "major"}
+    review = {**REVIEW_MAJOR, "findings": [gap]}
+    refutes = {
+        "review-refute:0": [_refute("nit", disproved=True)],
+        "review-refute-2:0": [_refute("minor")],
+    }
+    orch, backend = _refute_run(repo, review, refutes)
+    out = go(orch)
+    assert out.status == "done"
+    assert any(r.key == "review-refute-2:0" for r in backend.requests)
+    stored = orch.run_state.stage("review")["output"]
+    assert stored["findings"] == [{**gap, "severity": "minor", "capped": True}]
+    assert stored["verdict"] == "approve"
+    (change,) = orch.run_state.state["refutations"]
+    assert change["basis"] == "kept_unverified" and change["after"] == "minor"
+    assert orch.run_state.state["unverified"] == [
+        {"id": "U1", "kind": "untested", "text": f"a.py: {GAP}"}
+    ]
+    assert "1 kept unverified" in out.report_text
+    assert "(capped: no reason); disproof kept unverified" in out.report_text
 
 
 def test_non_ultra_review_major_without_reason_unchanged(repo):
@@ -3204,7 +3259,21 @@ def test_cap_review_findings():
     kept = [_finding("major", "k"), _finding("minor", "m"), _finding("nit", "n")]
     review = {"verdict": "request_changes", "findings": [bare, *kept], "unverified": []}
     capped, which = _cap_review_findings(review)
-    assert which == [{"index": 0, "before": "major"}]
+    assert which == [
+        {
+            "index": 0,
+            "before": "major",
+            "path": "a.py",
+            "issue": GAP,
+            "dimension": "unknown",
+            "why": "no reason",
+        }
+    ]
+    _, which = _cap_review_findings(
+        {**review, "findings": [{**bare, "dimension": "security", "issue": "y" * 300}]}
+    )
+    assert which[0]["dimension"] == "security"
+    assert len(which[0]["issue"]) == MAX_UNVERIFIED_TEXT
     assert capped["findings"] == [{**bare, "severity": "minor", "capped": True}, *kept]
     assert capped["verdict"] == "request_changes"  # the justified major survives
     assert capped["unverified"] == [{"kind": "untested", "text": f"a.py: {GAP}"}]
@@ -3223,6 +3292,148 @@ def test_cap_review_findings():
     full = [{"id": f"U{i}", "kind": "normative", "text": str(i)} for i in range(MAX_UNVERIFIED)]
     out, _ = _cap_review_findings({**review, "findings": [bare], "unverified": full})
     assert out["unverified"] == full
+
+
+# -- ultra: reason follow-up for security/correctness majors (#45) -------------
+
+LEAK = "token written to the log"
+
+
+def _bare(issue=LEAK, dim=None):
+    finding = {"severity": "major", "path": "a.py", "issue": issue, "fix": "fix it"}
+    return {**finding, "dimension": dim} if dim else finding
+
+
+def _reason_run(repo, dim, followups, merged, fixes=0, **extra):
+    """Ultra S run: `dim` reports a reasonless major, `followups` answer its follow-up."""
+    review = {**REVIEW_MAJOR, "findings": [_bare()]}
+    script = {
+        "implement": [impl()] * (1 + fixes),
+        "test": [TEST_OK] * (1 + fixes),
+        **{f"review-dim:{d}": [review if d == dim else REVIEW_OK] for d in DIMS},
+        f"review-dim:{dim}:reason": followups,
+        "review": [merged] + [REVIEW_OK] * fixes,
+        **extra,
+    }
+    if fixes:
+        script["review-dim"] = [REVIEW_OK] * 3 * fixes  # the fix rounds' dimensions
+    return make_editing(repo, script, [EDIT], **_ultra_s(followup_timeout_s=0.05))
+
+
+def test_ultra_security_major_without_reason_followup_still_capped(repo):
+    still = {**REVIEW_MAJOR, "findings": [_bare()]}
+    merged = {**REVIEW_MAJOR, "findings": [_bare(dim="security")]}
+    orch, backend = _reason_run(
+        repo, "security", [still], merged, **{"review-refute:0": [_refute("minor")]}
+    )
+    out = go(orch)
+    assert out.status == "done"
+    assert "fix-1:implement" not in keys(orch)
+    (followup,) = [r for r in backend.requests if r.key == "review-dim:security:reason"]
+    dim_entry = orch.run_state.stage("review-dim:security")
+    assert followup.resume == dim_entry["session_id"] and followup.resume
+    assert followup.max_turns == DEFAULT_FOLLOWUP_MAX_TURNS and followup.stage == "review-dim"
+    assert f"- a.py: {LEAK}" in followup.prompt and "`reason`" in followup.prompt
+    (event,) = _events(orch, "review_reason_followup")
+    assert event == {**event, "dim": "security", "count": 1, "resolved": False}
+    merge_req = next(r for r in backend.requests if r.key == "review")
+    assert '"dimension":"security"' in merge_req.prompt
+    (entry,) = orch.run_state.state["severity_capped"]["review"]
+    assert entry == {
+        "index": 0,
+        "before": "major",
+        "path": "a.py",
+        "issue": LEAK,
+        "dimension": "security",
+        "why": "no reason",
+    }
+    report = out.report_text
+    assert "Capped findings:\n" in report
+    assert f"- major -> minor [security] a.py: {LEAK} (capped: no reason)\n" in report
+
+
+def test_ultra_security_major_followup_with_reason_is_not_capped(repo):
+    fixed = {**REVIEW_MAJOR, "findings": [{**_bare(), "reason": "security"}]}
+    merged = {**REVIEW_MAJOR, "findings": [{**_bare(dim="security"), "reason": "security"}]}
+    orch, backend = _reason_run(
+        repo, "security", [fixed], merged, fixes=1, **{"review-refute:0": [_refute()]}
+    )
+    out = go(orch)
+    assert out.status == "done"
+    (event,) = _events(orch, "review_reason_followup")
+    assert event["resolved"] is True and event["count"] == 1
+    merge_req = next(r for r in backend.requests if r.key == "review")
+    assert '"reason":"security"' in merge_req.prompt
+    assert orch.run_state.stage("review-dim:security:reason")["output"] == fixed
+    assert _events(orch, "review_severity_capped") == []
+    assert "fix-1:implement" in keys(orch)
+    assert "capped" not in out.report_text
+    # The follow-up is memoised: one per dimension per round, none in the fix round.
+    assert len([r for r in backend.requests if r.key.endswith(":reason")]) == 1
+
+
+def test_ultra_correctness_major_without_reason_gets_followup(repo):
+    fixed = {**REVIEW_MAJOR, "findings": [{**_bare(), "reason": "correctness"}]}
+    orch, backend = _reason_run(repo, "correctness", [fixed], REVIEW_OK)
+    assert go(orch).status == "done"
+    (event,) = _events(orch, "review_reason_followup")
+    assert event["dim"] == "correctness" and event["resolved"] is True
+    assert [r.key for r in backend.requests if r.key.endswith(":reason")] == [
+        "review-dim:correctness:reason"
+    ]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        NoStructuredOutput("no output", StageResult(cost_usd=0.1, num_turns=1)),
+        StageTimeout("timed out", StageResult(num_turns=1)),
+        StageResult(structured={"verdict": "approve"}, cost_usd=0.1, num_turns=1),
+    ],
+)
+def test_ultra_reason_followup_failure_keeps_original_and_caps(repo, reply):
+    merged = {**REVIEW_MAJOR, "findings": [_bare(dim="security")]}
+    orch, backend = _reason_run(
+        repo, "security", [reply], merged, **{"review-refute:0": [_refute("minor")]}
+    )
+    out = go(orch)
+    assert out.status == "done"
+    (event,) = _events(orch, "review_reason_followup")
+    assert event["resolved"] is False
+    assert orch.run_state.stage("review-dim:security:reason") is None
+    (attempt,) = orch.run_state.state["failed_attempts"]
+    assert attempt["key"] == "review-dim:security:reason" and attempt["followup"] is True
+    merge_req = next(r for r in backend.requests if r.key == "review")
+    assert LEAK in merge_req.prompt
+    assert len(orch.run_state.state["severity_capped"]["review"]) == 1
+    # A resume never repeats an attempted follow-up.
+    assert orch.run_state.state["reason_followups"] == ["review-dim:security:reason"]
+
+
+def test_ultra_reason_followup_skipped_without_session(repo):
+    review = {**REVIEW_MAJOR, "findings": [_bare()]}
+    no_session = StageResult(structured=review, num_turns=1, session_id=None)
+    merged = {**REVIEW_MAJOR, "findings": [_bare(dim="security")]}
+    orch, backend = _reason_run(
+        repo,
+        "security",
+        [],
+        merged,
+        **{"review-dim:security": [no_session], "review-refute:0": [_refute("minor")]},
+    )
+    assert go(orch).status == "done"
+    assert _events(orch, "review_reason_followup") == []
+    assert not any(r.key.endswith(":reason") for r in backend.requests)
+    assert len(orch.run_state.state["severity_capped"]["review"]) == 1
+
+
+def test_report_renders_old_severity_capped_entries(repo):
+    orch, _, _ = make(repo, {"implement": [impl()], "test": [TEST_OK]}, size="S")
+    go(orch)
+    orch.run_state.state["severity_capped"] = {"review": [{"index": 0, "before": "blocker"}]}
+    report = orch._report(orch.run_state)
+    assert "Review: 1 majors capped (no reason)\n" in report
+    assert "- blocker -> minor [unknown] (capped: no reason)\n" in report
 
 
 def test_ultra_refute_low_verifiability_escalates(repo):

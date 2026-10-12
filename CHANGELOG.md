@@ -28,6 +28,17 @@
   capped at minor and listed as an `untested` unverified item instead of
   starting a fix round. A missing test for the behaviour the task asks for
   stays serious as `goal_defeating`. The reviewer agent template says so too.
+- `--ultra`: capped findings can no longer quietly hide a real major (#45).
+  The report lists each one (original severity, dimension, path, issue,
+  "capped: no reason" and its refutation outcome), as do `carcara status`
+  while running and `carcara status --json` (`severity_capped`). A
+  reasonless major or blocker from the correctness or security dimension
+  gets one follow-up prompt asking for a `reason` before it is capped
+  (`review_reason_followup` event). A capped finding is contested for
+  refutation: one refuter's disproof without evidence no longer drops it;
+  that needs evidence or a second refuter, otherwise it is kept as an
+  unverified item. The reviewer template requires `reason` on every major or
+  blocker.
 
 ### Added
 - `carcara runs prune` deletes old run directories under `.carcara/runs/`

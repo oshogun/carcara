@@ -562,7 +562,9 @@ def test_ultra_inventory_comes_only_from_merge_review(repo):
         "test": [TEST_OK, TEST_OK],
         "review": merge,
     }
-    dim = _with_inventory(REVIEW_MAJOR, "dim only", "merge item")
+    # A reasoned major, so no reason follow-up runs.
+    reasoned = [{**f, "reason": "correctness"} for f in REVIEW_MAJOR["findings"][:1]]
+    dim = _with_inventory({**REVIEW_MAJOR, "findings": reasoned}, "dim only", "merge item")
     ultra = {
         **common,
         "scope": [

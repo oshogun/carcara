@@ -61,6 +61,8 @@ _UNVERIFIED: dict[str, Any] = {
 # Why a finding is major or higher (review findings and refuter raises alike);
 # "none" when it is not or no floor reason applies (such a rating is capped at minor).
 FINDING_REASONS = ("none", "goal_defeating", "low_verifiability", "security", "correctness")
+# Ultra mode: the parallel review dimensions (a finding's optional source `dimension`).
+REVIEW_DIMENSIONS = ("correctness", "security", "tests")
 
 MAX_SCOPE_AREAS = 4
 # Ultra: at most this many merged review findings are refuted per round.
@@ -84,8 +86,9 @@ _REVIEW: dict[str, Any] = _obj(
                     "issue": _STR,
                     "fix": _STR,
                     "reason": {"type": "string", "enum": list(FINDING_REASONS)},
+                    "dimension": {"type": "string", "enum": list(REVIEW_DIMENSIONS)},
                 },
-                optional=("line", "reason"),
+                optional=("line", "reason", "dimension"),
             )
         ),
         "unverified": _UNVERIFIED,

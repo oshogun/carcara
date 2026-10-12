@@ -672,8 +672,10 @@ def diff_main(ns: argparse.Namespace) -> int:
 
 
 def _verifiability_lines(state: dict[str, Any]) -> list[str]:
-    """Gate trigger, extent facts and open unverified items for the no-report fallback."""
-    from carcara.schemas import UNVERIFIED_KINDS
+    """Gate trigger, extent facts, open unverified items and capped findings for the
+    no-report fallback."""
+    from carcara.orchestrator import capped_finding_lines
+    from carcara.schemas import MAX_UNVERIFIED, UNVERIFIED_KINDS
 
     lines = []
     gate = state.get("gate")
@@ -697,6 +699,11 @@ def _verifiability_lines(state: dict[str, Any]) -> list[str]:
         )
         lines.append(f"unverified: {len(open_items)} open ({counts})")
         lines.extend(f"  - {i['id']} [{i['kind']}] {i['text']}" for i in open_items)
+    capped = capped_finding_lines(state, limit=MAX_UNVERIFIED)
+    if capped:
+        count = sum(len(v) for v in (state.get("severity_capped") or {}).values())
+        lines.append(f"Capped (no reason): {count}")
+        lines.extend(f"  {line}" for line in capped)
     return lines + _issue_lines(state)
 
 
@@ -753,6 +760,7 @@ def status_main(ns: argparse.Namespace) -> int:
             "gate": state.get("gate"),
             "review_reason": state.get("review_reason"),
             "unverified": state.get("unverified") or [],
+            "severity_capped": state.get("severity_capped") or {},
             "probe_results": state.get("probe_results") or {},
             "extent": state.get("extent"),
             "triage_range": state.get("triage_range"),

@@ -8,6 +8,7 @@ from carcara.schemas import (
     MAX_SCOPE_AREAS,
     MAX_UNVERIFIED,
     MAX_UNVERIFIED_TEXT,
+    REVIEW_DIMENSIONS,
     SCHEMAS,
     TRIAGE_RANGES,
     UNCERTAINTY_KINDS,
@@ -131,6 +132,19 @@ def test_review_finding_reason():
         reasoned = {**review, "findings": [{**finding, "reason": reason}]}
         assert validate("review", reasoned) == []
     assert validate("review", {**review, "findings": [{**finding, "reason": "tests"}]})
+
+
+def test_review_finding_dimension():
+    from carcara.orchestrator import _REVIEW_DIMS
+
+    assert REVIEW_DIMENSIONS == tuple(_REVIEW_DIMS) == ("correctness", "security", "tests")
+    finding = {"severity": "major", "path": "a.py", "issue": "i", "fix": "f"}
+    review = {"verdict": "approve", "findings": [finding], "unverified": []}
+    assert validate("review", review) == []  # optional
+    for dim in REVIEW_DIMENSIONS:
+        tagged = {**review, "findings": [{**finding, "dimension": dim}]}
+        assert validate("review-dim", tagged) == []
+    assert validate("review", {**review, "findings": [{**finding, "dimension": "style"}]})
 
 
 def test_review_refute_schema():

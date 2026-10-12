@@ -63,7 +63,9 @@ from carcara.schemas import (
     MAX_SECOND_REFUTERS,
     MAX_UNVERIFIED,
     MAX_UNVERIFIED_TEXT,
+    REVIEW_DIMENSIONS,
     UNVERIFIED_KINDS,
+    validate,
 )
 from carcara.testcmds import (
     CommandResult,
@@ -163,15 +165,29 @@ _REVIEW_DIMS = {
     "tests": "missing or weak tests for the changed behaviour; a test gap for an edge "
     "case is minor unless it covers the behaviour the task asks for.",
 }
+assert tuple(_REVIEW_DIMS) == REVIEW_DIMENSIONS
+
+# Ultra mode: the dimensions whose reasonless majors get one follow-up before the cap.
+_REASON_FOLLOWUP_DIMS = ("correctness", "security")
 
 # Ultra mode: the reason a dimension or merged finding of major or higher must give
 # (enforced in code by _cap_review_findings).
 _FINDING_REASON_RULE = (
     "Every major or blocker finding must set `reason`: correctness (wrong behaviour in "
     "the shipped code), security, goal_defeating (including a missing or weak test for "
-    "the behaviour the task asks for) or low_verifiability. Any other major or blocker "
-    "is capped at minor and listed as an untested item; a missing test for an edge "
-    "case is minor."
+    "the behaviour the task asks for) or low_verifiability. A major or blocker without "
+    "one of these reasons is capped at minor and listed as an untested item; a missing "
+    "test for an edge case is minor."
+)
+
+# Ultra mode: sent in a security/correctness dimension reviewer's session when it
+# rated a finding major or higher without a floor reason; {findings} lists them.
+_REASON_FOLLOWUP = (
+    "These findings are rated major or blocker but have no floor `reason`:\n{findings}\n"
+    "Do not investigate further. For each one, set `reason` (security, correctness, "
+    "goal_defeating or low_verifiability) if it applies, or lower the severity to minor. "
+    "Without a reason it will be capped at minor. Then call the StructuredOutput tool "
+    "exactly once with your full review again."
 )
 
 # Severity floor shared by the merge and refute prompts (enforced in code too).
@@ -578,10 +594,12 @@ def _contested(finding: dict[str, Any], res: dict[str, Any]) -> bool:
     That is when the finding is serious as merged, or the refuter's own ratings say
     it is (goal-defeating, low-verifiability, or re-rated major or higher with a floor
     reason): such a disproof contradicts itself, so it cannot drop the finding on its
-    own say-so.
+    own say-so. A finding capped for a missing reason (_cap_review_findings) is
+    contested too, so one refuter cannot drop a possibly real major unseen.
     """
     return (
         _serious(finding)
+        or bool(finding.get("capped"))
         or res["goal_defeating"]
         or res["low_verifiability"]
         or _SEVERITY_RANK[_refuter_severity(res)[0]] >= _SEVERITY_RANK["major"]
@@ -721,20 +739,58 @@ def _cap_review_findings(
     an `untested` unverified item instead of starting a fix round. The verdict is
     recomputed when anything was capped.
 
-    Returns (capped copy, capped findings as {index, before}).
+    Returns (capped copy, capped findings as {index, before, path, issue, dimension,
+    why}); dimension is the finding's source dimension, or "unknown".
     """
     findings: list[dict[str, Any]] = []
     capped: list[dict[str, Any]] = []
     for index, finding in enumerate(review["findings"]):
         severity, was_capped = _justified_severity(finding["severity"], finding.get("reason"))
         if was_capped:
-            capped.append({"index": index, "before": finding["severity"]})
+            capped.append(
+                {
+                    "index": index,
+                    "before": finding["severity"],
+                    "path": finding["path"],
+                    "issue": finding["issue"][:MAX_UNVERIFIED_TEXT],
+                    "dimension": finding.get("dimension") or "unknown",
+                    "why": "no reason",
+                }
+            )
             finding = {**finding, "severity": severity, "capped": True}
         findings.append(finding)
     if not capped:
         return review, capped
     verdict = "request_changes" if any(_serious(f) for f in findings) else "approve"
     return _with_untested({**review, "verdict": verdict, "findings": findings}), capped
+
+
+def capped_finding_lines(state: dict[str, Any], limit: int | None = None) -> list[str]:
+    """One line per finding capped for a missing reason, with its refutation outcome.
+
+    Entries from older runs ({index, before} only) render with dimension "unknown".
+    """
+    outcomes = {c.get("key"): c for c in state.get("refutations") or []}
+    lines: list[str] = []
+    for key, entries in (state.get("severity_capped") or {}).items():
+        for entry in entries:
+            where = f" {entry['path']}: {entry.get('issue', '')}" if entry.get("path") else ""
+            line = (
+                f"- {entry['before']} -> minor [{entry.get('dimension') or 'unknown'}]"
+                f"{where} (capped: no reason)"
+            )
+            change = outcomes.get(f"{key}-refute:{entry['index']}")
+            if change is not None:
+                if change.get("after") is None:
+                    line += f"; dropped ({change.get('basis', 'minor')})"
+                elif change.get("basis") == "kept_unverified":
+                    line += "; disproof kept unverified"
+                elif _SEVERITY_RANK[change["after"]] >= _SEVERITY_RANK["major"]:
+                    line += f"; restored to {change['after']}"
+            lines.append(line)
+    if limit is not None and len(lines) > limit:
+        lines = lines[:limit] + [f"- ... {len(lines) - limit} more"]
+    return lines
 
 
 def _slug(text: str) -> str:
@@ -1603,6 +1659,128 @@ class Orchestrator:
             return None, result.cost_usd or 0.0
         return result, result.cost_usd or 0.0
 
+    async def _reason_followup(self, run: Run, key: str, dim: str) -> dict[str, Any]:
+        """Ultra: ask dimension ``key``'s session once for its reasonless majors' reasons.
+
+        Returns the dimension's review to merge: the follow-up's when it is valid,
+        else the original (its reasonless majors are then capped). Memoised as stage
+        ``<key>:reason``; an attempted follow-up is never repeated on resume.
+        """
+        entry = run.stage(key)
+        assert entry is not None
+        output = entry["output"]
+        fkey = f"{key}:reason"
+        done = run.stage(fkey)
+        if done is not None:
+            run.event("stage_replayed", key=fkey)
+            return done["output"]
+        tried = run.state.setdefault("reason_followups", [])
+        flagged = [
+            f for f in output["findings"] if _justified_severity(f["severity"], f.get("reason"))[1]
+        ]
+        session_id = entry.get("session_id")
+        if not flagged or not session_id or fkey in tried:
+            return output
+        remaining: float | None = None
+        if self.options.max_budget_usd is not None:
+            remaining = round(self.options.max_budget_usd - run.state["totals"]["cost_usd"], 6)
+            if remaining <= 0:
+                return output
+        tried.append(fkey)
+        run.save()
+        listing = "\n".join(f"- {f['path']}: {f['issue']}" for f in flagged)
+        request = replace(
+            build_request(
+                "review-dim",
+                self._role("reviewer"),
+                self.profile,
+                _REASON_FOLLOWUP.format(findings=listing),
+                self.cwd,
+                max_turns=DEFAULT_FOLLOWUP_MAX_TURNS,
+                max_budget_usd=remaining,
+                setting_sources=["project"] if self.options.project_settings else [],
+                unrestricted_bash=self.options.unrestricted_bash,
+                key=fkey,
+                timeout_s=self.options.followup_timeout_s,
+            ),
+            resume=session_id,
+        )
+        run.event(
+            "stage_started",
+            key=fkey,
+            stage="review-dim",
+            role="reviewer",
+            model=request.model,
+            followup=True,
+        )
+        result: StageResult | None = None
+        error = ""
+        try:
+            result = await self.backend.run_stage(request)
+        except BackendError as exc:
+            counted = exc.result is not None and not isinstance(exc, StageTimeout)
+            if counted:
+                run.add_cost(exc.result.cost_usd, exc.result.usage, exc.result.num_turns)
+            cost = self._record_failure(
+                run,
+                fkey,
+                "review-dim",
+                "reviewer",
+                request.model,
+                exc.result,
+                str(exc),
+                counted=counted,
+                followup=True,
+            )
+            run.event("stage_error", key=fkey, error=str(exc), **cost)
+        except BaseException as exc:
+            # Interrupt or unexpected error: the follow-up's spend is unknown.
+            cost = self._record_failure(
+                run, fkey, "review-dim", "reviewer", request.model, None, repr(exc), followup=True
+            )
+            run.event("stage_error", key=fkey, error=repr(exc), **cost)
+            raise
+        else:
+            run.add_cost(result.cost_usd, result.usage, result.num_turns)
+            if result.is_error:
+                error = "; ".join(result.errors) or f"error result (subtype {result.subtype})"
+            elif not isinstance(result.structured, dict):
+                error = "no structured output"
+            elif problems := validate("review-dim", result.structured):
+                error = "invalid structured output: " + "; ".join(problems[:3])
+            if error:
+                cost = self._record_failure(
+                    run,
+                    fkey,
+                    "review-dim",
+                    "reviewer",
+                    request.model,
+                    result,
+                    f"follow-up failed: {error}",
+                    followup=True,
+                )
+                run.event("stage_error", key=fkey, error=error, **cost)
+                result = None
+        if result is not None:
+            output = result.structured
+            run.record_stage(
+                fkey,
+                "review-dim",
+                "reviewer",
+                request.model,
+                output,
+                result.cost_usd,
+                result.usage,
+                result.num_turns,
+                result.session_id,
+            )
+            run.event("stage_completed", key=fkey, cost_usd=result.cost_usd, followup=True)
+        resolved = result is not None and not any(
+            _justified_severity(f["severity"], f.get("reason"))[1] for f in output["findings"]
+        )
+        run.event("review_reason_followup", key=key, dim=dim, count=len(flagged), resolved=resolved)
+        return output
+
     async def _stage(
         self,
         key: str,
@@ -2379,12 +2557,26 @@ class Orchestrator:
             ]
         )
         found = dict(zip(_REVIEW_DIMS, outs, strict=True))
+        # One follow-up per security/correctness dimension before its majors are capped.
+        followed = await asyncio.gather(
+            *(
+                self._reason_followup(run, f"{prefix}review-dim:{d}", d)
+                for d in _REASON_FOLLOWUP_DIMS
+            )
+        )
+        found.update(zip(_REASON_FOLLOWUP_DIMS, followed, strict=True))
+        # Tag each finding with its source dimension so the merge can carry it through.
+        found = {
+            dim: {**out, "findings": [{**f, "dimension": dim} for f in out["findings"]]}
+            for dim, out in found.items()
+        }
 
         def merge_prompt() -> str:
             return (
                 f"Task: {task}\n\nDimension review findings (JSON):\n{_dumps(found)}\n\n"
                 "Verify each finding against the code, drop false positives, merge "
-                "duplicates; keep any finding you cannot disprove, with its `reason`. "
+                "duplicates; keep any finding you cannot disprove, with its `reason` and "
+                "the `dimension` it came from. "
                 f"Re-check each severity: {_SEVERITY_FLOOR} {_FINDING_REASON_RULE} "
                 f"Give the overall verdict.\n\n{shared()}"
             )
@@ -2851,6 +3043,9 @@ class Orchestrator:
             lines.append(line)
         elif no_reason:
             lines.append(f"Review: {no_reason} majors capped (no reason)")
+        if no_reason:
+            lines.append("Capped findings:")
+            lines += capped_finding_lines(state)
         lines += [
             f"est. cost: {costs}",
             f"total est. cost: ${state['totals']['cost_usd']:.2f} "
