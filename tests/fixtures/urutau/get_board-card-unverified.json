@@ -6,24 +6,36 @@
   "lastRun": {
     "status": "done",
     "unverifiedOpen": {
-      "external": 1,
+      "external": 2,
       "normative": 0,
       "untested": 0
     },
-    "runId": "c-20261008-0001"
-  },
-  "unverified": [
-    {
-      "id": "U1",
-      "kind": "external",
-      "text": "ext item",
-      "status": "open"
-    },
-    {
-      "id": "U2",
-      "kind": "normative",
-      "text": "norm item",
-      "status": "resolved"
-    }
-  ]
+    "runId": "c-20261008-0001",
+    "unverifiedItems": [
+      {
+        "id": "U1",
+        "kind": "external",
+        "text": "ext item",
+        "status": "open"
+      },
+      {
+        "id": "U2",
+        "kind": "untested",
+        "text": "untested item",
+        "status": "resolved"
+      },
+      {
+        "id": "U3",
+        "kind": "normative",
+        "text": "norm item",
+        "status": "accepted"
+      },
+      {
+        "id": "U4",
+        "kind": "external",
+        "text": "the vendor changelog says the 2.x client retries 429 replies with backoff; the vendor changelog says the 2.x client retries 429 replies with backoff; the vendor changelog says the 2.x client retries 429 replies with backoff; the vendor changelog says the 2.x client retries 429 r…",
+        "status": "open"
+      }
+    ]
+  }
 }

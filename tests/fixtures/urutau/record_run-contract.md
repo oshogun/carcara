@@ -122,9 +122,18 @@ measured from the moment the run entered its waiting status, is shown red; sendi
 status again does not restart that time, a different waiting status does. Costs, fix rounds, files, areas and merge
 SHAs are stored for reports and shown nowhere on the board.
 
-**Assumed by carcara, not yet in §18** (issue #46): before a new run carries the previous run's
-open unverified items, carcara reads the card's items from `get_board` and drops those a person
-resolved. It expects `card.unverified` (or, failing that, `card.lastRun.unverifiedItems`) as a list
-of `{id, kind, text, status | resolved}`, where an item is resolved when `resolved` is `true` or
-`status` is `resolved`, `closed` or `done` (see `get_board-card-unverified.json`). A card without
-either list is treated as "unchecked": carcara carries the items unchanged and says so in its report.
+**Unverified items on the card** (issue #46; urutau d2dac6c, `server/mcp/contract.ts`
+`CardUnverifiedItemJson`): `get_board` called with `includeUnverifiedItems: true` adds
+`card.lastRun.unverifiedItems`, a list of `{id, kind, text, status}` with `status` one of `open`,
+`resolved` (a probe closed it) or `accepted` (a person accepted it); withdrawn items are left out
+(see `get_board-card-unverified.json`). Only carcara's carry check sends the flag, on the first call
+and every paged call; estimate reads do not, so they stay small. Before a new run carries the
+previous run's open unverified items, carcara drops those that are `resolved` or `accepted` on the
+card. Urutau cleans and caps `id` and `text` for display (`cleanText`, `DISPLAY_CAPS`: a cut text
+ends in `…`), so carcara matches by id first (the uid it sent, then the item's id). Only an item with
+no id on the card falls back to its text: a closed card item of the same kind matches when the texts
+are equal after normalising, or when the card text, without its `…`, is a prefix of the item's text
+of at least 24 characters that no other carried item of that kind shares. Anything else is carried,
+since re-sending is the safe failure. A card without the list (an older Urutau that ignores the
+flag) is "unchecked", and an unreachable Urutau is "unreachable": carcara carries the items
+unchanged and says so in its report.

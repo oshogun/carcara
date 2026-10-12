@@ -380,37 +380,71 @@ def test_get_estimate_absent_card_is_none_and_bounded():
     assert [a["offset"] for _, a in log[1:3]] == [1, 2]
 
 
-def test_get_card_unverified_reads_open_and_resolved_items():
+def test_get_card_unverified_reads_open_resolved_and_accepted_items():
     card = sample("get_board-card-unverified.json")
-    card["unverified"].append({"kind": "external", "text": "no id"})  # malformed: skipped
-    card["unverified"].append("junk")
+    items = card["lastRun"]["unverifiedItems"]
+    cut = items[3]["text"]
+    items.append({"kind": "external", "text": "no id"})  # malformed: skipped
+    items.append({"id": "U9", "kind": "external", "text": None, "status": "open"})
+    items.append("junk")
     client, log, _, _ = make_client([ok(board(bucket("doing", [card])))])
     assert run(client.get_card_unverified()) == [
-        {"id": "U1", "kind": "external", "text": "ext item", "resolved": False},
-        {"id": "U2", "kind": "normative", "text": "norm item", "resolved": True},
+        {"id": "U1", "kind": "external", "text": "ext item", "status": "open", "resolved": False},
+        {
+            "id": "U2",
+            "kind": "untested",
+            "text": "untested item",
+            "status": "resolved",
+            "resolved": True,
+        },
+        {
+            "id": "U3",
+            "kind": "normative",
+            "text": "norm item",
+            "status": "accepted",
+            "resolved": True,
+        },
+        {"id": "U4", "kind": "external", "text": cut, "status": "open", "resolved": False},
     ]
-    assert len(log) == 1
+    assert log == [
+        (
+            "get_board",
+            {"repo": "acme/widgets", "includeClosed": True, "includeUnverifiedItems": True},
+        )
+    ]
 
 
-def test_get_card_unverified_last_run_form():
+def test_get_card_unverified_unknown_status_counts_as_open():
     card = {**sample("get_board-card.json")}
     card["lastRun"] = {
         **card["lastRun"],
         "unverifiedItems": [
-            {"id": "U1", "kind": "external", "text": "a", "resolved": True},
-            {"id": "U2", "kind": "untested", "text": "b", "status": "closed"},
-            {"id": "U3", "kind": "untested", "text": "c", "status": "open"},
+            {"id": "U1", "kind": "external", "text": "a", "status": "closed"},
+            {"id": "U2", "kind": "untested", "text": "b", "status": "done", "resolved": True},
+            {"id": "U3", "kind": "untested", "text": "c"},
         ],
     }
     client, _, _, _ = make_client([ok(board(bucket("doing", [card])))])
     items = run(client.get_card_unverified())
-    assert [(i["id"], i["resolved"]) for i in items] == [("U1", True), ("U2", True), ("U3", False)]
+    assert [(i["id"], i["resolved"]) for i in items] == [
+        ("U1", False),
+        ("U2", False),
+        ("U3", False),
+    ]
 
 
 def test_get_card_unverified_none_without_card_or_list():
     client, _, _, _ = make_client([ok(board(bucket("doing", [])))])
     assert run(client.get_card_unverified()) is None
+    # An older Urutau ignores includeUnverifiedItems: the card has no list.
     client, _, _, _ = make_client([ok(board(bucket("doing", [sample("get_board-card.json")])))])
+    assert run(client.get_card_unverified()) is None
+    card = {**sample("get_board-card.json"), "lastRun": None}
+    client, _, _, _ = make_client([ok(board(bucket("doing", [card])))])
+    assert run(client.get_card_unverified()) is None
+    # The guessed top-level list is not read.
+    card = {**sample("get_board-card.json"), "unverified": [{"id": "U1", "kind": "x", "text": "t"}]}
+    client, _, _, _ = make_client([ok(board(bucket("doing", [card])))])
     assert run(client.get_card_unverified()) is None
 
 
@@ -420,8 +454,10 @@ def test_get_card_unverified_pages_buckets():
     first = board(bucket("todo", [other], more=True))
     second = board(bucket("todo", [card], offset=1))
     client, log, _, _ = make_client([ok(first), ok(second)])
-    assert [i["id"] for i in run(client.get_card_unverified())] == ["U1", "U2"]
+    assert [i["id"] for i in run(client.get_card_unverified())] == ["U1", "U2", "U3", "U4"]
     assert len(log) == 2
+    assert all(args["includeUnverifiedItems"] is True for _, args in log)
+    assert log[1][1]["buckets"] == ["todo"] and log[1][1]["offset"] == 1
     assert_offset_has_one_bucket(log)
 
 
@@ -432,9 +468,27 @@ def test_get_estimate_shares_card_read_once():
     assert run(client.get_card_unverified()) is not None
     assert run(client.get_estimate()) == {"size": "M", "confidence": None}
     assert len(log) == 1
-    # The kept read is used once: a later call reads the board again.
+    # The kept read is used once: a later call reads the board again, without the flag.
     assert run(client.get_estimate()) is None
     assert len(log) == 2
+    assert "includeUnverifiedItems" not in log[1][1]
+
+
+def test_unflagged_kept_read_does_not_serve_the_carry_check():
+    card = sample("get_board-card-unverified.json")
+    plain = {
+        **card,
+        "lastRun": {k: v for k, v in card["lastRun"].items() if k != "unverifiedItems"},
+    }
+    script = [ok(board(bucket("doing", [plain]))), ok(board(bucket("doing", [card])))]
+    client, log, _, _ = make_client(script[1:])
+    client._card_cache = (plain, False)  # as if an estimate read had been kept
+    assert len(run(client.get_card_unverified())) == 4
+    assert [args.get("includeUnverifiedItems") for _, args in log] == [True]
+    client, log, _, _ = make_client(script)
+    assert run(client.get_estimate()) is None
+    assert len(run(client.get_card_unverified())) == 4
+    assert [args.get("includeUnverifiedItems") for _, args in log] == [None, True]
 
 
 def test_get_card_unverified_error_raises():

@@ -32,6 +32,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
@@ -862,6 +863,23 @@ def _norm_text(text: str) -> str:
     return " ".join(text.lower().split())
 
 
+# Shortest card text prefix that may match a carried item's text (see
+# _drop_resolved_on_card).
+_CARD_PREFIX_MIN = 24
+# Code point categories Urutau's cleanText removes from display text.
+_INVISIBLE = ("Cc", "Cf", "Co", "Cn", "Cs", "Zl", "Zp")
+
+
+def _card_text(text: str) -> str:
+    """``text`` normalised as Urutau shows it: invisible code points removed, a
+    trailing ellipsis from its display cap stripped, then ``_norm_text``."""
+    text = "".join(ch for ch in text if ch.isspace() or unicodedata.category(ch) not in _INVISIBLE)
+    text = text.rstrip()
+    for mark in ("\u2026", "..."):
+        text = text.removesuffix(mark)
+    return _norm_text(text)
+
+
 def _implement_paths(run: Run) -> list[str]:
     """Unique changed paths across all implement stages, in order."""
     paths: list[str] = []
@@ -1268,17 +1286,19 @@ class Orchestrator:
         """Copy the open unverified items of the previous run on the same issue
         and repo into this new run, so its record_run keeps them on the card.
 
-        Resolved items and probe results are not carried, nor items a person
-        resolved on the Urutau card since (read once here; if Urutau cannot be
-        read, the items are carried as-is and the report says so).
+        Resolved items and probe results are not carried, nor items closed on
+        the Urutau card since: resolved by a probe or accepted by a person (read
+        once here; if Urutau cannot be read, or returns no item list, the items
+        are carried as-is and the report says so).
 
         Carrying chains run to run through each run's own state: a run that
         failed before review keeps its carried copies and passes them on, and a
         run that found a previous run but carried nothing still records an empty
         inventory, so the next run stops at it instead of reaching further back.
         ``carried_from`` names the run an item was taken from, not the run it
-        started in. Every hop rechecks the card, so an item resolved at any
-        point in the chain is dropped for good.
+        started in. Every hop rechecks the card, so an item resolved or accepted
+        at any point in the chain is dropped for good, and a run that dropped
+        every item ends the chain.
         """
         state = run.state
         issue = state.get("issue")
@@ -1322,7 +1342,17 @@ class Orchestrator:
     async def _drop_resolved_on_card(
         self, run: Run, prev: Run, items: list[dict[str, Any]]
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """(items to carry, items dropped as resolved on the card); records ``carry_check``."""
+        """(items to carry, items dropped as closed on the card); records ``carry_check``.
+
+        Items match card items by id: the uid the previous run sent, then the
+        item's own id. An item with no id on the card falls back to its text,
+        which Urutau cleans and caps for display (cleanText, DISPLAY_CAPS: cut
+        with a trailing ellipsis), so a closed card item of the same kind matches
+        when the texts are equal after normalising, or when the card text is a
+        prefix of the item's text that is at least ``_CARD_PREFIX_MIN`` long and
+        that no other carried item of that kind shares. Otherwise the item is
+        carried: re-sending is the safe failure, dropping the wrong item is not.
+        """
         assert self.urutau is not None
         urutau = run.state.setdefault("urutau", {})
         try:
@@ -1337,19 +1367,44 @@ class Orchestrator:
         by_id: dict[str, list[dict[str, Any]]] = {}
         for c in card_items:
             by_id.setdefault(c["id"], []).append(c)
-        resolved_text = {(c["kind"], _norm_text(c["text"])) for c in card_items if c["resolved"]}
+        closed = [(c, _card_text(c["text"])) for c in card_items if c["resolved"]]
+        local = [(i["kind"], _card_text(i["text"])) for i in items]
         sent = (prev.state.get("urutau") or {}).get("sent_items") or {}
         keep: list[dict[str, Any]] = []
         dropped: list[dict[str, Any]] = []
-        for item in items:
+        counts: dict[str, int] = {}
+        for item, (kind, text) in zip(items, local, strict=True):
             uids = [k for k, v in sent.items() if (v or {}).get("local_id") == item["id"]]
             matched = [c for uid in [*uids, item["id"]] for c in by_id.get(uid, [])]
             if matched:
-                resolved = any(c["resolved"] for c in matched)
+                hit = next((c for c in matched if c["resolved"]), None)
             else:
-                resolved = (item["kind"], _norm_text(item["text"])) in resolved_text
-            (dropped if resolved else keep).append(item)
-        urutau["carry_check"] = {"status": "ok", "dropped": len(dropped), "from": prev.id}
+                hit = next(
+                    (
+                        c
+                        for c, card in closed
+                        if c["kind"] == kind
+                        and (
+                            text == card
+                            or len(card) >= _CARD_PREFIX_MIN
+                            and text.startswith(card)
+                            and sum(k == kind and t.startswith(card) for k, t in local) == 1
+                        )
+                    ),
+                    None,
+                )
+            if hit is None:
+                keep.append(item)
+                continue
+            dropped.append(item)
+            status = "accepted" if hit.get("status") == "accepted" else "resolved"
+            counts[status] = counts.get(status, 0) + 1
+        urutau["carry_check"] = {
+            "status": "ok",
+            "dropped": len(dropped),
+            **counts,
+            "from": prev.id,
+        }
         return keep, dropped
 
     def _new_urutau_run(self, run: Run) -> None:
@@ -3256,7 +3311,13 @@ def _urutau_report_lines(state: dict[str, Any]) -> list[str]:
     lines.extend(f"carried from {src}: {n}" for src, n in carried.items())
     check = urutau.get("carry_check") or {}
     if check.get("status") == "ok" and check.get("dropped"):
-        lines.append(f"dropped {check['dropped']} item(s) resolved on Urutau")
+        accepted = int(check.get("accepted") or 0)
+        resolved = int(check.get("resolved", check["dropped"] - accepted))
+        lines.extend(
+            f"dropped {n} item(s) {how} on Urutau"
+            for n, how in ((resolved, "resolved"), (accepted, "accepted"))
+            if n
+        )
     elif check.get("status") == "unreachable":
         lines.append(
             "Urutau unreachable when carrying; carried unverified items as-is "
