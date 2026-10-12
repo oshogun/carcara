@@ -75,3 +75,38 @@ def test_prune_empty_project(tmp_path, capsys):
     assert main(["runs", "prune", "--keep", "1", "--cwd", str(tmp_path)]) == 0
     assert capsys.readouterr().out.strip() == "0 runs"
     assert not (tmp_path / ".carcara").exists()
+
+
+def _make_carry_runs(tmp_path):
+    store, ids = _make_runs(tmp_path, 2)
+    run = store.load(ids[0])
+    run.state.update(
+        issue=7,
+        urutau={"repo": "org/repo"},
+        unverified=[{"id": "U1", "kind": "claim", "text": "unchecked"}],
+    )
+    run.save()
+    return store, ids
+
+
+def test_prune_dry_run_shows_carry_source(tmp_path, capsys):
+    store, ids = _make_carry_runs(tmp_path)
+    argv = ["runs", "prune", "--keep", "0", "--dry-run", "--cwd", str(tmp_path)]
+    assert main(argv) == 0
+    out = capsys.readouterr().out
+    assert f"keep         {ids[0]}" in out
+    assert "carry source for #7" in out
+    assert f"would delete {ids[1]}" in out
+    assert store.list_runs() == ids
+
+
+def test_prune_json_carry_source_and_override(tmp_path, capsys):
+    _, ids = _make_carry_runs(tmp_path)
+    argv = ["runs", "prune", "--keep", "0", "--dry-run", "--json", "--cwd", str(tmp_path)]
+    assert main(argv) == 0
+    data = {d["run_id"]: d for d in json.loads(capsys.readouterr().out)}
+    assert (data[ids[0]]["action"], data[ids[0]]["reason"]) == ("keep", "carry source for #7")
+
+    assert main([*argv, "--include-carry-sources"]) == 0
+    data = {d["run_id"]: d for d in json.loads(capsys.readouterr().out)}
+    assert data[ids[0]]["action"] == "delete"

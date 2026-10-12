@@ -57,7 +57,7 @@ from carcara.project_config import (
     parse_project_config,
 )
 from carcara.roles import Role, get_role
-from carcara.runstore import Run, RunBusy, RunStore, _now
+from carcara.runstore import Run, RunBusy, RunStore, _now, open_unverified_items
 from carcara.schemas import (
     MAX_REFUTERS,
     MAX_SCOPE_AREAS,
@@ -1310,8 +1310,7 @@ class Orchestrator:
             return
         carried = [
             {"id": i["id"], "kind": i["kind"], "text": i["text"], "carried_from": prev.id}
-            for i in prev.state.get("unverified") or []
-            if isinstance(i, dict) and not i.get("resolved") and i.get("id") and i.get("text")
+            for i in open_unverified_items(prev.state)
         ]
         dropped: list[dict[str, Any]] = []
         if carried and self.urutau is not None:

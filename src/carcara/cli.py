@@ -231,7 +231,9 @@ def _add_runs_parser(sub: Any) -> None:
         help="delete old runs",
         description="Delete old run directories. Never touches the run holding the "
         "active lock, running or paused runs (awaiting_approval, needs_human, "
-        "budget_exceeded) or unreadable runs. With both --older-than and --keep, a run "
+        "budget_exceeded), unreadable runs or, unless --include-carry-sources, the "
+        "newest run on an issue whose open unverified items a later run would carry "
+        "forward. With both --older-than and --keep, a run "
         "is deleted only if it is outside the --keep window and older than --older-than.",
     )
     prune.add_argument(
@@ -247,6 +249,12 @@ def _add_runs_parser(sub: Any) -> None:
         default=None,
         metavar="N",
         help="keep the N newest runs (protected runs count toward N)",
+    )
+    prune.add_argument(
+        "--include-carry-sources",
+        action="store_true",
+        help="also prune the newest run on an issue whose open unverified items a "
+        "later run would carry forward",
     )
     prune.add_argument("--dry-run", action="store_true", help="show what would be deleted")
     prune.add_argument("--json", action="store_true", help="print machine-readable JSON")
@@ -1078,7 +1086,12 @@ def runs_main(ns: argparse.Namespace) -> int:
     if ns.older_than is None and ns.keep is None:
         _err("runs prune: give --older-than and/or --keep")
         return 2
-    decisions = RunStore(cwd).prune(keep=ns.keep, older_than=ns.older_than, dry_run=ns.dry_run)
+    decisions = RunStore(cwd).prune(
+        keep=ns.keep,
+        older_than=ns.older_than,
+        dry_run=ns.dry_run,
+        include_carry_sources=ns.include_carry_sources,
+    )
     failed = any(d.reason.startswith("error: ") for d in decisions)
     if ns.json:
         sys.stdout.write(json.dumps([d.to_dict() for d in decisions], indent=2) + "\n")

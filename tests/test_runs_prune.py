@@ -9,6 +9,7 @@ from carcara.runstore import (
     PruneDecision,
     RunStore,
     RunStoreError,
+    open_unverified_items,
     select_prunable,
 )
 
@@ -37,8 +38,15 @@ def _deleted(decisions):
     return [d.run_id for d in decisions if d.action == "delete"]
 
 
-def _select(entries, keep=None, older_than=None, active=None):
-    return select_prunable(entries, keep=keep, older_than=older_than, now=NOW, active_run_id=active)
+def _select(entries, keep=None, older_than=None, active=None, include_carry_sources=False):
+    return select_prunable(
+        entries,
+        keep=keep,
+        older_than=older_than,
+        now=NOW,
+        active_run_id=active,
+        include_carry_sources=include_carry_sources,
+    )
 
 
 # -- select_prunable ----------------------------------------------------------
@@ -128,14 +136,96 @@ def test_keep_zero_deletes_every_unprotected_run():
     assert _deleted(_select(entries, keep=0)) == ["a", "c"]
 
 
+# -- carry sources (#47) --------------------------------------------------------
+
+OPEN = [{"id": "U1", "kind": "claim", "text": "unchecked"}]
+CLOSED = [{"id": "U1", "kind": "claim", "text": "checked", "resolved": True}]
+
+
+def _issue_state(issue=7, repo="org/repo", unverified=OPEN, **extra):
+    return _state(issue=issue, urutau={"repo": repo}, unverified=unverified, **extra)
+
+
+def test_open_unverified_items_filters_closed_and_incomplete():
+    state = {"unverified": [*OPEN, *CLOSED, {"id": "U2"}, "junk", {"id": "U3", "text": "t"}]}
+    assert [i["id"] for i in open_unverified_items(state)] == ["U1", "U3"]
+    assert open_unverified_items(None) == []
+    assert open_unverified_items({}) == []
+
+
+def test_carry_source_kept_and_no_issue_run_deleted():
+    entries = [("a-src", _issue_state()), ("b-none", _state())]
+    decisions = _by_id(_select(entries, older_than=timedelta(days=30)))
+    assert decisions["a-src"].action == "keep"
+    assert decisions["a-src"].reason == "carry source for #7"
+    assert decisions["b-none"].action == "delete"
+
+
+def test_only_newest_carry_source_per_issue_kept():
+    entries = [("a-old", _issue_state()), ("b-new", _issue_state())]
+    decisions = _by_id(_select(entries, older_than=timedelta(days=30)))
+    assert decisions["a-old"].action == "delete"
+    assert decisions["b-new"].reason == "carry source for #7"
+
+
+@pytest.mark.parametrize("unverified", [CLOSED, []])
+def test_all_closed_run_not_a_carry_source(unverified):
+    entries = [("a", _issue_state(unverified=unverified))]
+    assert _deleted(_select(entries, older_than=timedelta(days=30))) == ["a"]
+
+
+def test_include_carry_sources_prunes_them():
+    entries = [("a-src", _issue_state())]
+    decisions = _select(entries, older_than=timedelta(days=30), include_carry_sources=True)
+    assert _deleted(decisions) == ["a-src"]
+
+
+def test_carry_sources_grouped_per_repo_case_insensitive():
+    entries = [
+        ("a-other", _issue_state(repo="org/other")),
+        ("b-repo", _issue_state(repo="Org/Repo")),
+        ("c-repo", _issue_state(repo="org/repo")),
+    ]
+    decisions = _by_id(_select(entries, older_than=timedelta(days=30)))
+    assert decisions["a-other"].reason == "carry source for #7"
+    assert decisions["b-repo"].action == "delete"
+    assert decisions["c-repo"].reason == "carry source for #7"
+
+
+def test_run_without_inventory_is_not_a_carry_source():
+    no_inventory = _state(issue=7, urutau={"repo": "org/repo"})
+    entries = [("a-src", _issue_state()), ("b-legacy", no_inventory)]
+    decisions = _by_id(_select(entries, older_than=timedelta(days=30)))
+    assert decisions["a-src"].reason == "carry source for #7"
+    assert decisions["b-legacy"].action == "delete"
+
+
+def test_active_run_skipped_when_finding_carry_source():
+    entries = [("a-src", _issue_state()), ("b-active", _issue_state())]
+    decisions = _by_id(_select(entries, older_than=timedelta(days=30), active="b-active"))
+    assert decisions["a-src"].reason == "carry source for #7"
+    assert decisions["b-active"].reason == "active lock"
+
+
+def test_newest_all_closed_run_ends_the_chain():
+    entries = [("a-open", _issue_state()), ("b-closed", _issue_state(unverified=CLOSED))]
+    assert _deleted(_select(entries, older_than=timedelta(days=30))) == ["a-open", "b-closed"]
+
+
+def test_within_keep_reason_wins_over_carry_source():
+    entries = [("a-src", _issue_state())]
+    assert _select(entries, keep=1)[0].reason == "within --keep"
+
+
 # -- RunStore.prune / delete_run -----------------------------------------------
 
 
-def _make_run(store, run_id, status="done", days_ago=40):
+def _make_run(store, run_id, status="done", days_ago=40, **extra):
     run = store.create("task", "balanced", "abc", run_id=run_id)
     run.set_status(status)
     state = json.loads(run.state_path.read_text(encoding="utf-8"))
     state["updated_at"] = state["created_at"] = _ts(days_ago)
+    state.update(extra)
     run.state_path.write_text(json.dumps(state), encoding="utf-8")
     return run
 
@@ -238,3 +328,23 @@ def test_delete_run_does_not_follow_symlink(tmp_path, symlink):
     with pytest.raises(RunStoreError):
         store.delete_run("link")
     assert (outside / "keep.txt").exists()
+
+
+def test_prune_keeps_carry_source_on_disk(tmp_path):
+    store = RunStore(tmp_path)
+    src, plain = "20260101-000001-abcd", "20260101-000002-abcd"
+    _make_run(store, src, issue=7, urutau={"repo": "org/repo"}, unverified=OPEN)
+    _make_run(store, plain)
+
+    decisions = store.prune(keep=None, older_than=timedelta(days=30), dry_run=False, now=NOW)
+    assert _by_id(decisions)[src].reason == "carry source for #7"
+    assert store.list_runs() == [src]
+
+    store.prune(
+        keep=None,
+        older_than=timedelta(days=30),
+        dry_run=False,
+        now=NOW,
+        include_carry_sources=True,
+    )
+    assert store.list_runs() == []

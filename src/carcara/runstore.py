@@ -195,6 +195,53 @@ def _run_age_ts(run_id: str, state: dict[str, Any]) -> datetime | None:
     return _run_id_ts(run_id)
 
 
+def open_unverified_items(state: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """The unverified items of a run state that are still open (not resolved)
+    and carryable (they have an id and text)."""
+    if not isinstance(state, dict):
+        return []
+    items = state.get("unverified")
+    if not isinstance(items, list):
+        return []
+    return [
+        i
+        for i in items
+        if isinstance(i, dict) and not i.get("resolved") and i.get("id") and i.get("text")
+    ]
+
+
+def _carry_key(state: dict[str, Any]) -> tuple[str, str | None] | None:
+    """The (issue, repo) a run carries unverified items along, as matched by
+    ``RunStore.find_previous_issue_run``; None for a run with no issue."""
+    issue = state.get("issue")
+    if not issue:
+        return None
+    urutau = state.get("urutau") or {}
+    repo = urutau.get("repo") if isinstance(urutau, dict) else None
+    return (str(issue), (repo or "").lower() or None)
+
+
+def carry_sources(
+    entries: list[tuple[str, dict[str, Any] | None]], *, active_run_id: str | None
+) -> dict[str, str]:
+    """Map run id to issue for the runs a later run on their issue would carry
+    open unverified items from: per (issue, repo), the newest run with an
+    inventory (never the active run), if it has open items. ``entries`` are
+    oldest first."""
+    decided: set[tuple[str, str | None]] = set()
+    sources: dict[str, str] = {}
+    for run_id, state in reversed(entries):
+        if run_id == active_run_id or not isinstance(state, dict) or "unverified" not in state:
+            continue
+        key = _carry_key(state)
+        if key is None or key in decided:
+            continue
+        decided.add(key)
+        if open_unverified_items(state):
+            sources[run_id] = key[0]
+    return sources
+
+
 def select_prunable(
     entries: list[tuple[str, dict[str, Any] | None]],
     *,
@@ -202,16 +249,20 @@ def select_prunable(
     older_than: timedelta | None,
     now: datetime,
     active_run_id: str | None,
+    include_carry_sources: bool = False,
 ) -> list[PruneDecision]:
     """Decide which runs to delete. ``entries`` are ``(run_id, state or None)``
     oldest first. Unreadable, locked, running and paused runs are always kept;
     ``keep`` keeps the newest N runs (protected ones count); ``older_than``
-    keeps runs touched more recently. With both, a run must fail both to go."""
+    keeps runs touched more recently. With both, a run must fail both to go.
+    The newest run per issue with open unverified items (see ``carry_sources``)
+    is kept too, unless ``include_carry_sources``."""
     if keep is None and older_than is None:
         raise ValueError("give keep and/or older_than")
     if now.tzinfo is None:
         now = now.astimezone()
     keep_from = len(entries) - keep if keep is not None else len(entries)
+    sources = {} if include_carry_sources else carry_sources(entries, active_run_id=active_run_id)
     decisions: list[PruneDecision] = []
     for index, (run_id, state) in enumerate(entries):
         if not isinstance(state, dict):
@@ -233,6 +284,8 @@ def select_prunable(
             reason = "unknown age"
         elif older_than is not None and age > now - older_than:
             reason = "too recent"
+        elif run_id in sources:
+            reason = f"carry source for #{sources[run_id]}"
         else:
             action = "delete"
             reason = "older than --older-than" if older_than is not None else "beyond --keep"
@@ -616,6 +669,7 @@ class RunStore:
         older_than: timedelta | None,
         dry_run: bool,
         now: datetime | None = None,
+        include_carry_sources: bool = False,
     ) -> list[PruneDecision]:
         """Select runs with ``select_prunable`` and delete them unless ``dry_run``."""
         entries: list[tuple[str, dict[str, Any] | None]] = []
@@ -631,6 +685,7 @@ class RunStore:
             older_than=older_than,
             now=now or datetime.now().astimezone(),
             active_run_id=holder["run_id"] if holder is not None else None,
+            include_carry_sources=include_carry_sources,
         )
         if dry_run:
             return decisions
