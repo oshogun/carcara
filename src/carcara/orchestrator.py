@@ -84,6 +84,7 @@ from carcara.urutau import (
     filter_files,
     urutau_status,
 )
+from carcara.usage import read_events, run_usage, usage_line
 
 EXIT_CODES = {
     "done": 0,
@@ -2088,6 +2089,18 @@ class Orchestrator:
         if stage == "implement" and output.get("blocked"):
             # Not memoised: a resume re-runs the stage after the human intervenes.
             run.state["blocked"] = {"key": key, "notes": output.get("notes", "")}
+            # Its cost is already in the totals; keep its tokens for the usage report.
+            run.state.setdefault("blocked_attempts", []).append(
+                {
+                    "key": key,
+                    "stage": stage,
+                    "role": role_name,
+                    "model": request.model,
+                    "cost_usd": result.cost_usd,
+                    "usage": result.usage,
+                    "num_turns": result.num_turns,
+                }
+            )
             run.save()
             run.event("stage_blocked", key=key, output=output)
             raise _Stop("needs_human", f"implementer blocked at {key}: {output.get('notes', '')}")
@@ -3122,6 +3135,7 @@ class Orchestrator:
             rel_dir = run.dir
         lines = [
             f"carcara run {run.id}: {state['status']} (size {state.get('size') or '?'})",
+            usage_line(run_usage(state, read_events(run.dir))),
             f"files changed: {', '.join(files) if files else 'none'}",
             f"tests: {test_line}",
             f"review: {review_line}",

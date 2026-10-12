@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import types
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -144,7 +145,10 @@ def test_small_sequence(repo):
     assert backend.requests[0].max_turns == 3
     report = (orch.run_state.dir / "report.md").read_text()
     assert report == out.report_text
-    assert len(report.splitlines()) <= 10
+    assert len(report.splitlines()) <= 11
+    lines = report.splitlines()
+    assert lines[1] == "usage: 0 tokens (0 output), active 0s"
+    assert lines.index(lines[1]) < next(i for i, x in enumerate(lines) if x.startswith("est. cost"))
     assert "a.py" in report and "passed" in report
     assert (repo / ".carcara" / ".gitignore").read_text() == "*\n"
     events = (orch.run_state.dir / "events.jsonl").read_text().splitlines()
@@ -326,6 +330,8 @@ def test_triage_only_runs_single_stage(repo):
     state = orch.run_state.state
     assert (state["triage_range"], state["uncertainty_kind"]) == ("S", "none")
     assert state["size"] == "S" and state["triage_only"] is True
+    assert out.report_text.splitlines()[1].startswith("usage: ")
+    assert " tokens (" in out.report_text and ", active " in out.report_text
 
 
 def _porcelain(repo):
@@ -484,6 +490,52 @@ def test_blocked_implement_needs_human_and_is_rerun_on_resume(repo):
     orch2, backend2, _ = make(repo, {"implement": [impl()], "test": [TEST_OK]})
     assert asyncio.run(orch2.resume(out.run_id)).status == "done"
     assert len(backend2.requests) == 2
+
+
+def test_blocked_implement_tokens_and_active_time_survive_resume(repo):
+    from carcara.usage import read_events, run_usage
+
+    blocked = StageResult(
+        structured=impl(blocked=True),
+        text=None,
+        cost_usd=0.1,
+        num_turns=1,
+        usage={"input_tokens": 5, "cache_read_input_tokens": 100, "output_tokens": 7},
+    )
+    orch, _, _ = make(repo, {"implement": [blocked]}, size="S")
+    out = go(orch)
+    assert out.status == "needs_human"
+    state = orch.run_state.state
+    assert run_usage(state, [])["tokens"] == 112
+    events = read_events(orch.run_state.dir)
+    assert [e["event"] for e in events if e.get("key") == "implement"] == [
+        "stage_started",
+        "stage_blocked",
+    ]
+    # The blocked attempt's interval is closed: the human pause is not counted live.
+    later = datetime.now().astimezone() + timedelta(hours=1)
+    assert run_usage(state, events, later)["active_seconds"] < 60
+    orch2, _, _ = make(
+        repo,
+        {
+            "implement": [
+                StageResult(
+                    structured=impl(),
+                    text=None,
+                    cost_usd=0.1,
+                    num_turns=1,
+                    usage={"input_tokens": 1, "output_tokens": 2},
+                )
+            ],
+            "test": [TEST_OK],
+        },
+    )
+    assert asyncio.run(orch2.resume(out.run_id)).status == "done"
+    state = orch2.run_state.state
+    usage = run_usage(state, read_events(orch2.run_state.dir))
+    assert usage["tokens"] == 115 and usage["output_tokens"] == 9
+    assert usage["est_cost_usd"] == pytest.approx(0.2)
+    assert usage["active_seconds"] < 60
 
 
 def test_budget_remaining_and_cost_totals(repo):

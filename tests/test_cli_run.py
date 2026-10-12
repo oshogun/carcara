@@ -647,6 +647,12 @@ STATUS_KEYS = {
     "resume_cmd",
     "active",
     "cost_usd",
+    "tokens",
+    "output_tokens",
+    "input_tokens",
+    "cache_creation_tokens",
+    "cache_read_tokens",
+    "active_seconds",
     "failed_attempts",
     "uncounted_stages",
     "gate",
@@ -1210,3 +1216,87 @@ def test_dry_run_issue_shows_urutau_state(repo, monkeypatch, no_token, capsys):
     monkeypatch.setattr(cli, "_gh_issue", lambda *a: pytest.fail("gh called in dry-run"))
     assert run(repo, "--dry-run", "--issue", "5", "--repo", "octo/repo") == 0
     assert "issue #5 (octo/repo); Urutau reporting: off" in capsys.readouterr().out
+
+
+def _usage_run(repo, status_value="done", report=None, usage=None, events=()):
+    run = RunStore(repo).create("task", "balanced", "abc", run_id="20260101-000000-uuuu")
+    run.state["status"] = status_value
+    run.state["stages"] = [
+        {
+            "key": "implement",
+            "stage": "implement",
+            "role": "implementer",
+            "model": "m",
+            "output": {},
+            "cost_usd": 0.5,
+            "usage": usage,
+            "num_turns": 1,
+            "session_id": None,
+        }
+    ]
+    run.state["totals"]["cost_usd"] = 0.5
+    run.save()
+    for ts, kind in events:
+        line = {"ts": ts, "event": kind, "key": "implement"}
+        with (run.dir / "events.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line) + "\n")
+    if report is not None:
+        run.write_report(report)
+    return run
+
+
+def test_status_json_usage_fields(repo, capsys):
+    usage = {
+        "input_tokens": 10,
+        "cache_creation_input_tokens": 200,
+        "cache_read_input_tokens": 5000,
+        "output_tokens": 30,
+    }
+    events = [
+        ("2026-01-01T00:00:00+0000", "stage_started"),
+        ("2026-01-01T00:01:30+0000", "stage_completed"),
+    ]
+    _usage_run(repo, usage=usage, events=events)
+    data = _status_json(repo, capsys)
+    assert set(data) == STATUS_KEYS
+    assert data["tokens"] == 5240 and data["output_tokens"] == 30
+    assert data["input_tokens"] == 10 and data["cache_creation_tokens"] == 200
+    assert data["cache_read_tokens"] == 5000 and data["active_seconds"] == 90
+    assert data["cost_usd"] == pytest.approx(0.5)
+
+
+def test_status_json_old_state_zero_usage(repo, capsys):
+    _usage_run(repo, usage=None)  # no usage dict, no events.jsonl
+    data = _status_json(repo, capsys)
+    assert data["tokens"] == data["output_tokens"] == data["active_seconds"] == 0
+    assert data["cache_read_tokens"] == 0
+
+
+def test_status_text_old_report_gets_usage_line(repo, capsys):
+    usage = {"input_tokens": 1000, "output_tokens": 500}
+    _usage_run(repo, usage=usage, report="carcara run x: done (size S)\nfiles changed: a.py\n")
+    capsys.readouterr()
+    assert status(repo) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[:3] == [
+        "carcara run x: done (size S)",
+        "usage: 1.5k tokens (500 output), active 0s",
+        "files changed: a.py",
+    ]
+
+
+def test_status_text_report_with_usage_line_unchanged(repo, capsys):
+    report = "carcara run x: done (size S)\nusage: 9 tokens (1 output), active 1s\n"
+    _usage_run(repo, usage={"output_tokens": 5}, report=report)
+    capsys.readouterr()
+    assert status(repo) == 0
+    assert capsys.readouterr().out.startswith(report)
+
+
+def test_status_text_running_fallback_has_usage(repo, capsys):
+    _usage_run(repo, status_value="running", usage={"output_tokens": 7}, report="stale\n")
+    capsys.readouterr()
+    assert status(repo) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "carcara run 20260101-000000-uuuu: running (size ?)"
+    assert lines[1] == "usage: 7 tokens (7 output), active 0s"

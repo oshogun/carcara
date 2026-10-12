@@ -271,6 +271,8 @@ SKILL_TASK = "carcara run --allow-dirty - <<'CARCARA_TASK'\nfix the --yes bug\nC
         "carcara run --resume 20260102-000000-bbbb",
         'carcara run --size M --plan-only -p quality - <<"EOF"\nx\nEOF',
         "carcara run --issue 5 --triage-only",
+        "carcara usage",
+        "carcara usage --json --since 30d --until 2026-10-01 --cost",
     ],
 )
 def test_bash_safe_carcara_forms_allowed(project, command):
@@ -383,6 +385,9 @@ def test_bash_obfuscated_sensitive_flags_ask(project, command):
         "carcara status --json > out.txt",
         "carcara diff a b",
         "carcara status ../x",
+        "carcara usage x",
+        "carcara usage --since ../x",
+        "carcara usage --cwd /tmp",
         "carcara install --force",
         "FOO=1 carcara status",
         "carcara status 'unterminated",

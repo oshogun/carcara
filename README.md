@@ -92,10 +92,12 @@ carcara profiles                           # list profiles
 carcara run "<task>"                       # run the pipeline headlessly (see below)
 carcara status [RUN_ID] [--json|--plan]    # show a run (default: active, else latest)
 carcara diff [RUN_ID] [--stat]             # a run's changes since its base (secrets excluded)
+carcara usage [--since WHEN] [--json]      # tokens and active time across runs
 carcara routing on|off|status              # Claude Code routing for this project
 ```
 
-`install`, `uninstall`, `profiles`, `run`, `status`, `diff`, `routing` and `hook` as the
+`install`, `uninstall`, `profiles`, `run`, `status`, `diff`, `runs`, `usage`, `routing` and
+`hook` as the
 first argument are subcommands; to
 target a directory with one of those names use `carcara -- <dir>` or
 `carcara install <dir>`.
@@ -316,6 +318,40 @@ for machine-readable output, `--plan` for the stored plan); `carcara diff
 [RUN_ID] [--stat]` shows the working tree's changes since the run's base,
 excluding secrets and `.carcara/`. Both default to the active run, else the
 latest one.
+
+**Usage: tokens and active time.** On a Claude subscription dollars are not the
+useful measure, so each report's second line is
+`usage: 1.25M tokens (45.6k output), active 12m34s`:
+
+- *tokens* = input + cache creation + cache reads + output, summed over every
+  stage and every failed attempt (output tokens are also shown on their own);
+- *active time* = the time at least one stage was running, from the
+  `stage_started` → `stage_completed`/`stage_error` events in `events.jsonl`.
+  Parallel stages count once, and approval waits and paused time are excluded.
+
+`carcara status` shows the same line (live for a running run, and added to
+reports written by older versions), and `carcara status --json` adds `tokens`,
+`output_tokens`, `input_tokens`, `cache_creation_tokens`, `cache_read_tokens`
+and `active_seconds` next to the existing `cost_usd`. The `est. cost` lines
+stay further down the report: they are API-price estimates, not subscription
+billing.
+
+`carcara usage` summarizes every run in `.carcara/runs`: totals and outcomes,
+then per size and mode (plain, ultra, triage) the median and range of tokens
+and active time over finished runs (what an S, M or L run typically takes),
+then tokens per role and model.
+
+```bash
+carcara usage                       # all runs
+carcara usage --since 30d           # runs created in the last 30 days
+carcara usage --since 2026-09-01 --until 2026-10-01
+carcara usage --cost                # also show dollar estimates
+carcara usage --json                # machine-readable (always includes est_cost_usd)
+```
+
+`--since` (inclusive) and `--until` (exclusive) take a date (`YYYY-MM-DD`,
+local midnight) or an age (`12h`, `30d`, `2w`) and filter on each run's
+creation time.
 
 The budget is checked from the estimated stage costs the SDK reports. A stage
 attempt that errors out but still returns SDK usage counts toward the total and

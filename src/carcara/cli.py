@@ -13,7 +13,7 @@ import signal
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from carcara import __version__
@@ -28,6 +28,7 @@ SUBCOMMANDS = (
     "profiles",
     "hook",
     "routing",
+    "usage",
 )
 SIZES = ("S", "M", "L")
 DEFAULT_PROFILE = "balanced"
@@ -58,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_status_parser(sub)
     _add_diff_parser(sub)
     _add_runs_parser(sub)
+    _add_usage_parser(sub)
     _add_hook_parsers(sub)
     return parser
 
@@ -261,6 +263,37 @@ def _add_runs_parser(sub: Any) -> None:
     prune.add_argument("--cwd", default=".", metavar="DIR", help="project directory (default .)")
 
 
+def _add_usage_parser(sub: Any) -> None:
+    usage = sub.add_parser(
+        "usage",
+        allow_abbrev=False,
+        help="summarize tokens and active time across stored runs",
+        description="Summarize tokens (input + cache creation + cache reads + output), "
+        "active time (while a stage was running; approval waits excluded) and outcomes "
+        "across .carcara/runs, by size and mode and by role and model. Dollar figures are "
+        "API-price estimates, not subscription billing.",
+    )
+    usage.add_argument(
+        "--since",
+        type=_since_arg,
+        default=None,
+        metavar="WHEN",
+        help="only runs created at or after WHEN (YYYY-MM-DD, or an age such as 30d)",
+    )
+    usage.add_argument(
+        "--until",
+        type=_since_arg,
+        default=None,
+        metavar="WHEN",
+        help="only runs created before WHEN (YYYY-MM-DD, or an age such as 7d)",
+    )
+    usage.add_argument(
+        "--cost", action="store_true", help="also show dollar estimates (API prices)"
+    )
+    usage.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    usage.add_argument("--cwd", default=".", metavar="DIR", help="project directory (default .)")
+
+
 _DURATION_RE = re.compile(r"^(\d+)([dhw])$")
 _DURATION_UNITS = {"h": "hours", "d": "days", "w": "weeks"}
 
@@ -270,6 +303,20 @@ def _duration(value: str) -> timedelta:
     if match is None or int(match.group(1)) < 1:
         raise argparse.ArgumentTypeError(f"invalid duration: {value!r} (use e.g. 30d, 12h, 2w)")
     return timedelta(**{_DURATION_UNITS[match.group(2)]: int(match.group(1))})
+
+
+def _since_arg(value: str) -> datetime:
+    """A local date (YYYY-MM-DD, at midnight) or an age before now (e.g. 30d)."""
+    try:
+        return datetime.strptime(value.strip(), "%Y-%m-%d").astimezone()
+    except ValueError:
+        pass
+    try:
+        return datetime.now().astimezone() - _duration(value)
+    except argparse.ArgumentTypeError:
+        raise argparse.ArgumentTypeError(
+            f"invalid date: {value!r} (use YYYY-MM-DD or an age such as 30d)"
+        ) from None
 
 
 def _non_negative_int(value: str) -> int:
@@ -491,6 +538,7 @@ def _dry_run(profile: Any, ns: argparse.Namespace, cwd: str, origin: str) -> str
 
 def _list_runs(cwd: str) -> str:
     from carcara.runstore import RunStore, RunStoreError
+    from carcara.usage import format_tokens, run_tokens
 
     store = RunStore(cwd)
     lines = []
@@ -504,9 +552,10 @@ def _list_runs(cwd: str) -> str:
         task = task if len(task) <= 60 else task[:57] + "..."
         cost = float(state.get("totals", {}).get("cost_usd", 0.0))
         unknown = "+?" if state.get("totals", {}).get("uncounted_stages") else ""
+        tokens = format_tokens(run_tokens(state)["total"])
         lines.append(
             f"{run_id}  {state.get('status', '?'):<17} {state.get('size') or '?'}  "
-            f"${cost:.2f}{unknown}  {task}"
+            f"{tokens:>7} tok  ${cost:.2f}{unknown}  {task}"
         )
     return "\n".join(lines) + "\n" if lines else "no runs\n"
 
@@ -745,6 +794,7 @@ def _issue_lines(state: dict[str, Any]) -> list[str]:
 def status_main(ns: argparse.Namespace) -> int:
     from carcara.gate import render_plan
     from carcara.orchestrator import EXIT_CODES
+    from carcara.usage import read_events, run_usage, usage_line
 
     picked = _pick_run(ns)
     if picked is None:
@@ -752,6 +802,8 @@ def status_main(ns: argparse.Namespace) -> int:
     _, run, holder = picked
     state = run.state
     status = str(state.get("status", "?"))
+    now = datetime.now().astimezone() if status == "running" else None
+    usage = run_usage(state, read_events(run.dir), now)
     active = holder is not None and holder["run_id"] == run.id
     plan = _stored_plan(state)
     resume_cmd = _status_resume_cmd(run.id, status, active, ns.cwd)
@@ -773,6 +825,12 @@ def status_main(ns: argparse.Namespace) -> int:
             "resume_cmd": resume_cmd,
             "active": active,
             "cost_usd": float(state.get("totals", {}).get("cost_usd", 0.0)),
+            "tokens": usage["tokens"],
+            "output_tokens": usage["output_tokens"],
+            "input_tokens": usage["input_tokens"],
+            "cache_creation_tokens": usage["cache_creation_tokens"],
+            "cache_read_tokens": usage["cache_read_tokens"],
+            "active_seconds": usage["active_seconds"],
             "failed_attempts": len(attempts),
             "uncounted_stages": uncounted,
             "gate": state.get("gate"),
@@ -811,7 +869,10 @@ def status_main(ns: argparse.Namespace) -> int:
         return 0
     if report is None or status == "running":
         # report.md may be stale (from a previous drive) while a run is in progress.
-        lines = [f"carcara run {run.id}: {status} (size {state.get('size') or '?'})"]
+        lines = [
+            f"carcara run {run.id}: {status} (size {state.get('size') or '?'})",
+            usage_line(usage),
+        ]
         if state.get("message"):
             lines.append(f"note: {state['message']}")
         if uncounted:
@@ -821,6 +882,10 @@ def status_main(ns: argparse.Namespace) -> int:
             )
         lines += _verifiability_lines(state)
         report = "\n".join(lines) + "\n"
+    elif not any(line.startswith("usage:") for line in report.splitlines()):
+        # Reports written before carcara reported usage: add it after the header.
+        head, sep, rest = report.partition("\n")
+        report = f"{head}\n{usage_line(usage)}\n{rest}" if sep else f"{head}\n{usage_line(usage)}\n"
     sys.stdout.write(report)
     if holder is not None and active:
         sys.stdout.write(f"active: running in pid {holder['pid']}\n")
@@ -1109,6 +1174,34 @@ def runs_main(ns: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def usage_main(ns: argparse.Namespace) -> int:
+    from carcara.runstore import RunStore, RunStoreError
+    from carcara.usage import COST_NOTE, format_summary, read_events, summarize
+
+    cwd = os.path.abspath(ns.cwd)
+    if not os.path.isdir(cwd):
+        _err(f"directory not found: {ns.cwd}")
+        return 1
+    store = RunStore(cwd)
+    entries = []
+    for run_id in store.list_runs():
+        try:
+            run = store.load(run_id)
+        except RunStoreError:
+            entries.append((run_id, None, []))
+            continue
+        entries.append((run_id, run.state, read_events(run.dir)))
+    summary = summarize(entries, since=ns.since, until=ns.until)
+    if ns.json:
+        sys.stdout.write(json.dumps({**summary, "cost_note": COST_NOTE}, indent=2) + "\n")
+        return 0
+    if not summary["runs"] and not summary["unreadable"]:
+        sys.stdout.write("no runs\n")
+        return 0
+    sys.stdout.write(format_summary(summary, show_cost=ns.cost))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     if sys.platform == "win32":
         # Redirected streams default to the locale code page there (e.g. cp1252).
@@ -1151,6 +1244,8 @@ def main(argv: list[str] | None = None) -> int:
         return diff_main(ns)
     if ns.command == "runs":
         return runs_main(ns)
+    if ns.command == "usage":
+        return usage_main(ns)
     if ns.command == "routing":
         from carcara.hooks import routing_main
 

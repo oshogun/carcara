@@ -66,6 +66,7 @@ _MENTION_RE = re.compile(r"carcara", re.IGNORECASE)
 _LONG_OPT_RE = re.compile(r"--[A-Za-z][\w-]*")
 _HEREDOC_RE = re.compile(r"\s*<<(['\"])([A-Za-z_][A-Za-z0-9_]*)\1\s*$")
 _SHELL_META = frozenset(";&|$`<>()\\\n\r")
+_SAFE_SUBS = ("run", "status", "diff", "usage")
 _VALUE_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
 _NUM_RE = re.compile(r"^[0-9]+(\.[0-9]+)?$")
 # Whitelisted options per subcommand: option -> value kind (None = no value).
@@ -88,6 +89,12 @@ _RUN_OPTS: dict[str, str | None] = {
 }
 _STATUS_OPTS: dict[str, str | None] = {"--json": None, "--plan": None}
 _DIFF_OPTS: dict[str, str | None] = {"--stat": None}
+_USAGE_OPTS: dict[str, str | None] = {
+    "--json": None,
+    "--cost": None,
+    "--since": "value",
+    "--until": "value",
+}
 _FALSY = frozenset({"", "0", "false", "no", "off"})
 # Words after which the next word is still in command position.
 _CMD_PREFIX_WORDS = frozenset(
@@ -409,7 +416,7 @@ def _split_heredoc(command: str) -> tuple[str, bool] | None:
 
 def _valid_args(sub: str, args: list[str]) -> int | None:
     """Number of ``-`` (stdin) arguments when ``args`` are whitelisted, else None."""
-    opts = {"run": _RUN_OPTS, "status": _STATUS_OPTS, "diff": _DIFF_OPTS}[sub]
+    opts = {"run": _RUN_OPTS, "status": _STATUS_OPTS, "diff": _DIFF_OPTS, "usage": _USAGE_OPTS}[sub]
     stdin = 0
     positional = 0
     i = 0
@@ -433,7 +440,7 @@ def _valid_args(sub: str, args: list[str]) -> int | None:
                 stdin += kind == "stdin"
         elif tok == "-" and sub == "run":
             stdin += 1
-        elif sub != "run" and not tok.startswith("-") and _VALUE_RE.match(tok):
+        elif sub not in ("run", "usage") and not tok.startswith("-") and _VALUE_RE.match(tok):
             positional += 1
             if positional > 1:
                 return None
@@ -444,7 +451,7 @@ def _valid_args(sub: str, args: list[str]) -> int | None:
 
 
 def _safe_form_tokens(command: str) -> list[str] | None:
-    """Tokens of exactly one whitelisted ``carcara run|status|diff`` invocation, else None."""
+    """Tokens of exactly one whitelisted ``carcara run|status|diff|usage`` invocation, else None."""
     split = _split_heredoc(command)
     if split is None:
         return None
@@ -455,14 +462,14 @@ def _safe_form_tokens(command: str) -> list[str] | None:
         tokens = shlex.split(head)
     except ValueError:
         return None
-    if len(tokens) < 2 or tokens[0] != "carcara" or tokens[1] not in ("run", "status", "diff"):
+    if len(tokens) < 2 or tokens[0] != "carcara" or tokens[1] not in _SAFE_SUBS:
         return None
     stdin = _valid_args(tokens[1], tokens[2:])
     return tokens if stdin is not None and stdin == (1 if heredoc else 0) else None
 
 
 def _is_safe_form(command: str) -> bool:
-    """True for exactly one whitelisted ``carcara run|status|diff`` invocation."""
+    """True for exactly one whitelisted ``carcara run|status|diff|usage`` invocation."""
     return _safe_form_tokens(command) is not None
 
 

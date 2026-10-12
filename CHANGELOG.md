@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Usage as tokens and active time (#13). Every report (triage-only included)
+  has a `usage:` line after its header. Tokens are input + cache creation +
+  cache reads + output over all stages and failed attempts. Active time is
+  the time at least one stage was running, with approval waits excluded.
+  `carcara status` shows it, and `--json` adds `tokens`, `output_tokens`,
+  `input_tokens`, `cache_creation_tokens`, `cache_read_tokens` and
+  `active_seconds` (`cost_usd` is unchanged). The `carcara run --list`
+  listing shows tokens before the dollar estimate.
+- `carcara usage [--since WHEN] [--until WHEN] [--json] [--cost]` summarizes
+  runs: totals, outcomes, median/range per size and mode, and tokens per role
+  and model. Dollars appear only as labelled API-price estimates (`--cost` in
+  text). The Claude Code hook allows it as a safe read-only command.
+
 ## 1.0.0
 
 carcara now runs natively on Windows (#12); CI tests windows-latest
