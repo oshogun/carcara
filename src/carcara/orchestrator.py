@@ -2724,6 +2724,10 @@ class Orchestrator:
                 "Verify each finding against the code, drop false positives, merge "
                 "duplicates; keep any finding you cannot disprove, with its `reason` and "
                 "the `dimension` it came from. "
+                "Only your `unverified` list is recorded: carry every dimension's "
+                "`unverified` items into it, merging duplicates (with each other and "
+                "with your own items) and dropping only those the code or a test "
+                "verifies. "
                 f"Re-check each severity: {_SEVERITY_FLOOR} {_FINDING_REASON_RULE} "
                 f"Give the overall verdict.\n\n{shared()}"
             )

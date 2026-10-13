@@ -2909,6 +2909,28 @@ def test_ultra_review_splits_into_dimensions_and_merges(repo):
     assert orch.run_state.state["unverified_reviews"] == ["review"]
 
 
+def test_ultra_merge_carries_dimension_unverified_items(repo):
+    item = {"id": "U1", "kind": "untested", "text": "dimension-only assumption"}
+    script = {
+        "implement": [impl()],
+        "test": [TEST_OK],
+        "review-dim:correctness": [_dim("correctness")],
+        "review-dim:security": [{**_dim("security"), "unverified": [item]}],
+        "review-dim:tests": [_dim("tests")],
+        "review": [{**REVIEW_OK, "unverified": [item]}],
+    }
+    orch, backend, _ = make(repo, script, **_ultra_s())
+    assert go(orch).status == "done"
+    merge = backend.requests[-1]
+    assert "dimension-only assumption" in merge.prompt
+    assert "carry every dimension's `unverified` items" in merge.prompt
+    state = orch.run_state.state
+    assert state["unverified_reviews"] == ["review"]
+    assert [(i["id"], i["text"]) for i in state["unverified"]] == [
+        ("U1", "dimension-only assumption")
+    ]
+
+
 def test_ultra_report_lists_parallel_stages(repo):
     script = {
         "implement": [impl()],
